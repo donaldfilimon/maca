@@ -466,14 +466,13 @@ impl WingetBackend {
                 )));
             }
         }
-        let mut ledger = state::Ledger::load()?;
-        ledger.upsert(state::record(
+        state::upsert_record(state::record_with_kind(
             &plan.name,
             &plan.version,
             "winget",
             cellar.clone(),
-        ));
-        ledger.save()?;
+            opts.kind,
+        ))?;
         Ok(InstallOutcome {
             name: plan.name.clone(),
             version: plan.version.clone(),

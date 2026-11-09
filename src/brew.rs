@@ -13,12 +13,14 @@ use serde::Deserialize;
 use crate::backend::{InstallOptions, InstallOutcome, InstallPlan, Package};
 use crate::install;
 use crate::mach_o;
+use crate::source;
 use crate::state;
 use crate::{Error, Result};
 
 const FORMULA_API: &str = "https://formulae.brew.sh/api/formula";
 const FORMULA_INDEX: &str = "https://formulae.brew.sh/api/formula.json";
 const GHCR_TOKEN: &str = "https://ghcr.io/token";
+const INDEX_TTL_SECS: u64 = 3600;
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // disabled reserved for info/search filtering
@@ -29,6 +31,8 @@ struct Formula {
     #[serde(default)]
     homepage: String,
     versions: Versions,
+    #[serde(default)]
+    urls: Option<FormulaUrls>,
     #[serde(default)]
     executables: Vec<String>,
     #[serde(default)]
@@ -46,6 +50,20 @@ struct Formula {
 #[derive(Debug, Deserialize)]
 struct Versions {
     stable: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FormulaUrls {
+    #[serde(default)]
+    stable: Option<SourceUrl>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceUrl {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    checksum: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +91,28 @@ impl BrewBackend {
         Self
     }
 
+    async fn cached_index(&self) -> Result<Vec<u8>> {
+        let cache = crate::config::data_dir().join("cache/brew-index.json");
+        let fresh = std::fs::metadata(&cache)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|age| age.as_secs() < INDEX_TTL_SECS)
+            .unwrap_or(false);
+        if fresh {
+            if let Ok(bytes) = std::fs::read(&cache) {
+                tracing::debug!("brew index cache hit");
+                return Ok(bytes);
+            }
+        }
+        let bytes = install::download(FORMULA_INDEX).await?;
+        if let Some(parent) = cache.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&cache, &bytes)?;
+        Ok(bytes)
+    }
+
     /// Fetch per-formula metadata. Name is lowercased; `homebrew/core` only.
     async fn fetch_formula(&self, name: &str) -> Result<Formula> {
         let normalized = name.trim().to_ascii_lowercase();
@@ -91,9 +131,11 @@ impl BrewBackend {
     }
 
     /// Search the full index (31 MiB). Filters by name/desc substring.
+    /// The index is cached on disk for `INDEX_TTL_SECS` to keep repeat
+    /// searches fast.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Package>> {
         let q = query.trim().to_ascii_lowercase();
-        let data = install::download(FORMULA_INDEX).await?;
+        let data = self.cached_index().await?;
         let all: Vec<FormulaSummary> = serde_json::from_slice(&data)
             .map_err(|e| Error::Network(format!("decoding formula index: {e}")))?;
         let mut hits: Vec<Package> = all
@@ -223,9 +265,111 @@ impl BrewBackend {
         Ok((plan, f.executables.clone(), file.sha256.clone()))
     }
 
+    /// Runtime dependencies declared by a formula (for reverse lookups).
+    pub async fn dependencies(&self, name: &str) -> Result<Vec<String>> {
+        let formula = self.fetch_formula(name).await?;
+        Ok(formula.dependencies)
+    }
+
     pub async fn install(&self, name: &str, opts: &InstallOptions) -> Result<InstallOutcome> {
         let mut visited = Vec::new();
         self.install_with_deps(name, opts, &mut visited).await
+    }
+
+    /// Compile `name` from its source tarball into the cellar.
+    /// Dependencies must already be installed (called from `install_with_deps`).
+    pub async fn build_from_source(
+        &self,
+        name: &str,
+        opts: &InstallOptions,
+    ) -> Result<InstallOutcome> {
+        let normalized = name.trim().to_ascii_lowercase();
+        let formula = self.fetch_formula(&normalized).await?;
+        let source = formula
+            .urls
+            .as_ref()
+            .and_then(|u| u.stable.as_ref())
+            .ok_or_else(|| {
+                Error::Unsupported(format!("formula '{}' has no source URL", formula.name))
+            })?;
+        if source.url.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "formula '{}' has an empty source URL",
+                formula.name
+            )));
+        }
+        if opts.dry_run {
+            println!(
+                "[dry-run] would build {} {} from source ({})",
+                formula.name, formula.versions.stable, source.url
+            );
+            return Ok(InstallOutcome {
+                name: formula.name.clone(),
+                version: formula.versions.stable.clone(),
+                backend: "brew".into(),
+                cellar_path: crate::config::cellar_dir(&opts.prefix)
+                    .join(&formula.name)
+                    .join(&formula.versions.stable),
+                linked_bins: vec![],
+            });
+        }
+        let bytes = install::download(&source.url).await?;
+        install::verify_sha256(&formula.name, &bytes, source.checksum.as_deref())?;
+        // Extract the source into a scratch tree.
+        let scratch = std::env::temp_dir().join(format!(
+            "maca-src-{}-{}-{}",
+            formula.name,
+            formula.versions.stable,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch)?;
+        let source_dir = install::extract_tar_gz_to_cellar("src", &formula.name, &bytes, &scratch)?;
+        let system = source::detect(&source_dir).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "could not detect a build system in {} source (looked for configure, \
+                 CMakeLists.txt, meson.build, Makefile, Cargo.toml, pyproject.toml)",
+                formula.name
+            ))
+        })?;
+        tracing::info!("building {} with {system:?}", formula.name);
+        let version = formula.versions.stable.clone();
+        let dest = crate::config::cellar_dir(&opts.prefix)
+            .join(&formula.name)
+            .join(&version);
+        let built = source::build(system, &source_dir, &dest, opts.jobs.max(1))?;
+        tracing::info!("{} built via {}", formula.name, built.build_system);
+        install::link_opt(&formula.name, &version, &dest, &opts.prefix)?;
+        let rewritten = mach_o::rewrite_placeholders(&dest, &opts.prefix)?;
+        if rewritten > 0 {
+            tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
+        }
+        let linked = install::link_bins(&dest, &formula.executables, &opts.prefix)?;
+        state::upsert_record(state::record_with_kind(
+            &formula.name,
+            &version,
+            "brew",
+            dest.clone(),
+            opts.kind,
+        ))?;
+        let _ = std::fs::remove_dir_all(&scratch);
+        Ok(InstallOutcome {
+            name: formula.name,
+            version,
+            backend: "brew".into(),
+            cellar_path: dest,
+            linked_bins: linked,
+        })
+    }
+
+    /// Whether a bottle exists for the current host.
+    fn has_bottle_for_host(&self, formula: &Formula) -> bool {
+        let Some(bottle) = formula.bottle.as_ref().and_then(|b| b.stable.as_ref()) else {
+            return false;
+        };
+        let host = host_platform();
+        let keys: std::collections::BTreeSet<String> = bottle.files.keys().cloned().collect();
+        Self::pick_bottle_key(&keys, host.os, host.arch, host.codename.as_deref()).is_some()
     }
 
     /// Install `name` plus any Homebrew dependencies that are not already
@@ -268,6 +412,16 @@ impl BrewBackend {
             Box::pin(self.install_with_deps(dep, opts, visited)).await?;
         }
 
+        // Prefer a bottle; fall back to a source build when unavailable or forced.
+        if opts.build_from_source || !self.has_bottle_for_host(&formula) {
+            if !opts.build_from_source {
+                tracing::warn!(
+                    "no bottle for {} on this host; building from source",
+                    normalized
+                );
+            }
+            return self.build_from_source(&normalized, opts).await;
+        }
         let (plan, executables, expected_sha) = self.plan_inner(&normalized).await?;
         if opts.dry_run {
             println!(
@@ -288,7 +442,20 @@ impl BrewBackend {
         let token = ghcr_anonymous_token(&plan.name).await?;
         let bytes = install::download_with_bearer(&plan.url, Some(&token)).await?;
         install::verify_sha256(&plan.name, &bytes, Some(&expected_sha))?;
-        let cellar = install::extract_bottle(&plan.name, &plan.version, &bytes, &opts.prefix)?;
+        let dest = crate::config::cellar_dir(&opts.prefix)
+            .join(&plan.name)
+            .join(&plan.version);
+        let cellar = match install::extract_bottle(&plan.name, &plan.version, &bytes, &opts.prefix)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // Do not leave a half-extracted keg behind.
+                let _ = std::fs::remove_dir_all(&dest);
+                let _ =
+                    std::fs::remove_dir_all(crate::config::cellar_dir(&opts.prefix).join("__tmp"));
+                return Err(e);
+            }
+        };
         // Homebrew exposes each keg at `<prefix>/opt/<name>`; bottles reference
         // deps through that path, so create the same symlink.
         install::link_opt(&plan.name, &plan.version, &cellar, &opts.prefix)?;
@@ -298,14 +465,13 @@ impl BrewBackend {
             tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
         }
         let linked = install::link_bins(&cellar, &executables, &opts.prefix)?;
-        let mut ledger = state::Ledger::load()?;
-        ledger.upsert(state::record(
+        state::upsert_record(state::record_with_kind(
             &plan.name,
             &plan.version,
             "brew",
             cellar.clone(),
-        ));
-        ledger.save()?;
+            opts.kind,
+        ))?;
         Ok(InstallOutcome {
             name: plan.name,
             version: plan.version,

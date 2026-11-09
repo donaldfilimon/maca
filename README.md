@@ -2,137 +2,169 @@
 
 Cross-platform package manager for **macOS** and **Linux**, written in **Rust 2024**.
 
-maca installs packages from three sources without shelling out to the native
-package manager for catalog work:
+maca installs packages from three sources **without shelling out to the native
+package manager** for catalog or install work:
 
 | Backend | Catalog | Installs |
 | --- | --- | --- |
-| `brew` | Homebrew formula JSON API (`formulae.brew.sh`) | Homebrew **bottles** downloaded as OCI blobs from GHCR, SHA-256 verified, extracted into the maca cellar |
-| `winget` | `api.winget.run` search + `microsoft/winget-pkgs` manifests | Windows installers (MSI/EXE), gated to Windows hosts |
-| `custom` | Local JSON registry + optional HTTP mirrors | `tar.gz` archives or single binaries, SHA-256 verified |
+| `brew` | Homebrew formula JSON API (`formulae.brew.sh`) | Bottles (OCI blobs from GHCR) **or source builds** |
+| `winget` | `api.winget.run` search + `microsoft/winget-pkgs` manifests | Windows installers (MSI/EXE) on Windows; dry-run plans everywhere |
+| `custom` | Local JSON registry + optional HTTP mirrors | `tar.gz`, single binaries, or source trees with build steps |
 
 `--backend auto` (the default) searches custom → brew → winget and lets the
-first backend that can resolve an install plan handle it.
+first backend that can resolve a plan handle the install.
 
 ## Install
 
 ```sh
 cargo build --release
-# binary: target/release/maca
-```
-
-Add the prefix bin dir to your `PATH`:
-
-```sh
-export PATH="$HOME/Library/Application Support/maca/prefix/bin:$PATH"   # macOS
-export PATH="$HOME/.local/share/maca/prefix/bin:$PATH"                 # Linux
+export PATH="$HOME/.maca/prefix/bin:$PATH"
 ```
 
 Override the prefix with `--prefix` or `MACA_PREFIX`.
 
-## Usage
+## Commands
 
 ```sh
-maca search jq                 # search all backends
-maca info jq                   # resolve a package
-maca install jq                # install (deps included)
-maca install jq --dry-run      # show the plan without installing
-maca list                      # installed ledger
-maca upgrade                   # upgrade everything
-maca upgrade --package jq      # upgrade one package
-maca remove jq                 # delete cellar + ledger entry
-maca doctor                    # prefix, backends, counts
+maca search jq                     # search all backends (cached brew index)
+maca search jq --json              # machine-readable
+maca info jq
+maca install jq                    # installs dependencies too
+maca install jq tree --jobs 4      # concurrent installs
+maca install jq --build-from-source
+maca install code --kind app       # kind: app|plugin|cli|library|other
+maca app install code              # kind-specific aliases
+maca plugin install ...
+maca cli install jq
+maca list --kind cli
+maca upgrade                       # honours pins
+maca remove jq
+maca why oniguruma                 # reverse dependencies
 
-# custom registry
+maca group create dev
+maca group add dev jq --backend brew --kind cli
+maca group install dev             # concurrent
+maca group export dev              # writes a lockfile
+maca lock                          # lockfile from the ledger
+maca sync                          # install exactly what the lock pins
+
+maca pin jq                        # pin to the installed version
+maca unpin jq
+
+maca snapshot create --note "before upgrade"
+maca snapshot list
+maca snapshot restore <id>
+maca snapshot delete <id>
+
+maca self-update --check
+maca self-update
+maca tui                           # interactive terminal UI
+maca doctor
 maca custom add --name hello --version 1.0.0 \
   --url https://example.com/hello.tar.gz --sha256 <hex>
 maca custom list
 maca custom remove hello
 ```
 
+## Safety
+
+- **Exclusive prefix lock** (`<prefix>/.maca.lock`, `flock`/`LockFileEx`) so
+  concurrent maca processes cannot race the ledger or cellar.
+- **Concurrent installs** with a bounded job pool (`--jobs`, default 4); ledger
+  writes are serialized.
+- **Automatic snapshot** before `install`/`remove`/`upgrade` (disable with
+  `--no-snapshot`). A failed operation rolls the prefix back automatically.
+- **SHA-256 verification** of every artifact against its catalog metadata.
+- **Mach-O relocation**: bottles are rewritten with `install_name_tool`
+  (`@@HOMEBREW_CELLAR@@`, `@@HOMEBREW_PREFIX@@`) and ad-hoc re-signed with
+  `codesign`, so they run on Apple Silicon. These are Apple developer tools,
+  not package managers; no `brew` binary is required.
+- **Space-free default prefix** (`~/.maca/prefix`) so source build recipes that
+  split on whitespace work.
+
+## Source builds
+
+`maca install <formula> --build-from-source` downloads the formula's source
+tarball, verifies its checksum, installs dependencies, detects the build system
+(`configure`, CMake, Meson, Make, Cargo, Python), compiles, and installs into
+the cellar. Build logs land in `<data>/logs/`.
+
+The custom backend supports build steps directly:
+
+```sh
+maca custom add --name hello --version 1.0.0 \
+  --url https://example.com/hello-src.tar.gz --sha256 <hex> \
+  --build-step 'make install PREFIX={{prefix}}'
+```
+
+Steps are split with shell-style quoting, so paths with spaces work; `{{prefix}}`
+expands to the install destination.
+
+## Groups, kinds, and lockfiles
+
+- **Kinds** — `app`, `plugin`, `cli`, `library`, `other` — recorded per package
+  and filterable (`maca list --kind cli`).
+- **Groups** — named profiles of packages with optional version pins, installed
+  as a unit.
+- **Lockfiles** — `<prefix>/maca.lock.json` pins exact versions; `maca sync`
+  reproduces a machine.
+- **Pins** — `maca pin <pkg>` keeps `upgrade` from touching a package.
+
 ## Layout
 
 ```
-<data>/config.toml                 # optional user config
-<data>/installed.json              # install ledger
-<data>/custom-registry.json        # custom backend registry
-<prefix>/cellar/<name>/<version>/  # extracted artifacts
-<prefix>/opt/<name>                # Homebrew-style keg symlink
-<prefix>/bin/<exe>                 # symlinks into the cellar
+~/.maca/config.toml                 # optional user config
+~/.maca/installed.json              # install ledger
+~/.maca/custom-registry.json        # custom backend registry
+~/.maca/groups/<name>.json          # groups
+~/.maca/snapshots/<id>/             # snapshots
+~/.maca/cache/brew-index.json       # cached catalog index (1h TTL)
+~/.maca/logs/                       # source build logs
+~/.maca/prefix/cellar/<name>/<ver>/ # extracted artifacts
+~/.maca/prefix/opt/<name>           # Homebrew-style keg symlink
+~/.maca/prefix/bin/<exe>            # symlinks into the cellar
 ```
 
-`<data>` is `~/Library/Application Support/maca` on macOS and
-`~/.local/share/maca` on Linux. `<prefix>` defaults to `<data>/prefix`.
+## TUI
 
-## How the brew backend works
+`maca tui` opens a full-screen interface with four tabs:
 
-1. `GET https://formulae.brew.sh/api/formula/<name>.json` for metadata,
-   `dependencies`, and the bottle file map.
-2. Pick the bottle key for the host (`arm64_tahoe`, `x86_64_linux`, …).
-3. Fetch an anonymous GHCR token
-   (`https://ghcr.io/token?scope=repository:homebrew/core/<name>:pull`).
-4. `GET` the OCI blob and verify its SHA-256 against the formula.
-5. Extract into the cellar, create `<prefix>/opt/<name>`, install dependencies
-   recursively.
-6. Rewrite `@@HOMEBREW_CELLAR@@` / `@@HOMEBREW_PREFIX@@` in every Mach-O file
-   with `install_name_tool`, then ad-hoc re-sign with `codesign` (Apple Silicon
-   requires a valid signature).
-7. Link executables into `<prefix>/bin` and record the package in the ledger.
+| Tab | Keys |
+| --- | --- |
+| Installed | `j`/`k` move · `u` upgrade · `r` remove · `s` snapshot |
+| Search | `/` edit query · `Enter` search · `i` install |
+| Groups | `g` install group |
+| Snapshots | `z` restore |
 
-## How the winget backend works
+`q` or `Ctrl-C` quits. `1`–`4` switch tabs.
 
-1. `GET https://api.winget.run/v2/packages?query=…` for search and metadata.
-2. Resolve the exact `Publisher.Name` id and latest version from the
-   `microsoft/winget-pkgs` contents API (the search API has no exact-id
-   endpoint).
-3. Read `ShortDescription` / `PackageUrl` from the `*.locale.en-US.yaml`
-   manifest.
-4. Parse the `*.installer.yaml` for `InstallerUrl` + `InstallerSha256`,
-   preferring the current architecture and `user` scope.
-5. On Windows, download, verify, and run the installer. On macOS/Linux,
-   installs are refused; `--dry-run` still prints the resolved plan.
+## Self-update
 
-## Custom registry schema
+`maca self-update` fetches the latest GitHub release of the configured repo
+(`MACA_UPDATE_REPO` or `update_repo` in config, default `donaldfilimon/maca`),
+downloads the asset for the host target, verifies its `.sha256` companion,
+backs up the current binary, and replaces itself.
 
-```json
-{
-  "packages": [
-    {
-      "name": "hello",
-      "version": "1.0.0",
-      "description": "Hello world",
-      "homepage": "https://example.com",
-      "artifacts": {
-        "macos-arm64": {
-          "url": "https://example.com/hello-1.0.0.tar.gz",
-          "sha256": "deadbeef…",
-          "kind": "tar.gz"
-        }
-      }
-    }
-  ]
-}
-```
-
-Platform keys: `macos-arm64`, `macos-x64`, `linux-x64`, `linux-arm64`,
-`windows-x64`, plus Darwin aliases (`darwin-aarch64`, `darwin-x86_64`) and a
-bare OS key (`macos`, `linux`, `windows`) for arch-independent artifacts.
-`kind` is `tar.gz` (extracted; `bin/*` linked) or `binary` (copied to `bin/`).
+Release asset convention: `maca-<target>-<version>.tar.gz` plus
+`maca-<target>-<version>.tar.gz.sha256`, where `<target>` is a Rust target
+triple such as `aarch64-apple-darwin`.
 
 ## Limits (honest scope)
 
-- **No source builds.** Formulae without a bottle are refused.
-- **No Windows package installation on macOS/Linux.** The winget catalog and
-  `--dry-run` plans work everywhere; running MSI/EXE installers requires
-  Windows.
-- **No `brew`/`winget` binary required** for search, info, or brew installs.
-  The winget installer path uses `msiexec` on Windows.
-- **Dependency resolution is Homebrew-only** and follows the formula
-  `dependencies` list; `uses_from_macos` entries are treated as system
-  provided.
-- **No rollback.** Removing a package deletes its cellar; there is no snapshot
-  or restore.
-- **No concurrent-install locking.** One writer per prefix at a time.
+- **Windows installer execution is implemented but unverified.** No Windows
+  host was available to execute MSI/EXE installers. The winget catalog,
+  manifest resolution, checksum verification, and `--dry-run` plans are
+  verified on macOS; the installer launch path is compile-gated to Windows.
+- **Self-update is implemented but unverified.** No release is published for
+  the default repository yet, so the download-and-replace path has not run
+  against a real release.
+- **Source builds are best-effort.** Autotools, CMake, Meson, Make, Cargo, and
+  Python projects are detected; projects with bespoke build systems fail with a
+  clear message and a log path.
+- **Homebrew dependency resolution** follows the formula `dependencies` list;
+  `uses_from_macos` entries are treated as system-provided.
+- **Snapshots clone directories** (`clonefile` on APFS, recursive copy
+  elsewhere), so a snapshot of a large prefix is not free.
 
 ## Development
 
@@ -140,4 +172,5 @@ bare OS key (`macos`, `linux`, `windows`) for arch-independent artifacts.
 ./check.sh
 ```
 
-Runs `cargo fmt --check`, `cargo clippy`, `cargo test`, and a release build.
+Runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, a
+release build, and `maca doctor`.

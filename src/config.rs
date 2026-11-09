@@ -30,6 +30,9 @@ pub struct Config {
     /// Extra custom registry URLs (HTTP) to consult after the local file.
     #[serde(default)]
     pub custom_registry_urls: Vec<String>,
+    /// GitHub `owner/repo` used by `maca self-update`.
+    #[serde(default)]
+    pub update_repo: Option<String>,
 }
 
 impl Config {
@@ -64,20 +67,30 @@ impl Config {
         if let Some(p) = &self.prefix {
             return p.clone();
         }
-        data_dir().join("prefix")
+        default_prefix()
     }
 }
 
 /// Data dir for maca state.
 pub fn data_dir() -> PathBuf {
     if let Some(base) = directories::BaseDirs::new() {
-        return base.data_dir().join("maca");
+        // Prefer a space-free home: many build recipes split on whitespace,
+        // and `~/Library/Application Support` breaks them.
+        #[cfg(target_os = "macos")]
+        {
+            return base.home_dir().join(".maca");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let data = base.data_dir();
+            return data.join("maca");
+        }
     }
     // Fallback: ~/.local/share/maca (Linux) / ~/Library/Application Support/maca (macOS)
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = std::env::home_dir() {
-            return home.join("Library/Application Support/maca");
+            return home.join(".maca");
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -87,6 +100,11 @@ pub fn data_dir() -> PathBuf {
         }
     }
     PathBuf::from(".maca")
+}
+
+/// Default install prefix. Space-free so source build recipes work.
+fn default_prefix() -> PathBuf {
+    data_dir().join("prefix")
 }
 
 pub fn installed_path() -> PathBuf {
@@ -136,9 +154,13 @@ mod tests {
     }
 
     #[test]
-    fn data_dir_ends_with_maca() {
+    fn data_dir_ends_with_maca_home() {
         let d = data_dir();
-        assert_eq!(d.file_name().and_then(|s| s.to_str()), Some("maca"));
+        let name = d.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        assert!(
+            name == "maca" || name == ".maca",
+            "unexpected data dir name: {name}"
+        );
     }
 
     #[test]
@@ -147,6 +169,7 @@ mod tests {
             prefix: Some(PathBuf::from("/tmp/p")),
             default_backend: Some("brew".into()),
             custom_registry_urls: vec!["https://example.com/reg.json".into()],
+            ..Default::default()
         };
         let s = toml::to_string(&cfg).unwrap();
         let back: Config = toml::from_str(&s).unwrap();

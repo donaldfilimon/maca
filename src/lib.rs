@@ -7,9 +7,15 @@ pub mod backend;
 pub mod brew;
 pub mod config;
 pub mod custom;
+pub mod group;
 pub mod install;
+pub mod lock;
 pub mod mach_o;
+pub mod selfupdate;
+pub mod snapshot;
+pub mod source;
 pub mod state;
+pub mod tui;
 pub mod winget;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,6 +38,10 @@ pub enum Error {
     },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("toml: {0}")]
+    Toml(#[from] toml::de::Error),
     #[error("{0}")]
     Other(#[from] anyhow::Error),
 }

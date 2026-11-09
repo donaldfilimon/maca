@@ -21,6 +21,13 @@ pub struct Record {
     pub cellar: PathBuf,
     #[serde(default)]
     pub installed_at: String,
+    /// How the package is used: app, plugin, cli, library, other.
+    #[serde(default = "default_kind")]
+    pub kind: crate::group::Kind,
+}
+
+fn default_kind() -> crate::group::Kind {
+    crate::group::Kind::App
 }
 
 impl Ledger {
@@ -66,7 +73,7 @@ impl Ledger {
     }
 }
 
-fn now_rfc3339() -> String {
+pub fn now_rfc3339() -> String {
     // Avoid chrono: use a simple UTC timestamp via std time.
     // Full RFC3339 without tz conversion indent; second-precision UTC.
     let secs = std::time::SystemTime::now()
@@ -106,7 +113,41 @@ pub fn record(name: &str, version: &str, backend: &str, cellar: PathBuf) -> Reco
         backend: backend.to_string(),
         cellar,
         installed_at: now_rfc3339(),
+        kind: crate::group::Kind::App,
     }
+}
+
+pub fn upsert_record(rec: Record) -> Result<()> {
+    let _guard = LEDGER_LOCK
+        .lock()
+        .map_err(|_| crate::Error::Other(anyhow::anyhow!("ledger lock poisoned")))?;
+    let mut ledger = Ledger::load()?;
+    ledger.upsert(rec);
+    ledger.save()
+}
+
+pub fn remove_record(name: &str) -> Result<bool> {
+    let _guard = LEDGER_LOCK
+        .lock()
+        .map_err(|_| crate::Error::Other(anyhow::anyhow!("ledger lock poisoned")))?;
+    let mut ledger = Ledger::load()?;
+    let removed = ledger.remove(name);
+    ledger.save()?;
+    Ok(removed)
+}
+
+static LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub fn record_with_kind(
+    name: &str,
+    version: &str,
+    backend: &str,
+    cellar: PathBuf,
+    kind: crate::group::Kind,
+) -> Record {
+    let mut r = record(name, version, backend, cellar);
+    r.kind = kind;
+    r
 }
 
 #[cfg(test)]

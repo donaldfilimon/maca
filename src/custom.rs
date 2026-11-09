@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{InstallOptions, InstallOutcome, InstallPlan, Package};
 use crate::config;
 use crate::install;
+use crate::source;
 use crate::state;
 use crate::{Error, Result};
 
@@ -53,6 +54,11 @@ pub struct Entry {
     pub homepage: String,
     #[serde(default)]
     pub artifacts: BTreeMap<String, Artifact>,
+    /// Custom build steps run in the extracted source tree. Use `{{prefix}}`
+    /// for the install destination. When set, the artifact is treated as a
+    /// source archive and built instead of being linked directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,6 +296,41 @@ impl CustomBackend {
         }
         let bytes = install::download(&plan.url).await?;
         install::verify_sha256(&plan.name, &bytes, plan.sha256.as_deref())?;
+        // Source build path: the entry declares build_steps, so the artifact is
+        // a source tree that is compiled into the cellar.
+        if !entry.build_steps.is_empty() {
+            let scratch = std::env::temp_dir().join(format!(
+                "maca-custom-src-{}-{}-{}",
+                plan.name,
+                plan.version,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&scratch);
+            std::fs::create_dir_all(&scratch)?;
+            let source_dir =
+                install::extract_tar_gz_to_cellar("src", &plan.name, &bytes, &scratch)?;
+            let cellar = cellar_for(&opts.prefix, &plan.name, &plan.version);
+            let built =
+                source::run_steps(&source_dir, &cellar, &entry.build_steps, opts.jobs.max(1))?;
+            let linked = link_all_bins(&cellar, &opts.prefix)?;
+            state::upsert_record(state::record_with_kind(
+                &plan.name,
+                &plan.version,
+                "custom",
+                cellar.clone(),
+                opts.kind,
+            ))?;
+            let _ = std::fs::remove_dir_all(&scratch);
+            tracing::info!("built {} with custom steps", plan.name);
+            let _ = built;
+            return Ok(InstallOutcome {
+                name: plan.name.clone(),
+                version: plan.version.clone(),
+                backend: "custom".into(),
+                cellar_path: cellar,
+                linked_bins: linked,
+            });
+        }
         match art.kind {
             ArtifactKind::TarGz => {
                 let cellar = install::extract_tar_gz_to_cellar(
@@ -300,14 +341,13 @@ impl CustomBackend {
                 )?;
                 // Link any `bin/*` files into the prefix bin.
                 let linked = link_all_bins(&cellar, &opts.prefix)?;
-                let mut ledger = state::Ledger::load()?;
-                ledger.upsert(state::record(
+                state::upsert_record(state::record_with_kind(
                     &plan.name,
                     &plan.version,
                     "custom",
                     cellar.clone(),
-                ));
-                ledger.save()?;
+                    opts.kind,
+                ))?;
                 Ok(InstallOutcome {
                     name: plan.name.clone(),
                     version: plan.version.clone(),
@@ -332,14 +372,13 @@ impl CustomBackend {
                     &plan.name,
                     &opts.prefix,
                 )?];
-                let mut ledger = state::Ledger::load()?;
-                ledger.upsert(state::record(
+                state::upsert_record(state::record_with_kind(
                     &plan.name,
                     &plan.version,
                     "custom",
                     cellar.clone(),
-                ));
-                ledger.save()?;
+                    opts.kind,
+                ))?;
                 Ok(InstallOutcome {
                     name: plan.name.clone(),
                     version: plan.version.clone(),
@@ -396,6 +435,7 @@ mod tests {
             description: String::new(),
             homepage: String::new(),
             artifacts,
+            build_steps: vec![],
         }
     }
 
@@ -418,6 +458,7 @@ mod tests {
             description: "greeter".into(),
             homepage: String::new(),
             artifacts: BTreeMap::new(),
+            build_steps: vec![],
         });
         let backend = CustomBackend { registry: reg };
         assert_eq!(backend.search("hello", 10).unwrap().len(), 1);

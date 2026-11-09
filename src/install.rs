@@ -37,9 +37,14 @@ pub async fn download(url: &str) -> Result<Vec<u8>> {
     download_with_bearer(url, None).await
 }
 
+/// Default per-request timeout. Catalog APIs and artifact downloads should
+/// answer well within this; a hung request must not stall a command.
+const HTTP_TIMEOUT_SECS: u64 = 20;
+
 pub async fn download_with_bearer(url: &str, bearer: Option<&str>) -> Result<Vec<u8>> {
     let client = reqwest::Client::builder()
         .user_agent(format!("maca/{}", crate::VERSION))
+        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| Error::Network(e.to_string()))?;
     let mut req = client.get(url);
@@ -258,6 +263,7 @@ pub fn link_single_binary(binary: &Path, name: &str, prefix: &Path) -> Result<Pa
 pub fn http_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent(format!("maca/{}", crate::VERSION))
+        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| Error::Network(e.to_string()))
 }
