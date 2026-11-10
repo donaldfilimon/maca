@@ -7,6 +7,10 @@
 
 Cross-platform package manager for **macOS** and **Linux**, written in **Rust 2024**.
 
+<p align="center">
+  <img src="docs/assets/banner.png" alt="maca — one binary, five ecosystems: Homebrew, winget, GitHub Releases, Aqua, and custom, with no shellouts" width="100%">
+</p>
+
 > **Live documentation & demo site:** [https://donaldfilimon.github.io/maca/](https://donaldfilimon.github.io/maca/)
 
 maca installs packages from five sources **without shelling out to the native

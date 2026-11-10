@@ -28,6 +28,16 @@ maca supports multiple backends (brew, winget, custom, github, aqua). New backen
 - Use the shared `install::*` helpers for downloads, verification, extraction, linking, and ledger updates.
 - Work with `MACA_*` environment overrides for tests (see `github` and `aqua` for examples).
 
+## Images
+
+All images live in `docs/assets/`. That one location serves both the README and the GitHub Pages site, so an image is never copied into a second place.
+
+- README references are relative to the repository root: `docs/assets/banner.png`. GitHub renders those, and so does any fork. Do not use an absolute `raw.githubusercontent.com` URL in the README — it pins the image to one branch of one fork and breaks everywhere else.
+- The Pages site references the same files relative to `docs/`: `assets/banner.png`. Anything that must resolve for a link preview (Open Graph, Twitter cards) needs the absolute Pages URL instead, because those crawlers do not resolve relative paths.
+- Prefer PNG. GitHub's image proxy does not reliably render SVG, so an SVG logo will show in the Pages site and vanish in the README.
+- Set the display size with an HTML image and a `width`, not Markdown image syntax. Markdown gives GitHub no size hint, so a 1200px banner renders at full resolution and blows out the layout on small screens.
+- The social preview GitHub shows on the repository page is not read from any file. It is set by hand under Settings, Social preview, and the image to upload is `docs/assets/social-card.png` (1280×640).
+
 ## Commit style
 
 Use clear, descriptive commit messages. When the change affects user-facing behavior, include a short example in the commit message if helpful.
