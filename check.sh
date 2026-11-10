@@ -8,13 +8,6 @@ cd "$(dirname "$0")"
 if ! command -v cargo >/dev/null 2>&1; then
     export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
 fi
-if command -v rustup >/dev/null 2>&1; then
-    NIGHTLY_RUSTC=$(rustup which --toolchain nightly rustc 2>/dev/null || true)
-    if [ -n "$NIGHTLY_RUSTC" ]; then
-        export PATH="$(dirname "$NIGHTLY_RUSTC"):$PATH"
-    fi
-fi
-
 echo "== cargo fmt --check =="
 cargo fmt --check
 
