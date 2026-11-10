@@ -4,7 +4,7 @@ This file provides guidance to Codex (claude.ai/code) when working with code in 
 
 ## What this is
 
-`maca` is a Rust 2024 (MSRV 1.89, for `std::fs::File::lock`) package manager for macOS and Linux. It installs from three backends — Homebrew bottles/sources, the winget catalog, and a custom JSON registry — by calling their HTTP APIs directly. It never shells out to `brew` or `winget`. One crate, one binary (`src/main.rs`) on top of a library (`src/lib.rs`).
+`maca` is a Rust 2024 (MSRV 1.89, for `std::fs::File::lock`) package manager for macOS and Linux. It installs from five backends — Homebrew bottles/sources, the winget catalog, GitHub Releases, the Aqua registry, and a custom JSON registry — by calling their HTTP APIs directly. It never shells out to `brew`, `winget`, `gh`, or `aqua`. One crate, one binary (`src/main.rs`) on top of a library (`src/lib.rs`).
 
 ## Commands
 
@@ -47,7 +47,7 @@ The default data dir is deliberately space-free on macOS (not `~/Library/Applica
 
 `BrewBackend`, `WingetBackend` and `CustomBackend` each expose `search` / `info` / `plan` / `install` by convention; there is no shared trait. Dispatch is a `match` on `BackendKind` or on the ledger's backend string, in `backend::install_with_backend` (every install goes through it, so its checks always run), `backend::latest_version`, and `main.rs` `cmd_search` and `info_one`. A new backend or a signature change has to be applied at each site.
 
-`--backend auto` means custom → brew → winget: `search_all` queries all three concurrently and merges; `auto_install` takes the first backend whose `plan()` succeeds.
+`--backend auto` means custom → brew → winget → github → aqua: `search_all` queries all five concurrently and merges; `auto_install` takes the first backend whose `plan()` succeeds.
 
 Custom registry HTTP mirrors (`custom_registry_urls`) are additive and local entries win. Install and auto-search paths load them through `Registry::load_configured()`, which falls back to the local registry if a mirror is unreachable; `custom add/list/remove` and `doctor` use `load_local()` only.
 
