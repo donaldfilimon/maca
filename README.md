@@ -3,8 +3,11 @@
 [![CI](https://github.com/donaldfilimon/maca/workflows/CI/badge.svg)](https://github.com/donaldfilimon/maca/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Rust](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://www.rust-lang.org/)
+[![Docs](https://img.shields.io/badge/docs-GitHub%20Pages-3fb950?logo=github)](https://donaldfilimon.github.io/maca/)
 
 Cross-platform package manager for **macOS** and **Linux**, written in **Rust 2024**.
+
+> **Live documentation & demo site:** [https://donaldfilimon.github.io/maca/](https://donaldfilimon.github.io/maca/)
 
 maca installs packages from five sources **without shelling out to the native
 package manager** (or to `gh` or `aqua`) for catalog or install work:

@@ -1,0 +1,1146 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>maca — Cross-platform package manager</title>
+        <meta
+            name="description"
+            content="maca is a cross-platform package manager for macOS and Linux. Install from Homebrew, winget, GitHub Releases, Aqua, and custom sources — one Rust binary, no native package manager shellouts."
+        />
+
+        <!-- Open Graph / Facebook -->
+        <meta property="og:type" content="website" />
+        <meta
+            property="og:url"
+            content="https://donaldfilimon.github.io/maca/"
+        />
+        <meta
+            property="og:title"
+            content="maca — Cross-platform package manager"
+        />
+        <meta
+            property="og:description"
+            content="One binary. Five ecosystems. Native support for Homebrew (bottles + source), winget, GitHub Releases, Aqua, and custom — without shelling out."
+        />
+
+        <!-- Twitter -->
+        <meta name="twitter:card" content="summary_large_image" />
+        <meta
+            name="twitter:url"
+            content="https://donaldfilimon.github.io/maca/"
+        />
+        <meta
+            name="twitter:title"
+            content="maca — Cross-platform package manager"
+        />
+        <meta
+            name="twitter:description"
+            content="One binary. Five ecosystems. macOS + Linux. Rust 2024."
+        />
+
+        <link
+            rel="icon"
+            href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%231e2937'/%3E%3Ctext x='50' y='68' font-size='58' font-family='system-ui, -apple-system, sans-serif' font-weight='700' fill='%2394a3b8' text-anchor='middle'%3Em%3C/text%3E%3C/svg%3E"
+        />
+        <link rel="canonical" href="https://donaldfilimon.github.io/maca/" />
+        <link
+            rel="sitemap"
+            type="application/xml"
+            title="Sitemap"
+            href="sitemap.xml"
+        />
+
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link
+            rel="stylesheet"
+            href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css"
+        />
+        <style>
+            @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&amp;family=Space+Grotesk:wght@500;600&amp;display=swap");
+
+            :root {
+                --font-sans: "Inter", system_ui, sans-serif;
+                --font-display: "Space Grotesk", system_ui, sans-serif;
+            }
+
+            body {
+                font-family: var(--font-sans);
+            }
+
+            .font-display {
+                font-family: var(--font-display);
+            }
+
+            .hero-bg {
+                background: linear-gradient(135deg, #0f172a 0%, #1e2937 100%);
+            }
+
+            .section-header {
+                font-family: var(--font-display);
+                letter-spacing: -0.025em;
+            }
+
+            .nav-link {
+                transition: color 0.1s ease;
+            }
+            .nav-link:hover {
+                color: rgb(148 163 184);
+            }
+
+            .terminal {
+                font-family:
+                    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                    "Liberation Mono", "Courier New", monospace;
+            }
+
+            .code-block {
+                background-color: #0f172a;
+                border: 1px solid #334155;
+            }
+
+            .backend-card {
+                transition:
+                    transform 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+                    box-shadow 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            .backend-card:hover {
+                transform: translateY(-4px);
+                box-shadow:
+                    0 20px 25px -5px rgb(0 0 0 / 0.1),
+                    0 8px 10px -6px rgb(0 0 0 / 0.1);
+            }
+
+            .feature-icon {
+                background: linear-gradient(145deg, #1e2937, #0f172a);
+            }
+
+            .maca-gradient {
+                background: linear-gradient(90deg, #64748b, #94a3b8);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+            }
+
+            .nav-scrolled {
+                background: rgba(15, 23, 42, 0.95);
+                backdrop-filter: blur(12px);
+            }
+
+            .command {
+                font-family:
+                    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                    "Liberation Mono", "Courier New", monospace;
+            }
+
+            .stat {
+                font-variant-numeric: tabular-nums;
+            }
+
+            .mobile-menu {
+                animation: slideDown 0.2s ease-out;
+            }
+            @keyframes slideDown {
+                from {
+                    opacity: 0;
+                    transform: translateY(-8px);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateY(0);
+                }
+            }
+        </style>
+    </head>
+    <body class="bg-slate-950 text-slate-200">
+        <!-- Navbar -->
+        <nav
+            class="border-b border-slate-800 bg-slate-950/80 backdrop-blur-lg sticky top-0 z-50"
+            id="nav"
+        >
+            <div class="max-w-7xl mx-auto px-6">
+                <div class="flex items-center justify-between h-16">
+                    <!-- Logo -->
+                    <div class="flex items-center gap-x-3">
+                        <div class="flex items-center gap-x-2">
+                            <div
+                                class="w-8 h-8 bg-gradient-to-br from-slate-400 to-slate-600 rounded-xl flex items-center justify-center"
+                            >
+                                <span class="text-slate-950 font-bold text-xl"
+                                    >m</span
+                                >
+                            </div>
+                            <span class="font-semibold text-2xl tracking-tight"
+                                >maca</span
+                            >
+                        </div>
+                        <span
+                            class="px-2 py-0.5 text-[10px] font-medium bg-slate-800 text-slate-400 rounded"
+                            >v0.1</span
+                        >
+                    </div>
+
+                    <!-- Desktop nav -->
+                    <div class="hidden md:flex items-center gap-x-8 text-sm">
+                        <a
+                            href="#backends"
+                            class="nav-link text-slate-300 hover:text-white text-sm font-medium"
+                            >Backends</a
+                        >
+                        <a
+                            href="#safety"
+                            class="nav-link text-slate-300 hover:text-white text-sm font-medium"
+                            >Safety</a
+                        >
+                        <a
+                            href="#features"
+                            class="nav-link text-slate-300 hover:text-white text-sm font-medium"
+                            >Features</a
+                        >
+                        <a
+                            href="#install"
+                            class="nav-link text-slate-300 hover:text-white text-sm font-medium"
+                            >Install</a
+                        >
+                        <a
+                            href="#commands"
+                            class="nav-link text-slate-300 hover:text-white text-sm font-medium"
+                            >Commands</a
+                        >
+                    </div>
+
+                    <div class="flex items-center gap-x-3">
+                        <a
+                            href="https://github.com/donaldfilimon/maca"
+                            class="hidden sm:flex items-center gap-x-2 px-4 py-2 text-sm font-medium rounded-xl border border-slate-700 hover:bg-slate-900 transition-colors"
+                        >
+                            <i class="fa-brands fa-github"></i>
+                            <span>GitHub</span>
+                        </a>
+                        <a
+                            href="https://github.com/donaldfilimon/maca/releases"
+                            class="px-4 py-2 text-sm font-semibold bg-white text-slate-900 hover:bg-slate-100 rounded-xl transition-colors"
+                        >
+                            Releases
+                        </a>
+
+                        <!-- Mobile hamburger -->
+                        <button
+                            id="mobile-menu-btn"
+                            class="md:hidden w-10 h-10 flex items-center justify-center rounded-xl border border-slate-700 text-slate-300 hover:text-white"
+                            aria-label="Toggle menu"
+                        >
+                            <i class="fa-solid fa-bars"></i>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Mobile menu -->
+            <div
+                id="mobile-menu"
+                class="hidden md:hidden border-t border-slate-800 bg-slate-950"
+            >
+                <div class="px-6 py-4 space-y-1 text-sm">
+                    <a
+                        href="#backends"
+                        class="block py-2 text-slate-300 hover:text-white"
+                        >Backends</a
+                    >
+                    <a
+                        href="#safety"
+                        class="block py-2 text-slate-300 hover:text-white"
+                        >Safety</a
+                    >
+                    <a
+                        href="#features"
+                        class="block py-2 text-slate-300 hover:text-white"
+                        >Features</a
+                    >
+                    <a
+                        href="#install"
+                        class="block py-2 text-slate-300 hover:text-white"
+                        >Install</a
+                    >
+                    <a
+                        href="#commands"
+                        class="block py-2 text-slate-300 hover:text-white"
+                        >Commands</a
+                    >
+                    <div class="pt-2 border-t border-slate-800 mt-2">
+                        <a
+                            href="https://github.com/donaldfilimon/maca"
+                            class="block py-2 text-slate-300 hover:text-white"
+                            >GitHub</a
+                        >
+                        <a
+                            href="https://github.com/donaldfilimon/maca/releases"
+                            class="block py-2 text-slate-300 hover:text-white"
+                            >Releases</a
+                        >
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <!-- Hero -->
+        <div class="hero-bg">
+            <div class="max-w-5xl mx-auto px-6 pt-16 pb-20 text-center">
+                <div
+                    class="inline-flex items-center gap-x-2 rounded-full bg-slate-900 border border-slate-700 px-3 py-1 text-sm mb-6"
+                >
+                    <div
+                        class="w-2 h-2 bg-emerald-400 rounded-full animate-pulse"
+                    ></div>
+                    <span class="text-slate-300 text-sm font-medium"
+                        >Production-ready • Rust 2024 (MSRV 1.89)</span
+                    >
+                </div>
+
+                <h1
+                    class="text-6xl md:text-7xl font-semibold tracking-tighter leading-none mb-4"
+                >
+                    One binary.<br />
+                    <span class="maca-gradient">Five ecosystems.</span>
+                </h1>
+
+                <p class="max-w-2xl mx-auto text-xl text-slate-400 mt-6 mb-10">
+                    Cross-platform package manager for macOS and Linux. Install
+                    from Homebrew, winget, GitHub Releases, Aqua, and custom
+                    sources —
+                    <span class="font-medium text-slate-300"
+                        >without shelling out</span
+                    >.
+                </p>
+
+                <div
+                    class="flex flex-col sm:flex-row items-center justify-center gap-3"
+                >
+                    <a
+                        href="#install"
+                        class="group w-full sm:w-auto inline-flex items-center justify-center gap-x-2 px-8 py-3.5 bg-white hover:bg-slate-100 text-slate-900 font-semibold rounded-2xl transition-all active:scale-[0.985]"
+                    >
+                        <span>Get started</span>
+                        <i
+                            class="fa-solid fa-arrow-right group-hover:translate-x-1 transition-transform"
+                        ></i>
+                    </a>
+
+                    <a
+                        href="https://github.com/donaldfilimon/maca"
+                        class="w-full sm:w-auto inline-flex items-center justify-center gap-x-2 px-6 py-3.5 bg-slate-900 hover:bg-slate-800 border border-slate-700 font-medium rounded-2xl transition-colors"
+                    >
+                        <i class="fa-brands fa-github mr-2"></i>
+                        <span>View on GitHub</span>
+                    </a>
+                </div>
+
+                <div
+                    class="mt-8 text-xs text-slate-500 flex items-center justify-center gap-x-2"
+                >
+                    <span>macOS &amp; Linux</span>
+                    <span class="text-slate-700">•</span>
+                    <span>Apache 2.0</span>
+                    <span class="text-slate-700">•</span>
+                    <a
+                        href="https://github.com/donaldfilimon/maca/blob/main/LICENSE"
+                        class="hover:text-slate-400"
+                        >LICENSE</a
+                    >
+                </div>
+            </div>
+        </div>
+
+        <!-- Trust / Backends bar -->
+        <div class="border-b border-slate-800 bg-slate-900/50">
+            <div class="max-w-6xl mx-auto px-6 py-5">
+                <div
+                    class="flex flex-wrap justify-center items-center gap-x-8 gap-y-3 text-sm text-slate-400"
+                >
+                    <div class="font-medium text-slate-300">
+                        Speaks natively with
+                    </div>
+                    <div class="flex items-center gap-6 text-slate-300">
+                        <div class="flex items-center gap-x-1.5">
+                            <i
+                                class="fa-solid fa-beer-mug-empty text-orange-400"
+                            ></i
+                            ><span class="font-medium">Homebrew</span>
+                        </div>
+                        <div class="flex items-center gap-x-1.5">
+                            <i class="fa-brands fa-windows text-blue-400"></i
+                            ><span class="font-medium">winget</span>
+                        </div>
+                        <div class="flex items-center gap-x-1.5">
+                            <i class="fa-brands fa-github"></i
+                            ><span class="font-medium">GitHub Releases</span>
+                        </div>
+                        <div class="flex items-center gap-x-1.5">
+                            <i class="fa-solid fa-fish text-teal-400"></i
+                            ><span class="font-medium">Aqua</span>
+                        </div>
+                        <div class="flex items-center gap-x-1.5">
+                            <i class="fa-solid fa-file-code text-slate-400"></i
+                            ><span class="font-medium">Custom</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Backends -->
+        <div id="backends" class="max-w-6xl mx-auto px-6 py-20">
+            <div class="text-center mb-12">
+                <span
+                    class="uppercase tracking-[2px] text-xs font-semibold text-emerald-400"
+                    >Five sources. One tool.</span
+                >
+                <h2 class="text-4xl font-semibold tracking-tight mt-3">
+                    One command. Five backends.
+                </h2>
+                <p class="mt-3 max-w-lg mx-auto text-slate-400">
+                    maca talks to multiple ecosystems directly over HTTP. No
+                    brew. No winget. No gh. No aqua.
+                </p>
+            </div>
+
+            <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-5">
+                <!-- Brew -->
+                <div
+                    class="backend-card rounded-3xl border border-slate-800 bg-slate-900 p-6"
+                >
+                    <div class="flex items-center gap-x-3 mb-4">
+                        <div
+                            class="w-10 h-10 bg-orange-500/10 text-orange-400 rounded-2xl flex items-center justify-center"
+                        >
+                            <i class="fa-solid fa-beer-mug-empty text-xl"></i>
+                        </div>
+                        <div>
+                            <div class="font-semibold text-lg">Homebrew</div>
+                            <div class="text-xs text-orange-400">
+                                bottles + source
+                            </div>
+                        </div>
+                    </div>
+                    <p class="text-slate-400 text-sm">
+                        Full formula support, automatic recursive dependencies,
+                        and
+                        <code class="font-mono text-rose-400"
+                            >--build-from-source</code
+                        >. Mach-O rewriting for Apple Silicon.
+                    </p>
+                    <div
+                        class="mt-4 text-xs bg-slate-950 border border-slate-800 rounded-xl px-3 py-1 inline-block"
+                    >
+                        <span class="font-medium">--backend brew</span>
+                    </div>
+                </div>
+
+                <!-- winget -->
+                <div
+                    class="backend-card rounded-3xl border border-slate-800 bg-slate-900 p-6"
+                >
+                    <div class="flex items-center gap-x-3 mb-4">
+                        <div
+                            class="w-10 h-10 bg-blue-500/10 text-blue-400 rounded-2xl flex items-center justify-center"
+                        >
+                            <i class="fa-brands fa-windows text-xl"></i>
+                        </div>
+                        <div>
+                            <div class="font-semibold text-lg">winget</div>
+                            <div class="text-xs text-blue-400">
+                                Windows installers
+                            </div>
+                        </div>
+                    </div>
+                    <p class="text-slate-400 text-sm">
+                        Native access to the Windows Package Manager catalog.
+                        Real MSI/EXE execution on Windows; catalog + dry-run
+                        everywhere.
+                    </p>
+                    <div
+                        class="mt-4 text-xs bg-slate-950 border border-slate-800 rounded-xl px-3 py-1 inline-block"
+                    >
+                        <span class="font-medium">--backend winget</span>
+                    </div>
+                </div>
+
+                <!-- GitHub -->
+                <div
+                    class="backend-card rounded-3xl border border-slate-800 bg-slate-900 p-6"
+                >
+                    <div class="flex items-center gap-x-3 mb-4">
+                        <div
+                            class="w-10 h-10 bg-violet-500/10 text-violet-400 rounded-2xl flex items-center justify-center"
+                        >
+                            <i class="fa-brands fa-github text-xl"></i>
+                        </div>
+                        <div>
+                            <div class="font-semibold text-lg">
+                                GitHub Releases
+                            </div>
+                            <div class="text-xs text-violet-400">
+                                owner/repo
+                            </div>
+                        </div>
+                    </div>
+                    <p class="text-slate-400 text-sm">
+                        Install any release asset by
+                        <code class="font-mono">owner/repo</code> or
+                        <code class="font-mono">owner--repo</code>. Matches host
+                        architecture automatically.
+                    </p>
+                    <div
+                        class="mt-4 text-xs bg-slate-950 border border-slate-800 rounded-xl px-3 py-1 inline-block"
+                    >
+                        <span class="font-medium">--backend github</span>
+                    </div>
+                </div>
+
+                <!-- Aqua -->
+                <div
+                    class="backend-card rounded-3xl border border-slate-800 bg-slate-900 p-6"
+                >
+                    <div class="flex items-center gap-x-3 mb-4">
+                        <div
+                            class="w-10 h-10 bg-teal-500/10 text-teal-400 rounded-2xl flex items-center justify-center"
+                        >
+                            <i class="fa-solid fa-fish text-xl"></i>
+                        </div>
+                        <div>
+                            <div class="font-semibold text-lg">
+                                Aqua Registry
+                            </div>
+                            <div class="text-xs text-teal-400">
+                                standard registry
+                            </div>
+                        </div>
+                    </div>
+                    <p class="text-slate-400 text-sm">
+                        First-class support for the aqua standard registry.
+                        Great for CLIs, language runtimes, and versioned tools.
+                    </p>
+                    <div
+                        class="mt-4 text-xs bg-slate-950 border border-slate-800 rounded-xl px-3 py-1 inline-block"
+                    >
+                        <span class="font-medium">--backend aqua</span> or
+                        <span class="font-mono">aqua:name/name</span>
+                    </div>
+                </div>
+
+                <!-- Custom -->
+                <div
+                    class="backend-card rounded-3xl border border-slate-800 bg-slate-900 p-6"
+                >
+                    <div class="flex items-center gap-x-3 mb-4">
+                        <div
+                            class="w-10 h-10 bg-slate-600/30 text-slate-400 rounded-2xl flex items-center justify-center"
+                        >
+                            <i class="fa-solid fa-file-code text-xl"></i>
+                        </div>
+                        <div>
+                            <div class="font-semibold text-lg">
+                                Custom Registry
+                            </div>
+                        </div>
+                    </div>
+                    <p class="text-slate-400 text-sm">
+                        Local JSON + optional HTTPS mirrors. Tarballs, single
+                        binaries, or fully custom source builds with
+                        <code class="font-mono">{{prefix}}</code> substitution.
+                    </p>
+                    <div
+                        class="mt-4 text-xs bg-slate-950 border border-slate-800 rounded-xl px-3 py-1 inline-block"
+                    >
+                        <span class="font-medium">maca custom</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Safety -->
+        <div id="safety" class="bg-slate-900 border-y border-slate-800">
+            <div class="max-w-6xl mx-auto px-6 py-16">
+                <div class="grid md:grid-cols-12 gap-10 items-center">
+                    <div class="md:col-span-5">
+                        <div
+                            class="uppercase tracking-widest text-emerald-400 text-sm font-semibold mb-2"
+                        >
+                            Safety by design
+                        </div>
+                        <h3
+                            class="text-4xl font-semibold tracking-tighter leading-none"
+                        >
+                            Nothing gets lost. Nothing gets overwritten by
+                            accident.
+                        </h3>
+                        <p class="mt-4 text-slate-400">
+                            Production-grade guarantees that work even when you
+                            run multiple commands at once or hit Ctrl-C
+                            mid-install.
+                        </p>
+                        <a
+                            href="https://github.com/donaldfilimon/maca#readme"
+                            class="inline-flex items-center gap-x-2 mt-6 text-sm text-emerald-400 hover:text-emerald-300"
+                        >
+                            Read the full safety model
+                            <i class="fa-solid fa-arrow-right ml-1"></i>
+                        </a>
+                    </div>
+
+                    <div class="md:col-span-7 grid sm:grid-cols-2 gap-4">
+                        <div
+                            class="rounded-2xl border border-slate-800 bg-slate-950 p-5"
+                        >
+                            <div
+                                class="flex items-center gap-x-2 text-emerald-400"
+                            >
+                                <i class="fa-solid fa-lock"></i>
+                                <span class="font-semibold"
+                                    >Exclusive prefix lock</span
+                                >
+                            </div>
+                            <p class="mt-2 text-sm text-slate-400">
+                                flock / LockFileEx on
+                                <span class="font-mono">.maca.lock</span>.
+                                Concurrent processes cannot race the ledger or
+                                cellar.
+                            </p>
+                        </div>
+                        <div
+                            class="rounded-2xl border border-slate-800 bg-slate-950 p-5"
+                        >
+                            <div
+                                class="flex items-center gap-x-2 text-emerald-400"
+                            >
+                                <i class="fa-solid fa-camera"></i>
+                                <span class="font-semibold"
+                                    >Automatic snapshots</span
+                                >
+                            </div>
+                            <p class="mt-2 text-sm text-slate-400">
+                                Every mutation is preceded by a snapshot.
+                                Failure triggers full rollback — kegs, links,
+                                and ledger.
+                            </p>
+                        </div>
+                        <div
+                            class="rounded-2xl border border-slate-800 bg-slate-950 p-5"
+                        >
+                            <div
+                                class="flex items-center gap-x-2 text-emerald-400"
+                            >
+                                <i class="fa-solid fa-shield-halved"></i>
+                                <span class="font-semibold"
+                                    >SHA-256 everywhere</span
+                                >
+                            </div>
+                            <p class="mt-2 text-sm text-slate-400">
+                                Every downloadable artifact is verified before
+                                extraction. Custom entries without hashes are
+                                loudly warned.
+                            </p>
+                        </div>
+                        <div
+                            class="rounded-2xl border border-slate-800 bg-slate-950 p-5"
+                        >
+                            <div
+                                class="flex items-center gap-x-2 text-emerald-400"
+                            >
+                                <i class="fa-solid fa-link-slash"></i>
+                                <span class="font-semibold"
+                                    >No foreign overwrite</span
+                                >
+                            </div>
+                            <p class="mt-2 text-sm text-slate-400">
+                                Existing binaries, man pages, or share files
+                                belonging to you or another package are left
+                                alone and reported.
+                            </p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Features -->
+        <div id="features" class="max-w-6xl mx-auto px-6 py-20">
+            <div class="text-center mb-10">
+                <span
+                    class="uppercase tracking-widest text-emerald-400 text-xs font-semibold"
+                    >Everything you expect, done properly</span
+                >
+                <h3 class="mt-2 text-4xl font-semibold tracking-tight">
+                    Features that actually matter
+                </h3>
+            </div>
+
+            <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <div class="flex gap-4">
+                    <div class="mt-1 text-emerald-400 w-6">
+                        <i class="fa-solid fa-terminal fa-lg"></i>
+                    </div>
+                    <div>
+                        <div class="font-semibold">Full TUI</div>
+                        <div class="text-sm text-slate-400 mt-1">
+                            Four-tab interactive terminal UI with search,
+                            filtering, pinning, upgrading, and snapshot
+                            management.
+                        </div>
+                    </div>
+                </div>
+                <div class="flex gap-4">
+                    <div class="mt-1 text-emerald-400 w-6">
+                        <i class="fa-solid fa-layer-group fa-lg"></i>
+                    </div>
+                    <div>
+                        <div class="font-semibold">Groups &amp; lockfiles</div>
+                        <div class="text-sm text-slate-400 mt-1">
+                            Declarative environments via
+                            <span class="font-mono">maca group</span>.
+                            Reproducible installs with
+                            <span class="font-mono">maca lock</span> /
+                            <span class="font-mono">sync --prune</span>.
+                        </div>
+                    </div>
+                </div>
+                <div class="flex gap-4">
+                    <div class="mt-1 text-emerald-400 w-6">
+                        <i class="fa-solid fa-sync fa-lg"></i>
+                    </div>
+                    <div>
+                        <div class="font-semibold">Self-update</div>
+                        <div class="text-sm text-slate-400 mt-1">
+                            Fetches the latest GitHub release asset for your
+                            target triple, verifies the companion
+                            <span class="font-mono">.sha256</span>, and replaces
+                            itself atomically.
+                        </div>
+                    </div>
+                </div>
+                <div class="flex gap-4">
+                    <div class="mt-1 text-emerald-400 w-6">
+                        <i class="fa-solid fa-plug fa-lg"></i>
+                    </div>
+                    <div>
+                        <div class="font-semibold">shellenv + completions</div>
+                        <div class="text-sm text-slate-400 mt-1">
+                            Portable shell integration for bash, zsh, fish, and
+                            csh. Tab completion for every supported shell via
+                            clap_complete.
+                        </div>
+                    </div>
+                </div>
+                <div class="flex gap-4">
+                    <div class="mt-1 text-emerald-400 w-6">
+                        <i class="fa-solid fa-broom fa-lg"></i>
+                    </div>
+                    <div>
+                        <div class="font-semibold">
+                            Cache &amp; disk hygiene
+                        </div>
+                        <div class="text-sm text-slate-400 mt-1">
+                            <span class="font-mono">maca clean</span> reclaims
+                            index caches, build logs, and temp trees. Snapshot
+                            pruning included.
+                        </div>
+                    </div>
+                </div>
+                <div class="flex gap-4">
+                    <div class="mt-1 text-emerald-400 w-6">
+                        <i class="fa-solid fa-stethoscope fa-lg"></i>
+                    </div>
+                    <div>
+                        <div class="font-semibold">maca doctor</div>
+                        <div class="text-sm text-slate-400 mt-1">
+                            Checks prefix writability, PATH, required dev tools,
+                            catalog endpoints, broken symlinks, and more — with
+                            structured exit codes.
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Install -->
+        <div id="install" class="bg-slate-900 border-y border-slate-800">
+            <div class="max-w-5xl mx-auto px-6 py-16">
+                <div class="grid md:grid-cols-12 gap-12 items-center">
+                    <div class="md:col-span-5">
+                        <div
+                            class="uppercase tracking-widest text-emerald-400 text-sm font-semibold mb-3"
+                        >
+                            Get started
+                        </div>
+                        <h3
+                            class="text-4xl font-semibold tracking-tighter leading-none"
+                        >
+                            Install in 30 seconds.
+                        </h3>
+                        <p class="mt-4 text-lg text-slate-400">
+                            No sudo. No extra system dependencies. Works on
+                            macOS and Linux.
+                        </p>
+                        <div class="mt-6 text-sm">
+                            <div
+                                class="inline-flex items-center gap-x-2 px-3 py-1 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-400"
+                            >
+                                <i
+                                    class="fa-solid fa-check text-emerald-400"
+                                ></i>
+                                <span
+                                    >Then run
+                                    <span class="font-mono text-emerald-300"
+                                        >eval "$(maca shellenv)"</span
+                                    ></span
+                                >
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="md:col-span-7">
+                        <div
+                            class="bg-slate-950 border border-slate-800 rounded-3xl p-2 shadow-inner"
+                        >
+                            <div
+                                class="px-5 pt-4 pb-1 text-sm font-medium text-slate-400"
+                            >
+                                From source (recommended)
+                            </div>
+
+                            <div
+                                class="code-block rounded-2xl p-4 mx-1 mt-1 relative group"
+                            >
+                                <pre
+                                    class="terminal text-emerald-300 text-sm leading-relaxed"
+                                >
+cargo install --git https://github.com/donaldfilimon/maca</pre>
+                                <button
+                                    onclick="copyToClipboard(this)"
+                                    class="absolute top-3 right-3 px-2.5 py-1 text-xs bg-slate-800 hover:bg-slate-700 rounded-lg text-slate-400 group-hover:opacity-100 transition flex items-center gap-x-1.5"
+                                    aria-label="Copy install command"
+                                >
+                                    <i class="fa-regular fa-copy"></i>
+                                    <span>Copy</span>
+                                </button>
+                            </div>
+
+                            <div class="px-5 pt-4 text-xs text-slate-400">
+                                Or clone and build:<br />
+                                <span class="font-mono text-slate-500"
+                                    >git clone
+                                    https://github.com/donaldfilimon/maca
+                                    &amp;&amp; cd maca &amp;&amp; cargo build
+                                    --release</span
+                                >
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Commands -->
+        <div id="commands" class="max-w-6xl mx-auto px-6 py-20">
+            <div class="flex items-end justify-between mb-8">
+                <div>
+                    <h3 class="text-3xl font-semibold tracking-tight">
+                        Familiar commands. Real power.
+                    </h3>
+                    <p class="text-slate-400 mt-1">
+                        The CLI you already know, extended with the things teams
+                        actually need.
+                    </p>
+                </div>
+                <a
+                    href="https://github.com/donaldfilimon/maca#readme"
+                    class="hidden md:inline text-sm text-emerald-400 hover:text-emerald-300"
+                    >Full command list →</a
+                >
+            </div>
+
+            <div class="grid md:grid-cols-2 gap-4">
+                <div class="code-block rounded-2xl p-5 text-sm">
+                    <div
+                        class="text-emerald-400 mb-3 text-xs font-semibold tracking-wider"
+                    >
+                        DAILY DRIVER
+                    </div>
+                    <div class="space-y-2 text-slate-300 font-mono text-[13px]">
+                        <div>
+                            <span class="text-slate-500">$</span> maca search jq
+                        </div>
+                        <div>
+                            <span class="text-slate-500">$</span> maca install
+                            jq tree --jobs 6
+                        </div>
+                        <div>
+                            <span class="text-slate-500">$</span> maca install
+                            owner/repo
+                        </div>
+                        <div>
+                            <span class="text-slate-500">$</span> maca install
+                            --backend aqua neovim
+                        </div>
+                        <div>
+                            <span class="text-slate-500">$</span> maca outdated
+                            --json
+                        </div>
+                    </div>
+                </div>
+
+                <div class="code-block rounded-2xl p-5 text-sm">
+                    <div
+                        class="text-emerald-400 mb-3 text-xs font-semibold tracking-wider"
+                    >
+                        REPRODUCIBILITY &amp; TEAMS
+                    </div>
+                    <div class="space-y-2 text-slate-300 font-mono text-[13px]">
+                        <div>
+                            <span class="text-slate-500">$</span> maca group
+                            create dev
+                        </div>
+                        <div>
+                            <span class="text-slate-500">$</span> maca group add
+                            dev jq --kind cli
+                        </div>
+                        <div>
+                            <span class="text-slate-500">$</span> maca group
+                            install dev
+                        </div>
+                        <div>
+                            <span class="text-slate-500">$</span> maca lock
+                            &amp;&amp; git add maca.lock.json
+                        </div>
+                        <div>
+                            <span class="text-slate-500">$</span> maca sync
+                            --prune
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- TUI callout -->
+        <div class="border-t border-slate-800 bg-slate-900/60">
+            <div class="max-w-5xl mx-auto px-6 py-16 text-center">
+                <div
+                    class="inline-flex items-center gap-x-2 text-xs uppercase tracking-[2px] text-emerald-400 font-medium"
+                >
+                    <span>NEW IN 0.1</span>
+                </div>
+                <h3 class="mt-3 text-4xl font-semibold tracking-tight">
+                    Powerful TUI included
+                </h3>
+                <p class="mt-3 max-w-md mx-auto text-slate-400">
+                    Manage installed packages, search, pin, upgrade, and restore
+                    snapshots without ever leaving the terminal.
+                </p>
+
+                <div
+                    class="mt-8 inline-flex items-center gap-x-3 text-xs bg-slate-950 border border-slate-800 rounded-2xl px-5 py-3"
+                >
+                    <div class="font-mono">maca tui</div>
+                    <span class="text-slate-600">•</span>
+                    <span class="text-slate-400"
+                        >Tabs • Filters • Confirmation overlays • Keyboard
+                        only</span
+                    >
+                </div>
+
+                <div class="mt-3 text-[10px] text-slate-500">
+                    Press
+                    <span class="font-mono bg-slate-900 px-1.5 py-px rounded"
+                        >?</span
+                    >
+                    inside the TUI for help.
+                </div>
+            </div>
+        </div>
+
+        <!-- Honest limits -->
+        <div class="max-w-5xl mx-auto px-6 py-12 text-center">
+            <div class="text-xs uppercase tracking-widest text-slate-500 mb-2">
+                Honest scope
+            </div>
+            <p class="max-w-2xl mx-auto text-sm text-slate-400">
+                Windows installer execution and self-update against a published
+                release are implemented but not yet exercised on Windows or
+                against a real published release (no hardware / no tags yet).
+                Full details are in the
+                <a
+                    href="https://github.com/donaldfilimon/maca#readme"
+                    class="text-emerald-400 hover:underline"
+                    >README</a
+                >.
+            </p>
+        </div>
+
+        <!-- Footer -->
+        <footer class="border-t border-slate-800 py-10">
+            <div
+                class="max-w-6xl mx-auto px-6 text-xs text-slate-500 flex flex-col md:flex-row md:items-center justify-between gap-y-4"
+            >
+                <div class="flex items-center gap-x-4">
+                    <span>© 2026 Donald Filimon</span>
+                    <span class="text-slate-700">•</span>
+                    <a
+                        href="https://github.com/donaldfilimon/maca/blob/main/LICENSE"
+                        class="hover:text-slate-300"
+                        >Apache 2.0</a
+                    >
+                </div>
+
+                <div class="flex items-center gap-x-5">
+                    <a
+                        href="https://github.com/donaldfilimon/maca"
+                        class="hover:text-slate-300"
+                        >GitHub</a
+                    >
+                    <a
+                        href="https://github.com/donaldfilimon/maca/releases"
+                        class="hover:text-slate-300"
+                        >Releases</a
+                    >
+                    <a
+                        href="https://github.com/donaldfilimon/maca/blob/main/CONTRIBUTING.md"
+                        class="hover:text-slate-300"
+                        >Contributing</a
+                    >
+                    <a
+                        href="https://github.com/donaldfilimon/maca/blob/main/SECURITY.md"
+                        class="hover:text-slate-300"
+                        >Security</a
+                    >
+                    <a
+                        href="https://github.com/donaldfilimon/maca/blob/main/CODE_OF_CONDUCT.md"
+                        class="hover:text-slate-300"
+                        >Code of Conduct</a
+                    >
+                </div>
+            </div>
+        </footer>
+
+        <script>
+            // Tailwind script is loaded via CDN in head; this is a safeguard
+            function initializeTailwind() {
+                // no-op — tailwind cdn script already ran
+            }
+
+            function copyToClipboard(element) {
+                const pre = element.parentElement.querySelector("pre");
+                if (!pre) return;
+
+                const text = pre.innerText.trim();
+                navigator.clipboard
+                    .writeText(text)
+                    .then(() => {
+                        const original = element.innerHTML;
+                        element.innerHTML =
+                            '<i class="fa-solid fa-check mr-1.5"></i> Copied';
+                        setTimeout(() => {
+                            element.innerHTML = original;
+                        }, 1700);
+                    })
+                    .catch(() => {
+                        // fallback
+                        const ta = document.createElement("textarea");
+                        ta.value = text;
+                        document.body.appendChild(ta);
+                        ta.select();
+                        document.execCommand("copy");
+                        document.body.removeChild(ta);
+                    });
+            }
+
+            function initNavbar() {
+                const nav = document.getElementById("nav");
+                window.addEventListener("scroll", () => {
+                    if (window.scrollY > 8) {
+                        nav.classList.add("nav-scrolled");
+                    } else {
+                        nav.classList.remove("nav-scrolled");
+                    }
+                });
+            }
+
+            function initMobileMenu() {
+                const btn = document.getElementById("mobile-menu-btn");
+                const menu = document.getElementById("mobile-menu");
+                if (!btn || !menu) return;
+
+                btn.addEventListener("click", () => {
+                    const isOpen = !menu.classList.contains("hidden");
+                    if (isOpen) {
+                        menu.classList.add("hidden");
+                        btn.innerHTML = '<i class="fa-solid fa-bars"></i>';
+                    } else {
+                        menu.classList.remove("hidden");
+                        menu.classList.add("mobile-menu");
+                        btn.innerHTML = '<i class="fa-solid fa-times"></i>';
+                    }
+                });
+
+                // close on nav click
+                menu.querySelectorAll("a").forEach((a) => {
+                    a.addEventListener("click", () => {
+                        menu.classList.add("hidden");
+                        btn.innerHTML = '<i class="fa-solid fa-bars"></i>';
+                    });
+                });
+            }
+
+            function initSmoothScroll() {
+                document.querySelectorAll('a[href^="#"]').forEach((anchor) => {
+                    anchor.addEventListener("click", function (e) {
+                        const target = document.querySelector(
+                            this.getAttribute("href"),
+                        );
+                        if (target) {
+                            e.preventDefault();
+                            target.scrollIntoView({
+                                behavior: "smooth",
+                                block: "start",
+                            });
+                        }
+                    });
+                });
+            }
+
+            function initKeyboardShortcuts() {
+                document.addEventListener("keydown", function (e) {
+                    if (
+                        e.key === "/" &&
+                        document.activeElement.tagName === "BODY"
+                    ) {
+                        e.preventDefault();
+                        const install = document.getElementById("install");
+                        if (install)
+                            install.scrollIntoView({
+                                behavior: "smooth",
+                                block: "center",
+                            });
+                    }
+                    if (
+                        e.key === "?" &&
+                        document.activeElement.tagName === "BODY"
+                    ) {
+                        e.preventDefault();
+                        window.open(
+                            "https://github.com/donaldfilimon/maca",
+                            "_blank",
+                        );
+                    }
+                });
+            }
+
+            function init() {
+                initNavbar();
+                initMobileMenu();
+                initSmoothScroll();
+                initKeyboardShortcuts();
+            }
+
+            window.onload = init;
+        </script>
+    </body>
+</html>
