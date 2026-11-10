@@ -36,7 +36,7 @@ Two things still reach outside the sandbox: the `doctor` test probes the catalog
 
 State is split, and only one half is relocatable:
 
-- **Prefix** — `--prefix` > `MACA_PREFIX` > `prefix` in `config.toml` > `<data>/prefix`. Holds `cellar/<name>/<version>/`, `opt/<name>`, `bin/`, `share/`, the process lock `.maca.lock`, and the lockfile `maca.lock.json`.
+- **Prefix** — `--prefix` > `MACA_PREFIX` > nearest `maca.toml` `prefix` (walking up from the cwd; relative paths resolve against that file; an unparseable file is an error, not a fallback) > `prefix` in `config.toml` > `<data>/prefix`. The cellar resolves `MACA_CELLAR` > `maca.toml` `cellar` > `config.toml` `cellar` > `<prefix>/cellar`, so several prefixes can share kegs (`Ctx::from_cli`). The prefix holds `cellar/<name>/<version>/`, `opt/<name>`, `bin/`, `share/`, the process lock `.maca.lock`, and the lockfile `maca.lock.json`.
 - **Data dir** — `config::data_dir()`: `MACA_HOME` if set, else `~/.maca` on macOS and the XDG data dir + `/maca` elsewhere. Holds `config.toml`, the ledger `installed.json`, `pins.json`, `custom-registry.json`, `groups/`, `snapshots/`, `cache/brew-index.json`, `logs/`.
 
 Consequence: pointing `MACA_PREFIX` (or `--prefix`) at a temp dir does **not** isolate the ledger, pins, snapshots or registry — `state::Ledger::load()` and `snapshot::*` always read the data dir, and ledger records store absolute cellar paths. Use `MACA_HOME` to isolate everything; there is no CLI flag for it.
@@ -59,7 +59,8 @@ Brew bottle install, in order: fetch formula JSON → recurse into `dependencies
 - Extraction is staged: `extract_bottle` / `extract_tar_gz_to_cellar` unpack into a unique `cellar/.tmp-*` dir and `rename` into place, so a keg that exists is complete (both return early when the keg exists). Package names and versions are checked with `install::valid_component` before they become path components.
 - Links go through `install::place_link`, which replaces an existing entry only if it is a dangling symlink or points into the same package's `cellar/<name>`; anything else is left alone and reported. `link_bins` falls back to scanning `<cellar>/bin` and `sbin` when the metadata lists no executables.
 - State files (ledger, pins, lockfile, snapshot manifest) are written with `install::atomic_write`.
-- Lockfile and group versions are verify-only: backends always install the catalog's current version, and `check_locked_version` in `main.rs` turns a mismatch into a failure.
+- `--version`, group versions and lockfile versions travel in `InstallOptions::version`. GitHub and Aqua fetch that release (tag tried with and without `v`); brew, winget and custom refuse anything but their current version with `Error::Unsupported`. `check_locked_version` in `main.rs` still turns a mismatch after install into a failure, so `sync` rolls back.
+- Casks (`cask:<token>`, `--cask`) install zip/tar archives only; disk images and installer packages are refused in `brew.rs` before any download, and the `.app` stays in the cellar.
 - `source.rs` handles `--build-from-source` (build-system detection) and custom-registry `build_steps` (`{{prefix}}` substitution, shell-style word splitting); logs go to `<data>/logs/`.
 - winget installer execution is `cfg(windows)`-gated; on macOS/Linux only catalog, manifest resolution and `--dry-run` plans run.
 - Artifact downloads (`install::download`) have connect and idle-read timeouts but no total limit; `http_client` (small API calls) has a 20 s total timeout.

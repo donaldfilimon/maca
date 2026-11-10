@@ -81,9 +81,11 @@ something else.
   the wrong one. `maca sync` still rolls back if what comes back is not what the
   lock named.
 - **Per-directory versions.** asdf and mise switch language versions per
-  project. maca installs into a prefix today; a directory-scoped prefix on top
-  of the same cellar is the planned shape, so version switching reuses the
-  installs you already have.
+  project. A `maca.toml` in a directory (or any parent) scopes the prefix, and
+  optionally the cellar, for every command run below it; see
+  [Project files](#project-files). Switching versions per directory on top of
+  one shared cellar is not finished: the ledger still records one install per
+  package per data dir (see [Limits](#limits-honest-scope)).
 - **Casks.** Zip and tar casks install from the Homebrew cask API
   (`maca install cask:<token>`), checksummed, with their binaries linked and
   the app bundle left in the cellar rather than copied into `/Applications`.
@@ -114,7 +116,7 @@ logs and the default prefix) somewhere other than `~/.maca`.
 ```sh
 maca shellenv                      # export PATH, MACA_PREFIX, MANPATH, INFOPATH
 maca shellenv --shell fish         # fish shell configuration
-maca completions zsh > ~/.zfunc/_maca # shell completions (bash, zsh, fish)
+maca completions zsh > ~/.zfunc/_maca # shell completions (bash, zsh, fish, elvish, powershell)
 maca search jq                     # search all backends (cached brew index)
 maca search jq --json              # machine-readable
 maca info jq
@@ -235,14 +237,33 @@ expands to the install destination.
   a unit. `group install` exits non-zero if any member fails or resolves to a
   different version than the group names.
 - **Lockfiles** — `<prefix>/maca.lock.json` records name, version, backend and
-  kind. The catalogs only serve their current version, so `maca sync` cannot
-  fetch an older one: it installs each locked package and **fails, rolling
-  back, if the version it gets differs from the lock**. Packages already at
-  the locked version are skipped. `--prune` runs last and only if every
-  install succeeded.
+  kind. `maca sync` asks the backend for the locked version. GitHub Releases
+  and Aqua can serve an older release, so they install it. Homebrew, winget and
+  custom entries publish only their current version, so the request is refused
+  when it differs. In every case `sync` **fails, rolling back, if the version
+  it gets differs from the lock**. Packages already at the locked version are
+  skipped. `--prune` runs last and only if every install succeeded.
 - **Pins** — `maca pin <pkg>` holds a package at its installed version:
   `upgrade` (CLI and TUI) skips it. A pin cannot name a different version, and
   an unreadable `pins.json` stops `upgrade` rather than releasing the pins.
+
+## Project files
+
+A `maca.toml` in the working directory or any parent scopes maca to that
+tree. The nearest file that names the key wins. Precedence for the prefix is
+`--prefix` / `MACA_PREFIX`, then the project file, then `config.toml`, then
+`<data>/prefix`.
+
+```toml
+prefix = "prefix"        # relative paths resolve against the file's directory
+cellar = "/opt/maca-kegs" # optional: share kegs between several prefixes
+```
+
+The cellar resolves as `MACA_CELLAR`, then the project file, then
+`config.toml`, then `<prefix>/cellar`. A project file that does not parse is an
+error, not a fallback to the global prefix. Only `prefix` and `cellar` are read
+from a project file, so entering a directory can relocate installs but cannot
+change backends, mirrors or the update repository.
 
 ## Layout
 
@@ -332,8 +353,9 @@ renaming the new file into place. The repository's release workflow and
   `MACA_HOME`, but a package can be installed in only one of them; installing
   it into a second prefix is refused. Use a separate `MACA_HOME` per prefix
   for fully independent installs.
-- **Version pinning is verify-only.** A lockfile or group version is checked
-  after install, not requested from the catalog.
+- **Older versions only where the catalog serves them.** `--version`, a group
+  version and a lockfile version are requested from GitHub Releases and Aqua.
+  Homebrew, winget and custom refuse a version that is not the current one.
 - **`scripts/package-release.sh` packages the host build only.** Pushing a
   `v<version>` tag runs `.github/workflows/release.yml`, which attaches the
   Linux x86_64 and macOS arm64 archives to the GitHub release. That workflow

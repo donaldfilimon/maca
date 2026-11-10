@@ -162,6 +162,30 @@ fn test_binary_discovery_and_share_linking() {
 }
 
 #[test]
+fn a_broken_project_file_stops_the_command_instead_of_using_the_global_prefix() {
+    let home = TempHome::new("badproject");
+    let proj = home.0.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::write(proj.join("maca.toml"), "prefix = [oops\n").unwrap();
+    let out = home.cmd().arg("list").current_dir(&proj).output().unwrap();
+    assert!(!out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("maca.toml"), "{err}");
+
+    // A good one scopes the prefix: shellenv reports it.
+    std::fs::write(proj.join("maca.toml"), "prefix = \"scoped\"\n").unwrap();
+    let out = home
+        .cmd()
+        .args(["shellenv", "--shell", "bash"])
+        .current_dir(&proj)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("scoped"), "{text}");
+}
+
+#[test]
 fn test_list_command() {
     let home = TempHome::new("list");
     let out = home.cmd().arg("list").output().unwrap();

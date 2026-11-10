@@ -157,27 +157,27 @@ fn default_prefix() -> PathBuf {
 /// This is how a directory gets its own install root without a flag: a project
 /// checks in `prefix = "..."` and every command run inside it uses that
 /// prefix. `--prefix` and `MACA_PREFIX` still win, because both are explicit.
-pub fn project_prefix(start: &std::path::Path) -> Option<PathBuf> {
-    let mut dir = if start.is_dir() {
-        Some(start)
-    } else {
-        start.parent()
-    };
-    while let Some(cur) = dir {
-        let file = cur.join("maca.toml");
-        if let Some(p) = prefix_in_project_file(&file) {
-            return Some(if p.is_absolute() { p } else { cur.join(p) });
-        }
-        dir = cur.parent();
-    }
-    None
+///
+/// A `maca.toml` that cannot be read or parsed is an error: silently skipping
+/// it would install into the global prefix when the project asked for its own.
+pub fn project_prefix(start: &std::path::Path) -> Result<Option<PathBuf>> {
+    project_value(start, |cfg| cfg.prefix)
 }
 
 /// The nearest `maca.toml` walking up from `start`, if one names a cellar root.
 ///
 /// Combined with `project_prefix`, this lets a project share a common
 /// keg location while keeping its own bin/opt/share links under its prefix.
-pub fn project_cellar(start: &std::path::Path) -> Option<PathBuf> {
+pub fn project_cellar(start: &std::path::Path) -> Result<Option<PathBuf>> {
+    project_value(start, |cfg| cfg.cellar)
+}
+
+/// Walk up from `start` to the first `maca.toml` for which `pick` yields a
+/// non-empty path, resolving a relative path against that file's directory.
+fn project_value(
+    start: &std::path::Path,
+    pick: impl Fn(Config) -> Option<PathBuf>,
+) -> Result<Option<PathBuf>> {
     let mut dir = if start.is_dir() {
         Some(start)
     } else {
@@ -185,24 +185,22 @@ pub fn project_cellar(start: &std::path::Path) -> Option<PathBuf> {
     };
     while let Some(cur) = dir {
         let file = cur.join("maca.toml");
-        if let Some(c) = cellar_in_project_file(&file) {
-            return Some(if c.is_absolute() { c } else { cur.join(c) });
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                let cfg: Config = toml::from_str(&text)
+                    .map_err(|e| Error::Config(format!("parse {}: {e}", file.display())))?;
+                if let Some(p) = pick(cfg).filter(|p| !p.as_os_str().is_empty()) {
+                    return Ok(Some(if p.is_absolute() { p } else { cur.join(p) }));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::Config(format!("read {}: {e}", file.display())));
+            }
         }
         dir = cur.parent();
     }
-    None
-}
-
-fn prefix_in_project_file(path: &std::path::Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let cfg: Config = toml::from_str(&text).ok()?;
-    cfg.prefix.filter(|p| !p.as_os_str().is_empty())
-}
-
-fn cellar_in_project_file(path: &std::path::Path) -> Option<PathBuf> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let cfg: Config = toml::from_str(&text).ok()?;
-    cfg.cellar.filter(|c| !c.as_os_str().is_empty())
+    Ok(None)
 }
 
 /// True when `path` lies inside `root`. Compared as written first, then with
@@ -307,16 +305,42 @@ mod tests {
         let nested = root.join("src");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(root.join("maca.toml"), "prefix = \"prefix\"\n").unwrap();
-        assert_eq!(project_prefix(&nested), Some(root.join("prefix")));
+        assert_eq!(project_prefix(&nested).unwrap(), Some(root.join("prefix")));
 
         // The nearer file wins over the one further up.
         std::fs::write(nested.join("maca.toml"), "prefix = \"/opt/near\"\n").unwrap();
-        assert_eq!(project_prefix(&nested), Some(PathBuf::from("/opt/near")));
+        assert_eq!(
+            project_prefix(&nested).unwrap(),
+            Some(PathBuf::from("/opt/near"))
+        );
 
         // A file that names no prefix is not a project, so the walk continues.
         std::fs::write(nested.join("maca.toml"), "default_backend = \"brew\"\n").unwrap();
-        assert_eq!(project_prefix(&nested), Some(root.join("prefix")));
+        assert_eq!(project_prefix(&nested).unwrap(), Some(root.join("prefix")));
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unparseable_project_file_is_an_error_not_a_fallback() {
+        let root = std::env::temp_dir().join(format!("maca-badproj-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("maca.toml"), "prefix = [not toml\n").unwrap();
+        assert!(project_prefix(&root).is_err());
+        assert!(project_cellar(&root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_project_file_can_name_a_cellar_relative_to_itself() {
+        let root = std::env::temp_dir().join(format!("maca-cellarproj-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("maca.toml"), "cellar = \"kegs\"\n").unwrap();
+        assert_eq!(
+            project_cellar(&root.join("a/b")).unwrap(),
+            Some(root.join("kegs"))
+        );
+        assert_eq!(project_prefix(&root.join("a/b")).unwrap(), None);
         let _ = std::fs::remove_dir_all(&root);
     }
 

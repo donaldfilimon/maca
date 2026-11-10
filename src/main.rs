@@ -410,23 +410,26 @@ impl Ctx {
                 .unwrap_or(BackendKind::Auto)
         });
         // Resolve prefix first (flag or MACA_PREFIX > project maca.toml > config > default).
-        let resolved_prefix = prefix.unwrap_or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .and_then(|dir| config::project_prefix(&dir))
-                .unwrap_or_else(|| cfg.prefix())
-        });
-        // Cellar resolution: MACA_CELLAR > project or user config `cellar` > <prefix>/cellar.
-        let resolved_cellar = std::env::current_dir()
+        // A project file that does not parse is an error, not a fallback.
+        let cwd = std::env::current_dir().ok();
+        let project_prefix = match &cwd {
+            Some(dir) => config::project_prefix(dir)?,
+            None => None,
+        };
+        let project_cellar = match &cwd {
+            Some(dir) => config::project_cellar(dir)?,
+            None => None,
+        };
+        let resolved_prefix = match prefix {
+            Some(p) => p,
+            None => project_prefix.unwrap_or_else(|| cfg.prefix()),
+        };
+        // Cellar resolution: MACA_CELLAR > project `cellar` > config `cellar` > <prefix>/cellar.
+        let resolved_cellar = std::env::var("MACA_CELLAR")
             .ok()
-            .and_then(|dir| config::project_cellar(&dir))
-            .map(|c| {
-                if c.is_absolute() {
-                    c
-                } else {
-                    resolved_prefix.join(c)
-                }
-            })
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .or(project_cellar)
             .or_else(|| {
                 cfg.cellar.as_ref().map(|c| {
                     if c.is_absolute() {
@@ -435,12 +438,6 @@ impl Ctx {
                         resolved_prefix.join(c)
                     }
                 })
-            })
-            .or_else(|| {
-                std::env::var("MACA_CELLAR")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(PathBuf::from)
             })
             .unwrap_or_else(|| config::cellar_dir(&resolved_prefix));
         Ok(Self {
