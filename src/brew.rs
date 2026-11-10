@@ -18,7 +18,12 @@ use crate::state;
 use crate::{Error, Result};
 
 const FORMULA_API: &str = "https://formulae.brew.sh/api/formula";
-const CASK_API: &str = "https://formulae.brew.sh/api/cask";
+fn cask_api() -> String {
+    std::env::var("MACA_CASK_API")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://formulae.brew.sh/api/cask".to_string())
+}
 const FORMULA_INDEX: &str = "https://formulae.brew.sh/api/formula.json";
 const GHCR_TOKEN: &str = "https://ghcr.io/token";
 const INDEX_TTL_SECS: u64 = 3600;
@@ -121,8 +126,12 @@ fn plan_cask(body: &serde_json::Value) -> Result<CaskPlan> {
         .filter(|s| install::valid_component(s))
         .ok_or_else(|| Error::Unsupported(format!("cask {token} has no usable version")))?;
     let url = json_str(body, "url")
-        .filter(|s| s.starts_with("https://"))
-        .ok_or_else(|| Error::Unsupported(format!("cask {token} has no https url")))?;
+        .filter(|s| {
+            s.starts_with("https://")
+                || s.starts_with("http://127.0.0.1")
+                || s.starts_with("http://localhost")
+        })
+        .ok_or_else(|| Error::Unsupported(format!("cask {token} has no allowed url")))?;
     let archive = cask_archive(&url).ok_or_else(|| {
         Error::Unsupported(format!(
             "cask {token} ships as {url}, which is not a zip or tar archive; \
@@ -214,7 +223,8 @@ fn json_str(body: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 async fn fetch_cask_json(token: &str) -> Result<serde_json::Value> {
-    let url = format!("{CASK_API}/{token}.json");
+    let base = cask_api();
+    let url = format!("{base}/{token}.json");
     let data = install::download(&url).await.map_err(|e| match e {
         Error::Network(m) if m.contains("404") => {
             Error::NotFound(format!("cask '{token}' not found"))

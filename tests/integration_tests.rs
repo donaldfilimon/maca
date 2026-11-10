@@ -751,6 +751,64 @@ fn e2e_binary_kind_build_steps_and_groups() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_cask_zip_install() {
+    use std::io::Write;
+    let script = b"#!/bin/sh\necho cask-bin\n";
+    // Build a zip archive in memory.
+    let mut zip_buffer = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut zip_buffer);
+        let options: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .unix_permissions(0o755);
+        zip.start_file("cask/tool.sh", options).unwrap();
+        zip.write_all(script).unwrap();
+        zip.finish().unwrap();
+    }
+    let zip_bytes = zip_buffer.into_inner();
+
+    let mut routes = HashMap::new();
+    // serve the zip at /tool.zip
+    routes.insert("/tool.zip".to_string(), zip_bytes.clone());
+    let base = serve(routes);
+    // fix cask url
+    let cask_json = serde_json::json!({
+        "token": "casktool",
+        "version": "1.2.3",
+        "url": format!("{}/tool.zip", base),
+        "sha256": "no_check",
+        "artifacts": [
+            {"binary": ["tool.sh"], "target": "$HOMEBREW_PREFIX/bin/casktool"}
+        ]
+    });
+    std::fs::write(
+        std::env::temp_dir().join("cask.json"),
+        cask_json.to_string(),
+    )
+    .unwrap();
+
+    // We need a second server for the cask JSON metadata. Since serve() takes one map, and our map above
+    // didn't include /cask/casktool.json, let's hack by starting a new `serve` with both.
+    let mut routes = HashMap::new();
+    routes.insert("/tool.zip".to_string(), zip_bytes.clone());
+    routes.insert(
+        "/cask/casktool.json".to_string(),
+        cask_json.to_string().into_bytes(),
+    );
+    let base = serve(routes);
+    let cask_api = format!("{}/cask", base);
+
+    let sb = Sandbox::new("caskzip");
+    let (success, text) = sb.run_env(
+        &["install", "cask:casktool", "--backend", "brew"],
+        &[("MACA_CASK_API", &cask_api)],
+    );
+    assert!(success, "install failed:\n{text}");
+    assert_eq!(sb.exec("casktool"), "cask-bin");
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_prefixes_and_snapshot_scopes_stay_isolated() {
     let a1 = script_tarball("a", "alpha", "alpha-1");
     let a2 = script_tarball("a", "alpha", "alpha-2");
