@@ -2,7 +2,9 @@
 //!
 //! Each backend implements search/info/install via native HTTP APIs.
 //! No backend shells out to `brew` or `winget` for catalog operations.
-//! Uses Rust 2024 native `async fn` in traits (no proc-macro needed).
+//! Backends are concrete structs sharing method names (`search`, `info`,
+//! `plan`, `install`) by convention; there is no trait. Dispatch is a `match`
+//! on [`BackendKind`] here and in `main.rs`.
 
 use serde::{Deserialize, Serialize};
 
@@ -117,7 +119,7 @@ pub fn auto_search_order() -> [BackendKind; 3] {
 /// Search every backend in auto order, merging results. Backends run
 /// concurrently so one slow or failing catalog does not stall the others.
 pub async fn search_all(query: &str, limit: usize) -> Vec<Package> {
-    let custom_reg = match custom::Registry::load_merged(&[]).await {
+    let custom_reg = match custom::Registry::load_configured().await {
         Ok(reg) => Some(reg),
         Err(e) => {
             tracing::warn!("custom registry: {e}");
@@ -159,7 +161,7 @@ pub async fn install_with_backend(
         BackendKind::Brew => brew::BrewBackend::new().install(name, opts).await,
         BackendKind::Winget => winget::WingetBackend::new().install(name, opts).await,
         BackendKind::Custom => {
-            let reg = custom::Registry::load_local()?;
+            let reg = custom::Registry::load_configured().await?;
             custom::CustomBackend::new(reg).install(name, opts).await
         }
         BackendKind::Auto => auto_install(name, opts).await,
@@ -167,13 +169,13 @@ pub async fn install_with_backend(
 }
 
 async fn auto_install(name: &str, opts: &InstallOptions) -> Result<InstallOutcome> {
-    if let Ok(reg) = custom::Registry::load_local() {
+    if let Ok(reg) = custom::Registry::load_configured().await {
         let custom_backend = custom::CustomBackend::new(reg);
         if custom_backend.plan(name).is_ok() {
             return custom_backend.install(name, opts).await;
         }
     }
-    if brew::BrewBackend::new().plan(name).await.is_ok() {
+    if brew::BrewBackend::new().can_install(name).await {
         return brew::BrewBackend::new().install(name, opts).await;
     }
     winget::WingetBackend::new().install(name, opts).await
@@ -181,34 +183,42 @@ async fn auto_install(name: &str, opts: &InstallOptions) -> Result<InstallOutcom
 
 /// Remove an installed package by name, using the prefix's ledger.
 pub fn remove_with_prefix(prefix: &std::path::Path, name: &str) -> Result<()> {
-    let mut ledger = state::Ledger::load()?;
+    let ledger = state::Ledger::load()?;
     let record = ledger
         .get(name)
         .cloned()
         .ok_or_else(|| crate::Error::NotFound(format!("package '{name}' is not installed")))?;
-    if record.cellar.exists() {
-        std::fs::remove_dir_all(&record.cellar)?;
-        if let Some(parent) = record.cellar.parent() {
-            let _ = std::fs::remove_dir(parent);
-        }
+    // Only the keg the ledger records is removed; `upgrade` reclaims the
+    // previous version itself, so nothing else under `cellar/<name>` is ours
+    // to delete.
+    remove_keg(prefix, &record.cellar)?;
+    if let Some(name_dir) = record.cellar.parent() {
+        let _ = std::fs::remove_dir(name_dir); // only if now empty
     }
+    let opt_link = prefix.join("opt").join(name);
+    if std::fs::read_link(&opt_link).is_ok_and(|t| !t.exists()) {
+        let _ = std::fs::remove_file(&opt_link);
+    }
+    state::remove_record(name)?;
+    Ok(())
+}
+
+/// Delete one keg directory together with the share and bin links that point
+/// into it. Links that point anywhere else are left alone.
+pub fn remove_keg(prefix: &std::path::Path, keg: &std::path::Path) -> Result<()> {
+    let _ = install::unlink_share(keg, prefix);
     let bin_dir = config::bin_dir(prefix);
     if bin_dir.exists() {
         for entry in std::fs::read_dir(&bin_dir)?.flatten() {
             let link = entry.path();
-            if let Ok(target) = read_link_target(&link) {
-                if target.starts_with(&record.cellar) && !target.exists() {
-                    let _ = std::fs::remove_file(&link);
-                }
+            if read_link_target(&link).is_ok_and(|t| t.starts_with(keg)) {
+                let _ = std::fs::remove_file(&link);
             }
         }
     }
-    let opt_link = prefix.join("opt").join(name);
-    if opt_link.symlink_metadata().is_ok() {
-        let _ = std::fs::remove_file(&opt_link);
+    if keg.is_dir() {
+        std::fs::remove_dir_all(keg)?;
     }
-    ledger.remove(name);
-    ledger.save()?;
     Ok(())
 }
 
@@ -234,12 +244,25 @@ pub async fn upgrade_with_prefix(prefix: &std::path::Path, name: &str) -> Result
         .get(name)
         .cloned()
         .ok_or_else(|| crate::Error::NotFound(format!("package '{name}' is not installed")))?;
+    if state::is_pinned(&record.name)? {
+        return Ok(format!(
+            "{} {} is pinned; skipping",
+            record.name, record.version
+        ));
+    }
     let opts = InstallOptions {
         dry_run: false,
         prefix: prefix.to_path_buf(),
+        kind: record.kind,
         ..Default::default()
     };
     let outcome = install_with_backend(&record.backend, &record.name, &opts).await?;
+    // The new keg, its links and its ledger record are in place; reclaim the
+    // previous version's keg unless this was a same-version reinstall.
+    if outcome.cellar_path != record.cellar && record.cellar.starts_with(config::cellar_dir(prefix))
+    {
+        remove_keg(prefix, &record.cellar)?;
+    }
     Ok(format!(
         "upgraded {} {} -> {}",
         outcome.name, record.version, outcome.version
@@ -249,7 +272,7 @@ pub async fn upgrade_with_prefix(prefix: &std::path::Path, name: &str) -> Result
 use crate::config;
 use crate::custom::{self, CustomBackend};
 use crate::state;
-use crate::{Result, brew, winget};
+use crate::{Result, brew, install, winget};
 
 #[cfg(test)]
 mod tests {

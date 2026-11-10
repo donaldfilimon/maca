@@ -11,6 +11,7 @@ repository = "https://github.com/donaldfilimon/maca"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = "0.28"
 directories = "6"
 fd-lock = "4"

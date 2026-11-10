@@ -98,14 +98,37 @@ impl Registry {
         }
         let text =
             serde_json::to_string_pretty(self).map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
-        std::fs::write(&path, text)?;
-        Ok(())
+        install::atomic_write(&path, text.as_bytes())
+    }
+
+    /// Local registry merged with the mirrors listed in `config.toml`
+    /// (`custom_registry_urls`). Used by install and auto-search paths so a
+    /// package found on a mirror can also be installed. An unreachable or
+    /// malformed mirror degrades to the local registry rather than blocking
+    /// local packages.
+    pub async fn load_configured() -> Result<Self> {
+        let urls = config::Config::load()?.custom_registry_urls;
+        if urls.is_empty() {
+            return Self::load_local();
+        }
+        match Self::load_merged(&urls).await {
+            Ok(reg) => Ok(reg),
+            Err(e) => {
+                tracing::warn!("custom registry mirrors unavailable, using local only: {e}");
+                Self::load_local()
+            }
+        }
     }
 
     /// Merge local + HTTP mirrors (mirrors are additive, local wins on conflict).
     pub async fn load_merged(extra_urls: &[String]) -> Result<Self> {
         let mut merged = Self::load_local()?;
         for url in extra_urls {
+            if !mirror_url_allowed(url) {
+                return Err(Error::Config(format!(
+                    "custom registry mirror {url} must use https (plain http is allowed only for localhost)"
+                )));
+            }
             let bytes = install::download(url).await?;
             let remote: Registry = serde_json::from_slice(&bytes)
                 .map_err(|e| Error::Network(format!("decoding registry {url}: {e}")))?;
@@ -252,6 +275,13 @@ impl CustomBackend {
             .registry
             .find(name)
             .ok_or_else(|| Error::NotFound(format!("custom package '{name}' not found")))?;
+        // Name and version become path components under the cellar and bin/.
+        if !install::valid_component(&entry.name) || !install::valid_component(&entry.version) {
+            return Err(Error::Unsupported(format!(
+                "custom package {:?} version {:?} is not a valid name/version (no path separators, `.` or `..`)",
+                entry.name, entry.version
+            )));
+        }
         let (key, art) = pick_artifact(entry).ok_or_else(|| {
             Error::Unsupported(format!(
                 "custom package '{}' has no artifact for this host (have: {})",
@@ -295,6 +325,12 @@ impl CustomBackend {
             });
         }
         let bytes = install::download(&plan.url).await?;
+        if plan.sha256.is_none() {
+            eprintln!(
+                "maca: warning: custom package {} declares no sha256; installing {} UNVERIFIED",
+                plan.name, plan.url
+            );
+        }
         install::verify_sha256(&plan.name, &bytes, plan.sha256.as_deref())?;
         // Source build path: the entry declares build_steps, so the artifact is
         // a source tree that is compiled into the cellar.
@@ -311,8 +347,22 @@ impl CustomBackend {
                 install::extract_tar_gz_to_cellar("src", &plan.name, &bytes, &scratch)?;
             let cellar = cellar_for(&opts.prefix, &plan.name, &plan.version);
             let built =
-                source::run_steps(&source_dir, &cellar, &entry.build_steps, opts.jobs.max(1))?;
+                match source::run_steps(&source_dir, &cellar, &entry.build_steps, opts.jobs.max(1))
+                {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // Steps install straight into the keg; a failed build
+                        // must not leave a partial one that looks installed.
+                        let _ = std::fs::remove_dir_all(&cellar);
+                        if let Some(name_dir) = cellar.parent() {
+                            let _ = std::fs::remove_dir(name_dir);
+                        }
+                        let _ = std::fs::remove_dir_all(&scratch);
+                        return Err(e);
+                    }
+                };
             let linked = link_all_bins(&cellar, &opts.prefix)?;
+            let _ = install::link_share(&cellar, &opts.prefix);
             state::upsert_record(state::record_with_kind(
                 &plan.name,
                 &plan.version,
@@ -341,6 +391,7 @@ impl CustomBackend {
                 )?;
                 // Link any `bin/*` files into the prefix bin.
                 let linked = link_all_bins(&cellar, &opts.prefix)?;
+                let _ = install::link_share(&cellar, &opts.prefix);
                 state::upsert_record(state::record_with_kind(
                     &plan.name,
                     &plan.version,
@@ -389,6 +440,21 @@ impl CustomBackend {
             }
         }
     }
+}
+
+/// Mirrors supply download URLs and build steps, so they must not be
+/// fetched over a tamperable transport. Loopback http is allowed for local
+/// mirrors and tests.
+pub fn mirror_url_allowed(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("https://")
+        || ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+            .iter()
+            .any(|p| {
+                lower
+                    .strip_prefix(p)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
+            })
 }
 
 pub fn cellar_for(prefix: &Path, name: &str, version: &str) -> PathBuf {
@@ -463,5 +529,63 @@ mod tests {
         let backend = CustomBackend { registry: reg };
         assert_eq!(backend.search("hello", 10).unwrap().len(), 1);
         assert_eq!(backend.search("zzz", 10).unwrap().len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod mirror_tests {
+    use super::*;
+
+    #[test]
+    fn mirrors_must_be_https_or_loopback() {
+        for ok in [
+            "https://example.com/reg.json",
+            "HTTPS://example.com/reg.json",
+            "http://127.0.0.1:8080/reg.json",
+            "http://localhost/reg.json",
+            "http://[::1]:9/reg.json",
+        ] {
+            assert!(mirror_url_allowed(ok), "{ok} should be allowed");
+        }
+        for bad in [
+            "http://example.com/reg.json",
+            "http://127.0.0.1.evil.com/reg.json",
+            "http://localhost.evil.com/",
+            "ftp://example.com/reg.json",
+            "file:///etc/passwd",
+        ] {
+            assert!(!mirror_url_allowed(bad), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn plan_refuses_traversing_name_or_version() {
+        let art = Artifact {
+            url: "https://example.com/x.tar.gz".into(),
+            sha256: None,
+            kind: ArtifactKind::TarGz,
+        };
+        let mut reg = Registry::default();
+        for (name, version) in [("../evil", "1.0"), ("ok", "../../x"), ("a/b", "1.0")] {
+            let mut artifacts = BTreeMap::new();
+            for key in ["macos", "linux", "windows"] {
+                artifacts.insert(key.to_string(), art.clone());
+            }
+            reg.upsert(Entry {
+                name: name.into(),
+                version: version.into(),
+                description: String::new(),
+                homepage: String::new(),
+                artifacts,
+                build_steps: vec![],
+            });
+        }
+        let backend = CustomBackend::new(reg);
+        for name in ["../evil", "ok", "a/b"] {
+            assert!(
+                matches!(backend.plan(name), Err(Error::Unsupported(_))),
+                "plan({name}) should be refused"
+            );
+        }
     }
 }

@@ -18,14 +18,19 @@ first backend that can resolve a plan handle the install.
 
 ```sh
 cargo build --release
-export PATH="$HOME/.maca/prefix/bin:$PATH"
+eval "$(./target/release/maca shellenv)"
 ```
 
-Override the prefix with `--prefix` or `MACA_PREFIX`.
+Override the prefix with `--prefix` or `MACA_PREFIX`. Set `MACA_HOME` to move
+the whole data directory (ledger, pins, snapshots, groups, registry, cache,
+logs and the default prefix) somewhere other than `~/.maca`.
 
 ## Commands
 
 ```sh
+maca shellenv                      # export PATH, MACA_PREFIX, MANPATH, INFOPATH
+maca shellenv --shell fish         # fish shell configuration
+maca completions zsh > ~/.zfunc/_maca # shell completions (bash, zsh, fish)
 maca search jq                     # search all backends (cached brew index)
 maca search jq --json              # machine-readable
 maca info jq
@@ -37,6 +42,8 @@ maca app install code              # kind-specific aliases
 maca plugin install ...
 maca cli install jq
 maca list --kind cli
+maca outdated                      # check for newer versions without upgrading
+maca outdated --json
 maca upgrade                       # honours pins
 maca remove jq
 maca why oniguruma                 # reverse dependencies
@@ -46,7 +53,8 @@ maca group add dev jq --backend brew --kind cli
 maca group install dev             # concurrent
 maca group export dev              # writes a lockfile
 maca lock                          # lockfile from the ledger
-maca sync                          # install exactly what the lock pins
+maca sync                          # install what the lock names; fails if a version differs
+maca sync --prune                  # also remove packages the lock does not name
 
 maca pin jq                        # pin to the installed version
 maca unpin jq
@@ -55,11 +63,14 @@ maca snapshot create --note "before upgrade"
 maca snapshot list
 maca snapshot restore <id>
 maca snapshot delete <id>
+maca snapshot prune --keep 5       # keep N latest snapshots
+maca clean                         # clean logs, tempdirs, prune snapshots
+maca clean --all                   # also clean 31 MiB catalog cache
 
 maca self-update --check
 maca self-update
 maca tui                           # interactive terminal UI
-maca doctor
+maca doctor                        # diagnostics: prefix, toolchain, network, symlinks
 maca custom add --name hello --version 1.0.0 \
   --url https://example.com/hello.tar.gz --sha256 <hex>
 maca custom list
@@ -72,9 +83,23 @@ maca custom remove hello
   concurrent maca processes cannot race the ledger or cellar.
 - **Concurrent installs** with a bounded job pool (`--jobs`, default 4); ledger
   writes are serialized.
-- **Automatic snapshot** before `install`/`remove`/`upgrade` (disable with
-  `--no-snapshot`). A failed operation rolls the prefix back automatically.
-- **SHA-256 verification** of every artifact against its catalog metadata.
+- **Automatic snapshot** before `install`/`remove`/`upgrade`/`sync`/`group
+  install` and before each TUI action (disable
+  with `--no-snapshot` where offered). A failed operation rolls the prefix back
+  automatically: kegs, links and ledger entries created after the snapshot are
+  removed, and the snapshotted ones are put back.
+- **SHA-256 verification** of every artifact that declares a checksum. Bottles
+  always do. A custom registry entry without `sha256` is installed with a
+  loud warning; the hash guards against a corrupted or swapped download, not
+  against a registry you should not trust.
+- **Nothing foreign is overwritten**: a `bin/` or `share/` entry that belongs
+  to another package or is a file of your own is left in place and reported.
+- **Staged extraction and atomic state writes**: a keg appears at its final
+  path only after a complete unpack, and the ledger, pins, lockfile and
+  snapshot manifests are written through a temp file and a rename.
+- **Custom registry mirrors** must be `https://` (plain `http://` is accepted
+  only for localhost). Package names and versions that are not plain path
+  components are refused.
 - **Mach-O relocation**: bottles are rewritten with `install_name_tool`
   (`@@HOMEBREW_CELLAR@@`, `@@HOMEBREW_PREFIX@@`) and ad-hoc re-signed with
   `codesign`, so they run on Apple Silicon. These are Apple developer tools,
@@ -104,11 +129,18 @@ expands to the install destination.
 
 - **Kinds** — `app`, `plugin`, `cli`, `library`, `other` — recorded per package
   and filterable (`maca list --kind cli`).
-- **Groups** — named profiles of packages with optional version pins, installed
-  as a unit.
-- **Lockfiles** — `<prefix>/maca.lock.json` pins exact versions; `maca sync`
-  reproduces a machine.
-- **Pins** — `maca pin <pkg>` keeps `upgrade` from touching a package.
+- **Groups** — named profiles of packages with optional versions, installed as
+  a unit. `group install` exits non-zero if any member fails or resolves to a
+  different version than the group names.
+- **Lockfiles** — `<prefix>/maca.lock.json` records name, version, backend and
+  kind. The catalogs only serve their current version, so `maca sync` cannot
+  fetch an older one: it installs each locked package and **fails, rolling
+  back, if the version it gets differs from the lock**. Packages already at
+  the locked version are skipped. `--prune` runs last and only if every
+  install succeeded.
+- **Pins** — `maca pin <pkg>` holds a package at its installed version:
+  `upgrade` (CLI and TUI) skips it. A pin cannot name a different version, and
+  an unreadable `pins.json` stops `upgrade` rather than releasing the pins.
 
 ## Layout
 
@@ -123,6 +155,7 @@ expands to the install destination.
 ~/.maca/prefix/cellar/<name>/<ver>/ # extracted artifacts
 ~/.maca/prefix/opt/<name>           # Homebrew-style keg symlink
 ~/.maca/prefix/bin/<exe>            # symlinks into the cellar
+~/.maca/prefix/share/...            # symlinks for man pages, info docs, completions
 ```
 
 ## TUI
@@ -143,10 +176,11 @@ expands to the install destination.
 `maca self-update` fetches the latest GitHub release of the configured repo
 (`MACA_UPDATE_REPO` or `update_repo` in config, default `donaldfilimon/maca`),
 downloads the asset for the host target, verifies its `.sha256` companion,
-backs up the current binary, and replaces itself.
+backs up the current binary, and replaces itself. A release without the
+`.sha256` file is refused unless `--force` is given.
 
-Release asset convention: `maca-<target>-<version>.tar.gz` plus
-`maca-<target>-<version>.tar.gz.sha256`, where `<target>` is a Rust target
+Release asset convention: `maca-<target>.tar.gz` plus
+`maca-<target>.tar.gz.sha256`, where `<target>` is a Rust target
 triple such as `aarch64-apple-darwin`.
 
 ## Limits (honest scope)
@@ -163,8 +197,15 @@ triple such as `aarch64-apple-darwin`.
   clear message and a log path.
 - **Homebrew dependency resolution** follows the formula `dependencies` list;
   `uses_from_macos` entries are treated as system-provided.
-- **Snapshots clone directories** (`clonefile` on APFS, recursive copy
-  elsewhere), so a snapshot of a large prefix is not free.
+- **Snapshots cover every installed package.** On APFS they are copy-on-write
+  clones (`cp -c`), so they take no extra space until files change; elsewhere
+  they are full recursive copies, so a snapshot of a large prefix is not free.
+- **Version pinning is verify-only.** A lockfile or group version is checked
+  after install, not requested from the catalog.
+- **`scripts/package-release.sh` packages the host build only.** Pushing a
+  `v<version>` tag runs `.github/workflows/release.yml`, which attaches the
+  Linux x86_64 and macOS arm64 archives to the GitHub release. That workflow
+  has not run yet, so no release exists for `self-update` to download.
 
 ## Development
 

@@ -4,6 +4,11 @@ set -eu
 
 cd "$(dirname "$0")"
 
+# Ensure cargo and rustc are found on standard macOS/Linux developer paths
+if ! command -v cargo >/dev/null 2>&1; then
+    export PATH="/opt/homebrew/bin:$HOME/.cargo/bin:$PATH"
+fi
+
 echo "== cargo fmt --check =="
 cargo fmt --check
 

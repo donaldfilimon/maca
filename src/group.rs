@@ -95,8 +95,7 @@ impl Group {
             std::fs::create_dir_all(parent)?;
         }
         let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, text)?;
-        Ok(())
+        crate::install::atomic_write(&path, text.as_bytes())
     }
 
     pub fn upsert(&mut self, entry: GroupEntry) {
@@ -157,6 +156,9 @@ pub struct LockEntry {
     pub name: String,
     pub version: String,
     pub backend: String,
+    /// Package kind to record on install. Absent in older lockfiles.
+    #[serde(default = "default_kind")]
+    pub kind: Kind,
 }
 
 pub fn lock_path(prefix: &std::path::Path) -> PathBuf {
@@ -173,6 +175,7 @@ pub fn write_lock(prefix: &std::path::Path) -> Result<Lockfile> {
             name: r.name.clone(),
             version: r.version.clone(),
             backend: r.backend.clone(),
+            kind: r.kind,
         })
         .collect();
     let lock = Lockfile {
@@ -181,7 +184,10 @@ pub fn write_lock(prefix: &std::path::Path) -> Result<Lockfile> {
         packages,
     };
     crate::config::ensure_dirs(prefix)?;
-    std::fs::write(lock_path(prefix), serde_json::to_string_pretty(&lock)?)?;
+    crate::install::atomic_write(
+        &lock_path(prefix),
+        serde_json::to_string_pretty(&lock)?.as_bytes(),
+    )?;
     Ok(lock)
 }
 
@@ -245,6 +251,7 @@ mod tests {
                 name: "jq".into(),
                 version: "1.8.2".into(),
                 backend: "brew".into(),
+                kind: Kind::Cli,
             }],
         };
         let text = serde_json::to_string(&lock).unwrap();

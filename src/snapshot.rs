@@ -2,12 +2,14 @@
 //!
 //! A snapshot captures the install ledger plus the cellar directories and bin
 //! links for a set of packages. Restoring replaces the current state with the
-//! captured one. On macOS directories are cloned with `clonefile` (copy-on-write,
-//! cheap and instant); elsewhere a recursive copy is used.
+//! captured one, including removing kegs and links that appeared afterwards.
+//! On macOS directories are cloned with `cp -c` (APFS copy-on-write); elsewhere
+//! a recursive copy is used.
 //!
 //! Snapshots live under `<data>/snapshots/<id>/`.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,35 @@ pub struct SnapshotManifest {
     #[serde(default)]
     pub bin_links: Vec<BinLink>,
     pub ledger: serde_json::Value,
+    /// Every `cellar/<name>/<version>` directory that existed in the prefix
+    /// when the snapshot was taken, whether or not maca's ledger knew about
+    /// it. Restore removes only kegs that are absent from this list, so
+    /// anything that was already there (another data dir's packages, files
+    /// the user placed) is never deleted. `None` in manifests written before
+    /// this field existed.
+    #[serde(default)]
+    pub kegs: Option<Vec<PathBuf>>,
+}
+
+/// All `<cellar_root>/<name>/<version>` directories, skipping staging dirs.
+fn existing_kegs(cellar_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(names) = std::fs::read_dir(cellar_root) else {
+        return out;
+    };
+    for name_entry in names.flatten() {
+        let fname = name_entry.file_name();
+        let fname = fname.to_string_lossy();
+        let name_dir = name_entry.path();
+        if !name_dir.is_dir() || fname.starts_with('.') || fname.starts_with("__tmp") {
+            continue;
+        }
+        if let Ok(kegs) = std::fs::read_dir(&name_dir) {
+            out.extend(kegs.flatten().map(|k| k.path()).filter(|k| k.is_dir()));
+        }
+    }
+    out.sort();
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,12 +160,17 @@ pub fn create(prefix: &Path, reason: &str, only: &[String]) -> Result<SnapshotMa
         packages,
         bin_links,
         ledger: ledger_json.clone(),
+        kegs: Some(existing_kegs(&config::cellar_dir(prefix))),
     };
-    let text = serde_json::to_string_pretty(&manifest)?;
-    std::fs::write(dir.join("manifest.json"), text)?;
     std::fs::write(
         dir.join("ledger.json"),
         serde_json::to_string_pretty(&ledger)?,
+    )?;
+    // The manifest is written last and atomically: `list` and `restore` only
+    // see a snapshot whose kegs were all copied.
+    crate::install::atomic_write(
+        &dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
     )?;
     tracing::info!(
         "snapshot {id} created ({} packages, reason: {reason})",
@@ -160,45 +196,137 @@ pub fn restore(id: &str, prefix: &Path) -> Result<SnapshotManifest> {
             prefix.display()
         )));
     }
-    // Remove the current cellars for the snapshotted packages, then copy back.
+    // 1. Validate before touching anything: every snapshotted keg must still
+    //    be present in the snapshot directory.
     for pkg in &manifest.packages {
+        let src = dir.join("cellar").join(&pkg.name).join(&pkg.version);
+        if !src.is_dir() {
+            return Err(Error::Other(anyhow::anyhow!(
+                "snapshot {id} is incomplete: missing copy of {} {}; nothing was changed",
+                pkg.name,
+                pkg.version
+            )));
+        }
+    }
+    let snap_ledger: Ledger = serde_json::from_value(manifest.ledger.clone())
+        .map_err(|e| Error::Config(format!("parse snapshot ledger: {e}")))?;
+
+    // 2. Remove kegs that appeared after the snapshot (a new install, the new
+    //    version of an upgrade, or a keg left by a failed install that never
+    //    reached the ledger). Only kegs that did not exist at snapshot time
+    //    are removed; anything that was already in the cellar stays, even if
+    //    this ledger never knew about it.
+    let cellar_root = config::cellar_dir(prefix);
+    let created_since: Vec<PathBuf> = match &manifest.kegs {
+        Some(then) => existing_kegs(&cellar_root)
+            .into_iter()
+            .filter(|keg| !then.contains(keg))
+            .collect(),
+        // Older manifest without the list: fall back to what the ledgers can
+        // prove, i.e. kegs the current ledger records and the snapshot's
+        // ledger does not.
+        None => Ledger::load()
+            .map(|now| now.packages)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| r.cellar)
+            .filter(|keg| {
+                keg.starts_with(&cellar_root)
+                    && !snap_ledger.packages.iter().any(|r| &r.cellar == keg)
+            })
+            .collect(),
+    };
+    for keg in created_since {
+        if keg.is_dir() {
+            std::fs::remove_dir_all(&keg)?;
+        }
+        if let Some(name_dir) = keg.parent() {
+            let _ = std::fs::remove_dir(name_dir); // only if now empty
+        }
+    }
+
+    // 3. Put the snapshotted kegs back. Each is cloned next to its final
+    //    path first, so the live keg is only removed once its replacement
+    //    exists in full.
+    for pkg in &manifest.packages {
+        let src = dir.join("cellar").join(&pkg.name).join(&pkg.version);
+        let mut staged = pkg.cellar.clone().into_os_string();
+        staged.push(".maca-restore");
+        let staged = PathBuf::from(staged);
+        clone_dir(&src, &staged)?;
         if pkg.cellar.exists() {
             std::fs::remove_dir_all(&pkg.cellar)?;
         }
-        let src = dir.join("cellar").join(&pkg.name).join(&pkg.version);
-        if src.exists() {
-            if let Some(parent) = pkg.cellar.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            clone_dir(&src, &pkg.cellar)?;
-        }
+        std::fs::rename(&staged, &pkg.cellar)?;
     }
-    // Rebuild bin links.
+
+    // 4. Links. Drop every maca-made symlink that now dangles (it pointed at
+    //    a keg removed above), then recreate what the snapshot recorded.
     config::ensure_dirs(prefix)?;
+    sweep_dangling_links(&config::bin_dir(prefix), &cellar_root, false);
+    sweep_dangling_links(&prefix.join("opt"), &cellar_root, false);
+    sweep_dangling_links(&prefix.join("share"), &cellar_root, true);
     for link in &manifest.bin_links {
-        if link.link.exists() || link.link.symlink_metadata().is_ok() {
-            let _ = std::fs::remove_file(&link.link);
-        }
         #[cfg(windows)]
         {
             // Windows bin entries are copies; restore by copying the target.
             if link.target.exists() {
+                let _ = std::fs::remove_file(&link.link);
                 std::fs::copy(&link.target, &link.link)?;
             }
         }
         #[cfg(not(windows))]
         {
+            if !link.target.exists() {
+                continue; // belonged to a package outside this snapshot
+            }
+            if link.link.symlink_metadata().is_ok() {
+                if std::fs::read_link(&link.link).is_err() {
+                    continue; // a real file now lives there; leave it
+                }
+                let _ = std::fs::remove_file(&link.link);
+            }
             std::os::unix::fs::symlink(&link.target, &link.link)?;
         }
     }
-    // Restore the ledger.
-    let ledger_path = config::installed_path();
-    std::fs::write(
-        &ledger_path,
-        serde_json::to_string_pretty(&manifest.ledger)?,
+    for record in &snap_ledger.packages {
+        if record.cellar.starts_with(&cellar_root) && record.cellar.exists() {
+            let _ = crate::install::link_opt(&record.name, &record.version, &record.cellar, prefix);
+            let _ = crate::install::link_share(&record.cellar, prefix);
+        }
+    }
+
+    // 5. The ledger goes last, atomically, once the files match it.
+    crate::install::atomic_write(
+        &config::installed_path(),
+        serde_json::to_string_pretty(&manifest.ledger)?.as_bytes(),
     )?;
     tracing::info!("snapshot {id} restored");
     Ok(manifest)
+}
+
+/// Remove symlinks in `dir` whose target lies under `cellar_root` but no
+/// longer exists. Files and links pointing elsewhere are never touched.
+fn sweep_dangling_links(dir: &Path, cellar_root: &Path, recursive: bool) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            if recursive {
+                sweep_dangling_links(&path, cellar_root, true);
+                let _ = std::fs::remove_dir(&path); // only if now empty
+            }
+        } else if ft.is_symlink() {
+            if let Ok(target) = std::fs::read_link(&path) {
+                if target.starts_with(cellar_root) && !target.exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
 }
 
 pub fn list() -> Result<Vec<SnapshotManifest>> {
@@ -235,6 +363,20 @@ pub fn delete(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Prune snapshots, keeping only the `keep` most recent snapshots.
+pub fn prune(keep: usize) -> Result<usize> {
+    let all = list()?;
+    let mut deleted = 0;
+    if all.len() > keep {
+        for s in &all[keep..] {
+            if delete(&s.id).is_ok() {
+                deleted += 1;
+            }
+        }
+    }
+    Ok(deleted)
+}
+
 pub fn get(id: &str) -> Result<SnapshotManifest> {
     let path = snapshots_root().join(id).join("manifest.json");
     let text = std::fs::read_to_string(&path)?;
@@ -251,20 +393,24 @@ fn clone_dir(src: &Path, dst: &Path) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        // clonefile gives an APFS copy-on-write clone: cheap and safe.
-        let status = Command::new("/usr/bin/clonefile")
+        // `cp -c` asks for APFS clonefile(2) per file: copy-on-write, so the
+        // clone costs no extra disk until either side changes. On a
+        // non-APFS volume cp itself falls back to a normal copy.
+        let status = Command::new("/bin/cp")
+            .arg("-cR")
             .arg(src)
             .arg(dst)
+            .stderr(std::process::Stdio::null())
             .status();
         match status {
             Ok(s) if s.success() => return Ok(()),
-            Ok(s) => {
+            other => {
                 tracing::warn!(
-                    "clonefile failed ({s}); falling back to recursive copy for {}",
+                    "cp -c failed ({other:?}); falling back to recursive copy for {}",
                     src.display()
                 );
+                let _ = std::fs::remove_dir_all(dst);
             }
-            Err(_) => {}
         }
     }
     copy_dir_recursive(src, dst)

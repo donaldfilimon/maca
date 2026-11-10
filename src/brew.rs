@@ -222,6 +222,21 @@ impl BrewBackend {
             .cloned()
     }
 
+    /// True when `install` can handle `name`: the formula exists and has
+    /// either a bottle for this host or a source URL to build from.
+    pub async fn can_install(&self, name: &str) -> bool {
+        match self.fetch_formula(name).await {
+            Ok(f) => {
+                self.has_bottle_for_host(&f)
+                    || f.urls
+                        .as_ref()
+                        .and_then(|u| u.stable.as_ref())
+                        .is_some_and(|s| !s.url.is_empty())
+            }
+            Err(_) => false,
+        }
+    }
+
     pub async fn plan(&self, name: &str) -> Result<InstallPlan> {
         let (plan, _executables, _sha) = self.plan_inner(name).await?;
         Ok(plan)
@@ -235,7 +250,7 @@ impl BrewBackend {
             .and_then(|b| b.stable.as_ref())
             .ok_or_else(|| {
                 Error::Unsupported(format!(
-                    "formula '{}' has no bottle (source-only); maca cannot build from source yet",
+                    "formula '{}' has no bottle (source-only); install it with --backend brew to build from source",
                     f.name
                 ))
             })?;
@@ -345,6 +360,7 @@ impl BrewBackend {
             tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
         }
         let linked = install::link_bins(&dest, &formula.executables, &opts.prefix)?;
+        let _ = install::link_share(&dest, &opts.prefix);
         state::upsert_record(state::record_with_kind(
             &formula.name,
             &version,
@@ -449,10 +465,8 @@ impl BrewBackend {
         {
             Ok(c) => c,
             Err(e) => {
-                // Do not leave a half-extracted keg behind.
-                let _ = std::fs::remove_dir_all(&dest);
-                let _ =
-                    std::fs::remove_dir_all(crate::config::cellar_dir(&opts.prefix).join("__tmp"));
+                // Extraction is staged, so a failure leaves nothing at `dest`.
+                let _ = &dest;
                 return Err(e);
             }
         };
@@ -465,6 +479,7 @@ impl BrewBackend {
             tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
         }
         let linked = install::link_bins(&cellar, &executables, &opts.prefix)?;
+        let _ = install::link_share(&cellar, &opts.prefix);
         state::upsert_record(state::record_with_kind(
             &plan.name,
             &plan.version,

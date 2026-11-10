@@ -1,6 +1,7 @@
 //! Paths, prefix discovery and user config.
 //!
-//! Layout (data dir = `directories::UserDirs::data_dir()/maca`):
+//! Layout (data dir = `$MACA_HOME` if set, else `~/.maca` on macOS and
+//! `<XDG data dir>/maca` elsewhere):
 //! ```text
 //! <data>/config.toml          # optional user config
 //! <data>/installed.json       # install ledger
@@ -10,8 +11,9 @@
 //! ```
 //!
 //! Prefix default is `$MACA_PREFIX` if set, else `<data>/prefix`.
-//! On macOS this resolves to `~/Library/Application Support/maca/prefix`,
-//! on Linux to `~/.local/share/maca/prefix`.
+//! On macOS this resolves to `~/.maca/prefix` (deliberately space-free, so
+//! not `~/Library/Application Support`), on Linux to
+//! `~/.local/share/maca/prefix`.
 
 use std::path::PathBuf;
 
@@ -71,8 +73,24 @@ impl Config {
     }
 }
 
-/// Data dir for maca state.
+/// Data dir for maca state. `MACA_HOME` overrides the platform default, which
+/// relocates the ledger, pins, snapshots, groups, registry, cache and logs
+/// (and the default prefix, `<data>/prefix`) in one step.
 pub fn data_dir() -> PathBuf {
+    data_dir_with_env(std::env::var("MACA_HOME").ok().as_deref())
+}
+
+/// Data dir resolution given an explicit `MACA_HOME` value (pure, testable).
+pub fn data_dir_with_env(env_value: Option<&str>) -> PathBuf {
+    if let Some(env) = env_value {
+        if !env.trim().is_empty() {
+            return PathBuf::from(env);
+        }
+    }
+    default_data_dir()
+}
+
+fn default_data_dir() -> PathBuf {
     if let Some(base) = directories::BaseDirs::new() {
         // Prefer a space-free home: many build recipes split on whitespace,
         // and `~/Library/Application Support` breaks them.
@@ -154,8 +172,18 @@ mod tests {
     }
 
     #[test]
+    fn maca_home_overrides_data_dir() {
+        assert_eq!(
+            data_dir_with_env(Some("/tmp/maca-home")),
+            PathBuf::from("/tmp/maca-home")
+        );
+        assert_eq!(data_dir_with_env(Some("  ")), default_data_dir());
+        assert_eq!(data_dir_with_env(None), default_data_dir());
+    }
+
+    #[test]
     fn data_dir_ends_with_maca_home() {
-        let d = data_dir();
+        let d = default_data_dir();
         let name = d.file_name().and_then(|s| s.to_str()).unwrap_or("");
         assert!(
             name == "maca" || name == ".maca",

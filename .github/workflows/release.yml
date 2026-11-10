@@ -1,0 +1,54 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds maca on each runner and attaches
+# maca-<target>.tar.gz plus its .sha256 to the GitHub release for that tag.
+# These are the assets `maca self-update` looks for.
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One host build per runner; scripts/package-release.sh refuses to
+        # label a binary with a triple other than the host's.
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}" >&2
+            exit 1
+          fi
+
+      - name: Package release archive
+        run: ./scripts/package-release.sh
+
+      - name: Upload to the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
+            || gh release view "$GITHUB_REF_NAME" >/dev/null
+          gh release upload "$GITHUB_REF_NAME" target/dist/maca-*.tar.gz target/dist/maca-*.tar.gz.sha256 --clobber

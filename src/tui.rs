@@ -305,7 +305,32 @@ fn switch_tab(app: &mut App, tab: Tab) {
     app.clamp_selection();
 }
 
+/// Snapshot the prefix before a TUI action, as the CLI commands do. The TUI
+/// already holds the prefix lock for its whole session.
+fn snapshot_before(
+    prefix: &std::path::Path,
+    what: &str,
+) -> std::result::Result<crate::snapshot::SnapshotManifest, String> {
+    crate::snapshot::create(prefix, &format!("tui: before {what}"), &[])
+        .map_err(|e| format!("{what} not started: snapshot failed: {e}"))
+}
+
+/// Undo a failed action; returns the text to append to the status line.
+fn roll_back(prefix: &std::path::Path, snap: &crate::snapshot::SnapshotManifest) -> String {
+    match crate::snapshot::restore(&snap.id, prefix) {
+        Ok(_) => format!("rolled back to snapshot {}", snap.id),
+        Err(e) => format!("rollback also failed: {e}"),
+    }
+}
+
 async fn install_pkg(prefix: &std::path::Path, name: &str, backend: &str, status: &mut String) {
+    let snap = match snapshot_before(prefix, "install") {
+        Ok(s) => s,
+        Err(msg) => {
+            *status = msg;
+            return;
+        }
+    };
     let opts = crate::backend::InstallOptions {
         dry_run: false,
         prefix: prefix.to_path_buf(),
@@ -314,25 +339,46 @@ async fn install_pkg(prefix: &std::path::Path, name: &str, backend: &str, status
     let result = crate::backend::install_with_backend(backend, name, &opts).await;
     *status = match result {
         Ok(out) => format!("installed {} {}", out.name, out.version),
-        Err(e) => format!("install failed: {e}"),
+        Err(e) => format!("install failed: {e}; {}", roll_back(prefix, &snap)),
     };
 }
 
 fn remove_pkg(prefix: &std::path::Path, name: &str, status: &mut String) {
-    match crate::backend::remove_with_prefix(prefix, name) {
-        Ok(()) => *status = format!("removed {name}"),
-        Err(e) => *status = format!("remove failed: {e}"),
+    let snap = match snapshot_before(prefix, "remove") {
+        Ok(s) => s,
+        Err(msg) => {
+            *status = msg;
+            return;
+        }
+    };
+    *status = match crate::backend::remove_with_prefix(prefix, name) {
+        Ok(()) => format!("removed {name} (snapshot {})", snap.id),
+        Err(e) => format!("remove failed: {e}; {}", roll_back(prefix, &snap)),
     };
 }
 
 async fn upgrade_pkg(prefix: &std::path::Path, name: &str, status: &mut String) {
-    match crate::backend::upgrade_with_prefix(prefix, name).await {
-        Ok(msg) => *status = msg,
-        Err(e) => *status = format!("upgrade failed: {e}"),
+    let snap = match snapshot_before(prefix, "upgrade") {
+        Ok(s) => s,
+        Err(msg) => {
+            *status = msg;
+            return;
+        }
+    };
+    *status = match crate::backend::upgrade_with_prefix(prefix, name).await {
+        Ok(msg) => msg,
+        Err(e) => format!("upgrade failed: {e}; {}", roll_back(prefix, &snap)),
     };
 }
 
 async fn install_group(prefix: &std::path::Path, group: &Group, status: &mut String) {
+    let snap = match snapshot_before(prefix, "group install") {
+        Ok(s) => s,
+        Err(msg) => {
+            *status = msg;
+            return;
+        }
+    };
     let mut installed = 0;
     let mut failed = 0;
     for entry in &group.packages {
@@ -351,10 +397,16 @@ async fn install_group(prefix: &std::path::Path, group: &Group, status: &mut Str
             }
         }
     }
-    *status = format!(
-        "group {}: {installed} installed, {failed} failed",
-        group.name
-    );
+    *status = if failed > 0 {
+        format!(
+            "group {}: {failed} of {} failed; {}",
+            group.name,
+            installed + failed,
+            roll_back(prefix, &snap)
+        )
+    } else {
+        format!("group {}: {installed} installed", group.name)
+    };
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App) {

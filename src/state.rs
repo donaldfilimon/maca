@@ -49,8 +49,7 @@ impl Ledger {
         }
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| crate::Error::Other(anyhow::anyhow!(e)))?;
-        std::fs::write(&path, text)?;
-        Ok(())
+        crate::install::atomic_write(&path, text.as_bytes())
     }
 
     pub fn get(&self, name: &str) -> Option<&Record> {
@@ -117,23 +116,70 @@ pub fn record(name: &str, version: &str, backend: &str, cellar: PathBuf) -> Reco
     }
 }
 
-pub fn upsert_record(rec: Record) -> Result<()> {
+/// Run a load-modify-save of the ledger under both an in-process mutex
+/// (concurrent install tasks) and a cross-process file lock on
+/// `<data>/.ledger.lock`. The ledger is shared by every prefix, so the
+/// per-prefix lock alone does not serialize two maca processes that use
+/// different prefixes.
+pub fn with_ledger_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
     let _guard = LEDGER_LOCK
         .lock()
         .map_err(|_| crate::Error::Other(anyhow::anyhow!("ledger lock poisoned")))?;
-    let mut ledger = Ledger::load()?;
-    ledger.upsert(rec);
-    ledger.save()
+    let dir = config::data_dir();
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join(".ledger.lock"))?;
+    let mut lock = fd_lock::RwLock::new(file);
+    let _write = lock
+        .write()
+        .map_err(|e| crate::Error::Other(anyhow::anyhow!("ledger lock: {e}")))?;
+    f()
+}
+
+pub fn upsert_record(rec: Record) -> Result<()> {
+    with_ledger_lock(|| {
+        let mut ledger = Ledger::load()?;
+        ledger.upsert(rec);
+        ledger.save()
+    })
 }
 
 pub fn remove_record(name: &str) -> Result<bool> {
-    let _guard = LEDGER_LOCK
-        .lock()
-        .map_err(|_| crate::Error::Other(anyhow::anyhow!("ledger lock poisoned")))?;
-    let mut ledger = Ledger::load()?;
-    let removed = ledger.remove(name);
-    ledger.save()?;
-    Ok(removed)
+    with_ledger_lock(|| {
+        let mut ledger = Ledger::load()?;
+        let removed = ledger.remove(name);
+        ledger.save()?;
+        Ok(removed)
+    })
+}
+
+pub fn pins_path() -> PathBuf {
+    config::data_dir().join("pins.json")
+}
+
+/// Pinned packages: name -> the version recorded when the pin was made.
+/// A pinned package is held: `upgrade` never touches it. A corrupt file is an
+/// error, not "no pins", so a broken file cannot silently release every pin.
+pub fn load_pins() -> Result<std::collections::BTreeMap<String, String>> {
+    let path = pins_path();
+    if !path.exists() {
+        return Ok(Default::default());
+    }
+    serde_json::from_str(&std::fs::read_to_string(&path)?)
+        .map_err(|e| crate::Error::Config(format!("parse {}: {e}", path.display())))
+}
+
+pub fn save_pins(pins: &std::collections::BTreeMap<String, String>) -> Result<()> {
+    let text = serde_json::to_string_pretty(pins)?;
+    crate::install::atomic_write(&pins_path(), text.as_bytes())
+}
+
+pub fn is_pinned(name: &str) -> Result<bool> {
+    Ok(load_pins()?.keys().any(|k| k.eq_ignore_ascii_case(name)))
 }
 
 static LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

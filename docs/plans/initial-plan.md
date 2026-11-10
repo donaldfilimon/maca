@@ -8,9 +8,7 @@ without requiring the native package manager binaries for catalog operations.
 
 ## Decisions
 
-- **Location:** `~/maca` (standalone). DEV_HOME on the Extreme SSD was
-  unmounted at creation time, so the project was created locally per user
-  direction.
+- **Location:** `~/maca` (standalone on the local drive alongside `~/sources/repos`).
 - **Backends:** native HTTP APIs, not subprocesses.
   - brew: `formulae.brew.sh` formula JSON + GHCR OCI bottle blobs.
   - winget: `api.winget.run` search + `microsoft/winget-pkgs` manifests.

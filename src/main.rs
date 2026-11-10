@@ -24,7 +24,8 @@
 //! maca doctor
 //! ```
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use maca::backend::{self, BackendKind, InstallOptions};
@@ -120,8 +121,34 @@ enum Commands {
         #[command(subcommand)]
         action: CustomCommands,
     },
-    /// Health check: prefix, backends, counts.
+    /// Health check: prefix, toolchain, network, symlinks.
     Doctor,
+    /// Output shell environment exports for eval.
+    Shellenv {
+        /// Shell type: bash, zsh, fish, csh (default: auto).
+        #[arg(long, default_value = "auto")]
+        shell: String,
+    },
+    /// Generate shell completion scripts.
+    Completions {
+        /// Shell to generate completions for.
+        shell: clap_complete::Shell,
+    },
+    /// Check installed packages for newer catalog versions without upgrading.
+    Outdated {
+        /// Output JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clean catalog caches, build logs, temp directories, and prune snapshots.
+    Clean {
+        /// Also clear index cache and build logs.
+        #[arg(long)]
+        all: bool,
+        /// Number of recent snapshots to keep [default: 5].
+        #[arg(long, default_value_t = 5)]
+        keep_snapshots: usize,
+    },
     /// Interactive terminal UI.
     Tui,
     /// Update the maca binary itself from a release.
@@ -149,6 +176,9 @@ enum Commands {
     Sync {
         #[arg(long)]
         dry_run: bool,
+        /// Remove installed packages not present in the lockfile.
+        #[arg(long)]
+        prune: bool,
     },
     /// Manage app-kind packages.
     App {
@@ -227,6 +257,12 @@ enum SnapshotCommands {
     Restore { id: String },
     /// Delete a snapshot.
     Delete { id: String },
+    /// Prune older snapshots, keeping only the N most recent.
+    Prune {
+        /// Number of recent snapshots to keep [default: 5].
+        #[arg(long, default_value_t = 5)]
+        keep: usize,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -387,17 +423,24 @@ async fn run(cli: Cli) -> Result<()> {
             packages,
             no_snapshot,
         } => cmd_remove(&ctx, &packages, no_snapshot),
-        Commands::Doctor => cmd_doctor(&ctx),
+        Commands::Doctor => cmd_doctor(&ctx).await,
+        Commands::Shellenv { shell } => cmd_shellenv(&ctx, &shell),
+        Commands::Completions { shell } => cmd_completions(shell),
+        Commands::Outdated { json } => cmd_outdated(&ctx, json).await,
+        Commands::Clean {
+            all,
+            keep_snapshots,
+        } => cmd_clean(&ctx, all, keep_snapshots),
         Commands::Tui => {
             let _lock = PrefixLock::acquire(&ctx.prefix)?;
             maca::tui::run(ctx.prefix.clone()).await
         }
         Commands::SelfUpdate { check, force } => cmd_self_update(check, force).await,
         Commands::Snapshot { action } => cmd_snapshot(&ctx, action),
-        Commands::Custom { action } => cmd_custom(action),
+        Commands::Custom { action } => cmd_custom(&ctx, action),
         Commands::Group { action } => cmd_group(&ctx, action).await,
         Commands::Lock => cmd_lock(&ctx),
-        Commands::Sync { dry_run } => cmd_sync(&ctx, dry_run).await,
+        Commands::Sync { dry_run, prune } => cmd_sync(&ctx, dry_run, prune).await,
         Commands::App { action } => cmd_kind(&ctx, action, Kind::App).await,
         Commands::Plugin { action } => cmd_kind(&ctx, action, Kind::Plugin).await,
         Commands::Cli { action } => cmd_kind(&ctx, action, Kind::Cli).await,
@@ -453,6 +496,20 @@ async fn cmd_info(ctx: &Ctx, package: &str, json: bool) -> Result<()> {
     println!("description: {}", p.description);
     if !p.tags.is_empty() {
         println!("tags:        {}", p.tags.join(", "));
+    }
+    let ledger = state::Ledger::load().ok();
+    let pins = pinned_versions().unwrap_or_default();
+    if let Some(r) = ledger.as_ref().and_then(|l| l.get(&p.name)) {
+        let is_pinned = pins.contains_key(&p.name);
+        println!(
+            "installed:   {} (kind: {}, pinned: {})",
+            r.version,
+            r.kind.as_str(),
+            if is_pinned { "yes" } else { "no" }
+        );
+        println!("cellar:      {}", r.cellar.display());
+    } else {
+        println!("installed:   no");
     }
     Ok(())
 }
@@ -537,7 +594,7 @@ async fn install_many(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> 
                 BackendKind::Brew => BrewBackend::new().install(&name, &opts).await,
                 BackendKind::Winget => WingetBackend::new().install(&name, &opts).await,
                 BackendKind::Custom => {
-                    let reg = Registry::load_local()?;
+                    let reg = Registry::load_configured().await?;
                     CustomBackend::new(reg).install(&name, &opts).await
                 }
                 BackendKind::Auto => backend::install_with_backend("auto", &name, &opts).await,
@@ -614,17 +671,24 @@ fn cmd_list(kind: Option<Kind>, json: bool) -> Result<()> {
         println!("no packages installed");
         return Ok(());
     }
+    let pins = pinned_versions().unwrap_or_default();
     println!(
-        "{:<24} {:<12} {:<8} {:<8} CELLAR",
-        "NAME", "VERSION", "BACKEND", "KIND"
+        "{:<24} {:<12} {:<8} {:<8} {:<8} CELLAR",
+        "NAME", "VERSION", "BACKEND", "KIND", "PINNED"
     );
     for r in rows {
+        let pinned = if pins.contains_key(&r.name) {
+            "yes"
+        } else {
+            "-"
+        };
         println!(
-            "{:<24} {:<12} {:<8} {:<8} {}",
+            "{:<24} {:<12} {:<8} {:<8} {:<8} {}",
             r.name,
             r.version,
             r.backend,
             r.kind.as_str(),
+            pinned,
             r.cellar.display()
         );
     }
@@ -664,23 +728,23 @@ async fn upgrade_inner(ctx: &Ctx, only: &[String]) -> Result<()> {
     let mut upgraded = 0usize;
     let mut current = 0usize;
     let mut failed = 0usize;
-    let pins = pinned_versions().unwrap_or_default();
+    // A corrupt pins file must stop the upgrade, not release every pin.
+    let pins = state::load_pins()?;
+    let mut unchecked = 0usize;
     for record in &ledger.packages {
         if !only_set.is_empty() && !only_set.contains(&record.name.to_ascii_lowercase()) {
             continue;
         }
-        if let Some(pin) = pins.get(&record.name) {
-            if pin == &record.version {
-                println!("{} {} is pinned; skipping", record.name, record.version);
-                current += 1;
-                continue;
-            }
+        if pins.keys().any(|k| k.eq_ignore_ascii_case(&record.name)) {
+            println!("{} {} is pinned; skipping", record.name, record.version);
+            current += 1;
+            continue;
         }
         let latest = match latest_version(ctx, &record.backend, &record.name).await {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("warning: could not check {}: {e}", record.name);
-                failed += 1;
+                unchecked += 1;
                 continue;
             }
         };
@@ -703,7 +767,18 @@ async fn upgrade_inner(ctx: &Ctx, only: &[String]) -> Result<()> {
                 jobs: ctx.jobs,
             };
             match backend::install_with_backend(&record.backend, &record.name, &opts).await {
-                Ok(_) => upgraded += 1,
+                Ok(out) => {
+                    // Reclaim the previous version's keg now that the new one
+                    // is linked and recorded.
+                    if out.cellar_path != record.cellar
+                        && record.cellar.starts_with(config::cellar_dir(&ctx.prefix))
+                    {
+                        if let Err(e) = backend::remove_keg(&ctx.prefix, &record.cellar) {
+                            eprintln!("warning: could not remove old {}: {e}", record.name);
+                        }
+                    }
+                    upgraded += 1;
+                }
                 Err(e) => {
                     eprintln!("error: upgrade of {} failed: {e}", record.name);
                     failed += 1;
@@ -714,7 +789,17 @@ async fn upgrade_inner(ctx: &Ctx, only: &[String]) -> Result<()> {
             current += 1;
         }
     }
-    println!("upgrade complete: {upgraded} upgraded, {current} current, {failed} failed");
+    println!(
+        "upgrade complete: {upgraded} upgraded, {current} current, {failed} failed, {unchecked} could not be checked"
+    );
+    // A failed install fails the command (and triggers the rollback in
+    // `cmd_upgrade`). A version check that could not be made does not: it
+    // changed nothing.
+    if failed > 0 {
+        return Err(Error::Other(anyhow::anyhow!(
+            "{failed} package(s) failed to upgrade"
+        )));
+    }
     Ok(())
 }
 
@@ -777,7 +862,7 @@ fn cmd_remove(ctx: &Ctx, packages: &[String], no_snapshot: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_doctor(ctx: &Ctx) -> Result<()> {
+async fn cmd_doctor(ctx: &Ctx) -> Result<()> {
     config::ensure_dirs(&ctx.prefix)?;
     println!("maca doctor");
     println!("  version: {}", maca::VERSION);
@@ -796,8 +881,117 @@ fn cmd_doctor(ctx: &Ctx) -> Result<()> {
     );
     println!("  backend: {}", ctx.backend.as_str());
     println!("  jobs: {}", ctx.jobs);
-    println!("  brew: formulae.brew.sh API + GHCR bottle blobs");
-    println!("  winget: api.winget.run + winget-pkgs manifests (install Windows-only)");
+
+    let mut passes = 0usize;
+    let mut warnings = 0usize;
+    let mut failures = 0usize;
+
+    // 1. Prefix writability check
+    let test_file = ctx.prefix.join(".maca-doctor-probe");
+    match std::fs::write(&test_file, b"probe") {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&test_file);
+            println!("  [OK] prefix is writable");
+            passes += 1;
+        }
+        Err(e) => {
+            println!("  [FAIL] prefix is not writable: {e}");
+            failures += 1;
+        }
+    }
+
+    // 2. PATH check
+    let bin_dir = config::bin_dir(&ctx.prefix);
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    let in_path = std::env::split_paths(&path_var).any(|p| p == bin_dir);
+    if in_path {
+        println!("  [OK] prefix bin is in PATH");
+        passes += 1;
+    } else {
+        println!(
+            "  [WARN] {} is not in PATH (run 'eval \"$(maca shellenv)\"' to add it)",
+            bin_dir.display()
+        );
+        warnings += 1;
+    }
+
+    // 3. Required host toolchain check
+    #[cfg(target_os = "macos")]
+    {
+        for tool in ["install_name_tool", "codesign", "otool"] {
+            if has_tool(tool) {
+                passes += 1;
+            } else {
+                println!(
+                    "  [FAIL] required tool '{tool}' not found (install Xcode Command Line Tools: xcode-select --install)"
+                );
+                failures += 1;
+            }
+        }
+    }
+
+    // 4. Build tools check (source builds)
+    for tool in ["make", "cc"] {
+        if has_tool(tool) {
+            passes += 1;
+        } else {
+            println!("  [WARN] build tool '{tool}' not found on PATH (needed for source builds)");
+            warnings += 1;
+        }
+    }
+
+    // 5. Catalog API Connectivity
+    let client = maca::install::http_client()?;
+    let endpoints = [
+        (
+            "brew formula API",
+            "https://formulae.brew.sh/api/formula/jq.json",
+        ),
+        (
+            "winget catalog API",
+            "https://api.winget.run/v2/packages?query=git&take=1",
+        ),
+    ];
+    for (name, url) in endpoints {
+        match client.head(url).send().await {
+            Ok(resp) if resp.status().is_success() || resp.status().as_u16() < 500 => {
+                passes += 1;
+            }
+            Ok(resp) => {
+                println!("  [WARN] {name} returned HTTP {}", resp.status().as_u16());
+                warnings += 1;
+            }
+            Err(e) => {
+                println!("  [WARN] {name} unreachable: {e}");
+                warnings += 1;
+            }
+        }
+    }
+
+    // 6. Symlink integrity in prefix bin
+    if bin_dir.exists() {
+        let mut broken = 0;
+        if let Ok(entries) = std::fs::read_dir(&bin_dir) {
+            for entry in entries.flatten() {
+                let link = entry.path();
+                if let Ok(target) = std::fs::read_link(&link) {
+                    if !target.exists() && !link.exists() {
+                        broken += 1;
+                    }
+                }
+            }
+        }
+        if broken == 0 {
+            passes += 1;
+        } else {
+            println!(
+                "  [WARN] found {broken} broken symlink(s) in {}",
+                bin_dir.display()
+            );
+            warnings += 1;
+        }
+    }
+
     println!(
         "  custom: {} entries",
         Registry::load_local()?.packages.len()
@@ -813,10 +1007,209 @@ fn cmd_doctor(ctx: &Ctx) -> Result<()> {
         "  update repo: {}",
         maca::selfupdate::repo_from_config(&config::Config::load().unwrap_or_default())
     );
+
+    println!("doctor summary: {passes} passed, {warnings} warning(s), {failures} failure(s)");
+    if failures > 0 {
+        return Err(Error::Other(anyhow::anyhow!(
+            "doctor detected {failures} issue(s) needing attention"
+        )));
+    }
     Ok(())
 }
 
-fn cmd_custom(action: CustomCommands) -> Result<()> {
+fn has_tool(tool: &str) -> bool {
+    let path = match std::env::var("PATH") {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    for dir in std::env::split_paths(&path) {
+        if dir.join(tool).exists() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            if dir.join(format!("{tool}.exe")).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn cmd_shellenv(ctx: &Ctx, shell: &str) -> Result<()> {
+    let prefix = ctx.prefix.to_string_lossy();
+    let shell_type = if shell == "auto" {
+        std::env::var("SHELL")
+            .ok()
+            .and_then(|s| s.split('/').next_back().map(String::from))
+            .unwrap_or_else(|| "bash".into())
+    } else {
+        shell.to_lowercase()
+    };
+
+    match shell_type.as_str() {
+        "fish" => {
+            println!("set -gx MACA_PREFIX \"{prefix}\";");
+            println!("fish_add_path -g \"{prefix}/bin\";");
+            println!(
+                "if test -d \"{prefix}/share/man\"; set -gx MANPATH \"{prefix}/share/man\" $MANPATH; end;"
+            );
+            println!(
+                "if test -d \"{prefix}/share/info\"; set -gx INFOPATH \"{prefix}/share/info\" $INFOPATH; end;"
+            );
+        }
+        "csh" | "tcsh" => {
+            println!("setenv MACA_PREFIX \"{prefix}\";");
+            println!("setenv PATH \"{prefix}/bin:$PATH\";");
+            println!("setenv MANPATH \"{prefix}/share/man:$MANPATH\";");
+            println!("setenv INFOPATH \"{prefix}/share/info:$INFOPATH\";");
+        }
+        _ => {
+            // sh, bash, zsh, ksh, default
+            println!("export MACA_PREFIX=\"{prefix}\";");
+            println!("export PATH=\"{prefix}/bin:$PATH\";");
+            println!("export MANPATH=\"{prefix}/share/man${{MANPATH+:$MANPATH}}\";");
+            println!("export INFOPATH=\"{prefix}/share/info${{INFOPATH+:$INFOPATH}}\";");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell, &mut cmd, "maca", &mut std::io::stdout());
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct OutdatedPackage {
+    name: String,
+    installed: String,
+    latest: String,
+    backend: String,
+    pinned: bool,
+}
+
+async fn cmd_outdated(ctx: &Ctx, json: bool) -> Result<()> {
+    let ledger = state::Ledger::load()?;
+    if ledger.packages.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("no packages installed");
+        }
+        return Ok(());
+    }
+    let pins = pinned_versions().unwrap_or_default();
+    let mut outdated = Vec::new();
+    for record in &ledger.packages {
+        let is_pinned = pins.contains_key(&record.name);
+        let latest = match latest_version(ctx, &record.backend, &record.name).await {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        if is_newer(&latest, &record.version) {
+            outdated.push(OutdatedPackage {
+                name: record.name.clone(),
+                installed: record.version.clone(),
+                latest,
+                backend: record.backend.clone(),
+                pinned: is_pinned,
+            });
+        }
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outdated)?);
+        return Ok(());
+    }
+    if outdated.is_empty() {
+        println!("all packages are up to date");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<12} {:<12} {:<8} PINNED",
+        "NAME", "INSTALLED", "LATEST", "BACKEND"
+    );
+    for p in &outdated {
+        let pin_str = if p.pinned { "yes" } else { "no" };
+        println!(
+            "{:<24} {:<12} {:<12} {:<8} {}",
+            p.name, p.installed, p.latest, p.backend, pin_str
+        );
+    }
+    Ok(())
+}
+
+fn cmd_clean(ctx: &Ctx, all: bool, keep_snapshots: usize) -> Result<()> {
+    // Held so a concurrent install's staging dir or the snapshot a rollback
+    // is reading cannot be swept from under it.
+    let _lock = PrefixLock::acquire(&ctx.prefix)?;
+    let mut reclaimed = 0u64;
+
+    // 1. Clean brew-index cache if all
+    let cache_dir = config::data_dir().join("cache");
+    if cache_dir.exists() && all {
+        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
+            for entry in entries.flatten() {
+                if let Ok(m) = entry.metadata() {
+                    reclaimed += m.len();
+                }
+                let _ = std::fs::remove_file(entry.path());
+            }
+            println!("cleaned catalog cache");
+        }
+    }
+
+    // 2. Clean build logs if all
+    let logs_dir = config::data_dir().join("logs");
+    if logs_dir.exists() && all {
+        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                if let Ok(m) = entry.metadata() {
+                    reclaimed += m.len();
+                }
+                let _ = std::fs::remove_file(entry.path());
+            }
+            println!("cleaned build logs");
+        }
+    }
+
+    // 3. Clean temporary directories in cellar (__tmp, .tmp-*)
+    let cellar = config::cellar_dir(&ctx.prefix);
+    if cellar.exists() {
+        if let Ok(entries) = std::fs::read_dir(&cellar) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("__tmp") || name.starts_with(".tmp-") {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+    }
+
+    // 4. Prune snapshots
+    let pruned = snapshot::prune(keep_snapshots)?;
+    if pruned > 0 {
+        println!("pruned {pruned} snapshot(s) (keeping {keep_snapshots} latest)");
+    }
+
+    let human_size = if reclaimed > 1024 * 1024 {
+        format!("{:.1} MiB", reclaimed as f64 / (1024.0 * 1024.0))
+    } else if reclaimed > 1024 {
+        format!("{:.1} KiB", reclaimed as f64 / 1024.0)
+    } else {
+        format!("{reclaimed} B")
+    };
+    println!("clean complete: {human_size} reclaimed");
+    Ok(())
+}
+
+fn cmd_custom(ctx: &Ctx, action: CustomCommands) -> Result<()> {
+    // Registry edits are read-modify-write; serialize them with installs.
+    let _lock = match action {
+        CustomCommands::List => None,
+        _ => Some(PrefixLock::acquire(&ctx.prefix)?),
+    };
     match action {
         CustomCommands::List => {
             let reg = Registry::load_local()?;
@@ -857,6 +1250,11 @@ fn cmd_custom(action: CustomCommands) -> Result<()> {
             description,
             homepage,
         } => {
+            if !maca::install::valid_component(&name) || !maca::install::valid_component(&version) {
+                return Err(Error::Config(format!(
+                    "name {name:?} and version {version:?} must be plain names (no path separators, `.` or `..`)"
+                )));
+            }
             let artifact_kind = match kind.to_ascii_lowercase().as_str() {
                 "binary" => maca::custom::ArtifactKind::Binary,
                 "tar.gz" | "targz" | "tar-gz" => maca::custom::ArtifactKind::TarGz,
@@ -986,11 +1384,25 @@ fn cmd_snapshot(ctx: &Ctx, action: SnapshotCommands) -> Result<()> {
             snapshot::delete(&id)?;
             println!("deleted snapshot {id}");
         }
+        SnapshotCommands::Prune { keep } => {
+            let pruned = snapshot::prune(keep)?;
+            println!("pruned {pruned} snapshot(s) (keeping {keep} latest)");
+        }
     }
     Ok(())
 }
 
 async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
+    // Group edits are read-modify-write. `Install` takes the (non-reentrant)
+    // lock itself, and the read-only arms need none.
+    let _lock = match action {
+        GroupCommands::Create { .. }
+        | GroupCommands::Delete { .. }
+        | GroupCommands::Add { .. }
+        | GroupCommands::Remove { .. }
+        | GroupCommands::Export { .. } => Some(PrefixLock::acquire(&ctx.prefix)?),
+        _ => None,
+    };
     match action {
         GroupCommands::Create { name, description } => {
             let group = Group {
@@ -1063,6 +1475,11 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
         GroupCommands::Install { name, dry_run } => {
             let g = Group::load(&name)?;
             let _lock = PrefixLock::acquire(&ctx.prefix)?;
+            let snapshot = if dry_run {
+                None
+            } else {
+                Some(snapshot::create(&ctx.prefix, "before group install", &[])?)
+            };
             let semaphore = Arc::new(Semaphore::new(ctx.jobs));
             let mut handles = Vec::new();
             for entry in &g.packages {
@@ -1079,12 +1496,14 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
                         no_snapshot: true,
                         jobs: 1,
                     };
-                    backend::install_with_backend(
+                    let out = backend::install_with_backend(
                         entry.backend.as_deref().unwrap_or("auto"),
                         &entry.name,
                         &opts,
                     )
-                    .await
+                    .await?;
+                    check_locked_version(&out, entry.version.as_deref())?;
+                    Ok::<_, Error>(out)
                 }));
             }
             let mut ok = 0;
@@ -1106,6 +1525,17 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
                 }
             }
             println!("group '{name}': {ok} installed, {failed} failed");
+            if failed > 0 {
+                if let Some(snap) = &snapshot {
+                    match snapshot::restore(&snap.id, &ctx.prefix) {
+                        Ok(_) => eprintln!("maca: rolled back to snapshot {}", snap.id),
+                        Err(r) => eprintln!("maca: rollback failed: {r}"),
+                    }
+                }
+                return Err(Error::Other(anyhow::anyhow!(
+                    "group '{name}': {failed} package(s) failed"
+                )));
+            }
         }
         GroupCommands::Export { name } => {
             let g = Group::load(&name)?;
@@ -1119,11 +1549,12 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
                         name: p.name.clone(),
                         version: p.version.clone().unwrap_or_else(|| "latest".into()),
                         backend: p.backend.clone().unwrap_or_else(|| "auto".into()),
+                        kind: p.kind,
                     })
                     .collect(),
             };
             let path = group::lock_path(&ctx.prefix);
-            std::fs::write(&path, serde_json::to_string_pretty(&lock)?)?;
+            maca::install::atomic_write(&path, serde_json::to_string_pretty(&lock)?.as_bytes())?;
             println!("exported group '{name}' to {}", path.display());
         }
     }
@@ -1131,6 +1562,7 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
 }
 
 fn cmd_lock(ctx: &Ctx) -> Result<()> {
+    let _lock = PrefixLock::acquire(&ctx.prefix)?;
     let lock = group::write_lock(&ctx.prefix)?;
     println!(
         "wrote {} ({} packages)",
@@ -1140,13 +1572,54 @@ fn cmd_lock(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_sync(ctx: &Ctx, dry_run: bool) -> Result<()> {
+/// The catalogs only serve their current version, so a locked version cannot
+/// be requested; instead an install whose resolved version differs from the
+/// lock is reported as a failure. `latest` (or no version) accepts anything.
+fn check_locked_version(out: &backend::InstallOutcome, locked: Option<&str>) -> Result<()> {
+    match locked {
+        Some(v) if v != "latest" && v != out.version => Err(Error::Unsupported(format!(
+            "{}: lock pins {v} but {} now provides {}",
+            out.name, out.backend, out.version
+        ))),
+        _ => Ok(()),
+    }
+}
+
+async fn cmd_sync(ctx: &Ctx, dry_run: bool, prune: bool) -> Result<()> {
     let _lock = PrefixLock::acquire(&ctx.prefix)?;
     let lock = group::read_lock(&ctx.prefix)?;
     println!("syncing {} packages from lockfile", lock.packages.len());
+    let snapshot = if dry_run {
+        None
+    } else {
+        Some(snapshot::create(&ctx.prefix, "before sync", &[])?)
+    };
+    let result = sync_inner(ctx, &lock, dry_run, prune).await;
+    if let (Err(e), Some(s)) = (&result, &snapshot) {
+        match snapshot::restore(&s.id, &ctx.prefix) {
+            Ok(_) => eprintln!("maca: sync failed ({e}); rolled back to snapshot {}", s.id),
+            Err(r) => eprintln!("maca: sync failed ({e}); rollback also failed: {r}"),
+        }
+    }
+    result
+}
+
+async fn sync_inner(ctx: &Ctx, lock: &group::Lockfile, dry_run: bool, prune: bool) -> Result<()> {
+    let ledger = state::Ledger::load()?;
     let semaphore = Arc::new(Semaphore::new(ctx.jobs));
     let mut handles = Vec::new();
+    let mut ok = 0;
+    let mut failed = 0;
     for entry in &lock.packages {
+        // Already at the locked version: nothing to do.
+        if ledger
+            .get(&entry.name)
+            .is_some_and(|r| r.version == entry.version && r.cellar.exists())
+        {
+            println!("{} {} (already installed)", entry.name, entry.version);
+            ok += 1;
+            continue;
+        }
         let sem = semaphore.clone();
         let prefix = ctx.prefix.clone();
         let entry = entry.clone();
@@ -1155,16 +1628,16 @@ async fn cmd_sync(ctx: &Ctx, dry_run: bool) -> Result<()> {
             let opts = InstallOptions {
                 dry_run,
                 prefix,
-                kind: Kind::App,
+                kind: entry.kind,
                 build_from_source: false,
                 no_snapshot: true,
                 jobs: 1,
             };
-            backend::install_with_backend(&entry.backend, &entry.name, &opts).await
+            let out = backend::install_with_backend(&entry.backend, &entry.name, &opts).await?;
+            check_locked_version(&out, Some(&entry.version))?;
+            Ok::<_, Error>(out)
         }));
     }
-    let mut ok = 0;
-    let mut failed = 0;
     for handle in handles {
         match handle.await {
             Ok(Ok(out)) => {
@@ -1181,7 +1654,35 @@ async fn cmd_sync(ctx: &Ctx, dry_run: bool) -> Result<()> {
             }
         }
     }
+
+    // Prune last, and only once everything the lock asks for is in place.
+    if prune && failed == 0 {
+        let lock_names: std::collections::HashSet<String> = lock
+            .packages
+            .iter()
+            .map(|p| p.name.to_ascii_lowercase())
+            .collect();
+        for pkg in &ledger.packages {
+            if lock_names.contains(&pkg.name.to_ascii_lowercase()) {
+                continue;
+            }
+            if dry_run {
+                println!("[dry-run] would remove unlocked package {}", pkg.name);
+            } else {
+                println!("pruning unlocked package {}", pkg.name);
+                if let Err(e) = backend::remove_with_prefix(&ctx.prefix, &pkg.name) {
+                    eprintln!("error: {e}");
+                    failed += 1;
+                }
+            }
+        }
+    }
     println!("sync complete: {ok} ok, {failed} failed");
+    if failed > 0 {
+        return Err(Error::Other(anyhow::anyhow!(
+            "sync failed for {failed} package(s)"
+        )));
+    }
     Ok(())
 }
 
@@ -1211,43 +1712,42 @@ async fn cmd_kind(ctx: &Ctx, action: KindCommands, kind: Kind) -> Result<()> {
     }
 }
 
-fn cmd_pin(_ctx: &Ctx, package: String, version: Option<String>) -> Result<()> {
+fn cmd_pin(ctx: &Ctx, package: String, version: Option<String>) -> Result<()> {
+    let _lock = PrefixLock::acquire(&ctx.prefix)?;
     let ledger = state::Ledger::load()?;
     let record = ledger
         .get(&package)
         .cloned()
         .ok_or_else(|| Error::NotFound(format!("package '{package}' is not installed")))?;
-    let version = version.unwrap_or_else(|| record.version.clone());
-    let path = config::data_dir().join("pins.json");
-    let mut pins: serde_json::Value = if path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(&path)?)?
-    } else {
-        serde_json::json!({})
-    };
-    pins[&package] = serde_json::Value::String(version.clone());
-    std::fs::write(&path, serde_json::to_string_pretty(&pins)?)?;
-    println!("pinned {package} to {version}");
+    // A pin holds the installed version. Pinning to some other version would
+    // promise something `upgrade` cannot deliver.
+    if let Some(v) = &version {
+        if v != &record.version {
+            return Err(Error::Unsupported(format!(
+                "{} is installed at {}; a pin holds the installed version, so it cannot be pinned to {v}",
+                record.name, record.version
+            )));
+        }
+    }
+    let mut pins = state::load_pins()?;
+    pins.insert(record.name.clone(), record.version.clone());
+    state::save_pins(&pins)?;
+    println!("pinned {} to {}", record.name, record.version);
     Ok(())
 }
 
-fn cmd_unpin(_ctx: &Ctx, package: String) -> Result<()> {
-    let path = config::data_dir().join("pins.json");
-    if !path.exists() {
-        return Err(Error::NotFound(format!("'{package}' is not pinned")));
-    }
-    let mut pins: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    if pins.get(&package).is_some() {
-        pins[&package] = serde_json::Value::Null;
-        // Drop null entries.
-        if let Some(obj) = pins.as_object_mut() {
-            obj.remove(&package);
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(&pins)?)?;
-        println!("unpinned {package}");
-        Ok(())
-    } else {
-        Err(Error::NotFound(format!("'{package}' is not pinned")))
-    }
+fn cmd_unpin(ctx: &Ctx, package: String) -> Result<()> {
+    let _lock = PrefixLock::acquire(&ctx.prefix)?;
+    let mut pins = state::load_pins()?;
+    let key = pins
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(&package))
+        .cloned()
+        .ok_or_else(|| Error::NotFound(format!("'{package}' is not pinned")))?;
+    pins.remove(&key);
+    state::save_pins(&pins)?;
+    println!("unpinned {key}");
+    Ok(())
 }
 
 async fn cmd_why(ctx: &Ctx, package: &str) -> Result<()> {
@@ -1292,20 +1792,7 @@ async fn cmd_why(ctx: &Ctx, package: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pins are stored as a simple JSON map; used by upgrade to skip pinned names.
+/// Pinned package names and the version each was pinned at.
 pub fn pinned_versions() -> Result<BTreeMap<String, String>> {
-    let path = config::data_dir().join("pins.json");
-    if !path.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
-    let mut out = BTreeMap::new();
-    if let Some(obj) = value.as_object() {
-        for (k, v) in obj {
-            if let Some(s) = v.as_str() {
-                out.insert(k.clone(), s.to_string());
-            }
-        }
-    }
-    Ok(out)
+    state::load_pins()
 }

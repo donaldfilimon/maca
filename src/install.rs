@@ -37,14 +37,18 @@ pub async fn download(url: &str) -> Result<Vec<u8>> {
     download_with_bearer(url, None).await
 }
 
-/// Default per-request timeout. Catalog APIs and artifact downloads should
-/// answer well within this; a hung request must not stall a command.
+/// Total timeout for small catalog/API requests made through `http_client`.
 const HTTP_TIMEOUT_SECS: u64 = 20;
+/// Downloads have no total limit (bottles can be hundreds of MiB); they fail
+/// when the connection cannot be made or stalls for this long between reads.
+const CONNECT_TIMEOUT_SECS: u64 = 20;
+const READ_IDLE_TIMEOUT_SECS: u64 = 60;
 
 pub async fn download_with_bearer(url: &str, bearer: Option<&str>) -> Result<Vec<u8>> {
     let client = reqwest::Client::builder()
         .user_agent(format!("maca/{}", crate::VERSION))
-        .timeout(std::time::Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .read_timeout(std::time::Duration::from_secs(READ_IDLE_TIMEOUT_SECS))
         .build()
         .map_err(|e| Error::Network(e.to_string()))?;
     let mut req = client.get(url);
@@ -68,43 +72,130 @@ pub async fn download_with_bearer(url: &str, bearer: Option<&str>) -> Result<Vec
     Ok(bytes.to_vec())
 }
 
+/// True when `s` is safe to use as a single path component (a package name,
+/// version or executable name): exactly one normal component, no separators,
+/// no control characters. Rejects ``, `.`, `..`, `a/b`, `/abs` and `C:\x`.
+pub fn valid_component(s: &str) -> bool {
+    if s.is_empty() || s.contains(['/', '\\']) || s.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    let mut comps = Path::new(s).components();
+    matches!(
+        (comps.next(), comps.next()),
+        (Some(std::path::Component::Normal(c)), None) if c == std::ffi::OsStr::new(s)
+    )
+}
+
+fn require_component(what: &str, s: &str) -> Result<()> {
+    if valid_component(s) {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(format!(
+            "{what} {s:?} is not a valid path component"
+        )))
+    }
+}
+
+/// Write `bytes` to `path` through a temp file in the same directory plus a
+/// rename, so a crash mid-write never leaves a truncated state file.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("state");
+    let tmp = dir.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// A private staging directory under `<prefix>/cellar`, unique per call so
+/// concurrent installs never share or delete each other's work. Removed on
+/// drop; the name matches the `.tmp-*` sweep in `maca clean`.
+struct Staging(PathBuf);
+
+impl Staging {
+    fn new(prefix: &Path, name: &str, version: &str) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = config::cellar_dir(prefix).join(format!(
+            ".tmp-{name}-{version}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn unpack_tar_gz(name: &str, bytes: &[u8], into: &Path) -> Result<()> {
+    let gz = flate2::read::GzDecoder::new(bytes);
+    let mut tar = tar::Archive::new(gz);
+    tar.unpack(into)
+        .map_err(|e| Error::Other(anyhow::anyhow!("untarring {name}: {e}")))
+}
+
 /// Extract a `.tar.gz` bottle archive into `<prefix>/cellar/<name>/<version>/`.
-/// Returns the cellar path.
+/// Returns the cellar path. The keg appears at its final path only after a
+/// complete unpack (staged, then renamed), so an existing keg is always whole.
 pub fn extract_bottle(name: &str, version: &str, bytes: &[u8], prefix: &Path) -> Result<PathBuf> {
+    require_component("package name", name)?;
+    require_component("version", version)?;
     config::ensure_dirs(prefix)?;
     let dest = config::cellar_dir(prefix).join(name).join(version);
     if dest.exists() {
-        // Idempotent: reuse existing install but ensure completeness.
         return Ok(dest);
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let gz = flate2::read::GzDecoder::new(bytes);
-    let mut tar = tar::Archive::new(gz);
-    tar.unpack(prefix.join("cellar").join("__tmp"))
-        .map_err(|e| Error::Other(anyhow::anyhow!("untarring {name}: {e}")))?;
-    // Bottle layout is `cellar/<name>/<version>/...` relative to a temp dir
-    // extracted under `cellar/__tmp/<name>/<version>/...`. Move it into place.
-    let staged = prefix.join("cellar/__tmp").join(name).join(version);
-    if !staged.exists() {
+    // Bottle layout is `<name>/<version>/...` inside the archive.
+    let staging = Staging::new(prefix, name, version)?;
+    unpack_tar_gz(name, bytes, &staging.0)?;
+    let staged = staging.0.join(name).join(version);
+    if !staged.is_dir() {
         return Err(Error::Other(anyhow::anyhow!(
             "bottle for {name} did not contain {name}/{version} at expected path"
         )));
     }
     std::fs::rename(&staged, &dest)
         .map_err(|e| Error::Other(anyhow::anyhow!("moving {name} into place: {e}")))?;
-    let _ = std::fs::remove_dir_all(prefix.join("cellar/__tmp"));
     Ok(dest)
 }
 
 /// Extract an arbitrary `.tar.gz` into a fresh `<prefix>/cellar/<name>/<version>/`.
+/// A single leading directory (common for release tarballs) is stripped.
+/// Staged and renamed like [`extract_bottle`], which also keeps symlinks and
+/// permissions exactly as unpacked.
 pub fn extract_tar_gz_to_cellar(
     name: &str,
     version: &str,
     bytes: &[u8],
     prefix: &Path,
 ) -> Result<PathBuf> {
+    require_component("package name", name)?;
+    require_component("version", version)?;
     config::ensure_dirs(prefix)?;
     let dest = config::cellar_dir(prefix).join(name).join(version);
     if dest.exists() {
@@ -113,73 +204,64 @@ pub fn extract_tar_gz_to_cellar(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let gz = flate2::read::GzDecoder::new(bytes);
-    let mut tar = tar::Archive::new(gz);
-    // Strip a single leading directory if present (common for GitHub tarballs),
-    // otherwise extract verbatim.
-    let entries: Vec<_> = tar
-        .entries()
-        .map_err(|e| Error::Other(anyhow::anyhow!("reading tar: {e}")))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| Error::Other(anyhow::anyhow!("reading tar entry: {e}")))?;
-    let top: Vec<String> = entries
-        .iter()
-        .filter_map(|e| e.path().ok())
-        .filter_map(|p| {
-            p.components()
-                .next()
-                .and_then(|c| c.as_os_str().to_str())
-                .map(String::from)
-        })
+    let staging = Staging::new(prefix, name, version)?;
+    unpack_tar_gz(name, bytes, &staging.0)?;
+    let mut top: Vec<PathBuf> = std::fs::read_dir(&staging.0)?
+        .flatten()
+        .map(|e| e.path())
         .collect();
-    let single_top = if top.iter().all(|t| t == &top[0]) && !top.is_empty() {
-        Some(top[0].clone())
-    } else {
-        None
-    };
-    if let Some(top_name) = single_top {
-        // Unpack into temp then move top dir contents.
-        let tmp = prefix.join(format!("cellar/.tmp-{name}-{version}"));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp)?;
-        let gz2 = flate2::read::GzDecoder::new(bytes);
-        let mut tar2 = tar::Archive::new(gz2);
-        tar2.unpack(&tmp)
-            .map_err(|e| Error::Other(anyhow::anyhow!("untarring {name}: {e}")))?;
-        let staged = tmp.join(&top_name);
-        // Move staged contents into dest.
-        if staged.exists() {
-            move_dir_contents(&staged, &dest)?;
-            let _ = std::fs::remove_dir_all(&tmp);
-        } else {
-            return Err(Error::Other(anyhow::anyhow!(
-                "tarball top dir {top_name} not found"
-            )));
+    let source = match (top.pop(), top.is_empty()) {
+        (Some(only), true) if only.is_dir() && !only.is_symlink() => only,
+        (None, _) => {
+            return Err(Error::Other(anyhow::anyhow!("tarball for {name} is empty")));
         }
-    } else {
-        let gz2 = flate2::read::GzDecoder::new(bytes);
-        let mut tar2 = tar::Archive::new(gz2);
-        tar2.unpack(&dest)
-            .map_err(|e| Error::Other(anyhow::anyhow!("untarring {name}: {e}")))?;
-    }
+        _ => staging.0.clone(),
+    };
+    std::fs::rename(&source, &dest)
+        .map_err(|e| Error::Other(anyhow::anyhow!("moving {name} into place: {e}")))?;
     Ok(dest)
 }
 
-fn move_dir_contents(src: &Path, dst: &Path) -> Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let dest = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            move_dir_contents(&entry.path(), &dest)?;
-        } else {
-            std::fs::copy(entry.path(), &dest)?;
-            if let Ok(perms) = entry.metadata() {
-                let _ = std::fs::set_permissions(&dest, perms.permissions());
-            }
+/// Put a symlink at `link` pointing to `target` without destroying anything
+/// maca does not own. An existing entry is replaced only when it is a symlink
+/// that is dangling or points inside `own_root` (this package's own
+/// `cellar/<name>` directory, so reinstalls and upgrades relink cleanly).
+/// Anything else (another package's link, a user's file) is left alone and
+/// `Ok(false)` is returned.
+#[cfg(not(windows))]
+fn place_link(target: &Path, link: &Path, own_root: &Path) -> Result<bool> {
+    if let Ok(meta) = link.symlink_metadata() {
+        let replaceable = meta.file_type().is_symlink()
+            && match std::fs::read_link(link) {
+                Ok(existing) => existing.starts_with(own_root) || !link.exists(),
+                Err(_) => false,
+            };
+        if !replaceable {
+            eprintln!(
+                "maca: not linking {}: it already exists and belongs to something else",
+                link.display()
+            );
+            return Ok(false);
         }
+        std::fs::remove_file(link)?;
     }
-    Ok(())
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(true)
+}
+
+/// Windows has no unprivileged symlinks, so entries are copies.
+#[cfg(windows)]
+fn place_link(target: &Path, link: &Path, _own_root: &Path) -> Result<bool> {
+    if link.exists() {
+        let _ = std::fs::remove_file(link);
+    }
+    std::fs::copy(target, link)?;
+    Ok(true)
+}
+
+/// `cellar/<name>` for a keg at `cellar/<name>/<version>`.
+fn own_root(keg: &Path) -> &Path {
+    keg.parent().unwrap_or(keg)
 }
 
 /// Create `<prefix>/opt/<name>` → `<cellar>/<name>/<version>` (Homebrew layout).
@@ -209,53 +291,166 @@ pub fn link_opt(name: &str, version: &str, cellar: &Path, prefix: &Path) -> Resu
     Ok(link)
 }
 
-/// Symlink `<cellar>/bin/<exe>` into `<prefix>/bin/<exe>`. On Windows, copy
-/// instead (symlinks need privileges).
+/// Symlink `<cellar>/bin/<exe>` (and any discovered binaries or sbin entries)
+/// into `<prefix>/bin/<exe>`. On Windows, copy instead (symlinks need privileges).
 pub fn link_bins(cellar: &Path, executables: &[String], prefix: &Path) -> Result<Vec<PathBuf>> {
     config::ensure_dirs(prefix)?;
     let bin_dir = config::bin_dir(prefix);
+    let mut targets: Vec<(PathBuf, String)> = Vec::new();
+
+    if executables.is_empty() {
+        let bin = cellar.join("bin");
+        if bin.exists() {
+            for name in discover_binaries(&bin) {
+                targets.push((bin.join(&name), name));
+            }
+        }
+    } else {
+        for exe in executables {
+            if exe.contains('/') || exe.contains('\\') || exe.is_empty() {
+                continue;
+            }
+            let target = cellar.join("bin").join(exe);
+            if target.exists() {
+                targets.push((target, exe.clone()));
+            }
+        }
+    }
+
+    // Also check sbin if present
+    let sbin = cellar.join("sbin");
+    if sbin.exists() {
+        for name in discover_binaries(&sbin) {
+            if !targets.iter().any(|(_, n)| n == &name) {
+                targets.push((sbin.join(&name), name));
+            }
+        }
+    }
+
     let mut linked = Vec::new();
-    for exe in executables {
-        // Reject path traversal.
-        if exe.contains('/') || exe.contains('\\') || exe.is_empty() {
-            continue;
+    for (target, exe) in targets {
+        let link = bin_dir.join(&exe);
+        if place_link(&target, &link, own_root(cellar))? {
+            linked.push(link);
         }
-        let target = cellar.join("bin").join(exe);
-        if !target.exists() {
-            continue;
-        }
-        let link = bin_dir.join(exe);
-        if link.exists() || link.symlink_metadata().is_ok() {
-            let _ = std::fs::remove_file(&link);
-        }
-        #[cfg(windows)]
-        {
-            std::fs::copy(&target, &link)?;
-        }
-        #[cfg(not(windows))]
-        {
-            std::os::unix::fs::symlink(&target, &link)?;
-        }
-        linked.push(link);
     }
     Ok(linked)
+}
+
+fn discover_binaries(dir: &Path) -> Vec<String> {
+    let mut exes = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_file() || ft.is_symlink() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if !name.starts_with('.') {
+                            exes.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    exes.sort();
+    exes
+}
+
+/// Recursively symlink documentation and share assets (`man`, `info`, completions)
+/// from `<cellar>/share` into `<prefix>/share`.
+pub fn link_share(cellar: &Path, prefix: &Path) -> Result<Vec<PathBuf>> {
+    let cellar_share = cellar.join("share");
+    if !cellar_share.exists() {
+        return Ok(vec![]);
+    }
+    let prefix_share = prefix.join("share");
+    let mut linked = Vec::new();
+    let mut stack = vec![cellar_share.clone()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if let Ok(rel) = path.strip_prefix(&cellar_share) {
+                let dest = prefix_share.join(rel);
+                if let Some(parent) = dest.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if place_link(&path, &dest, own_root(cellar))? {
+                    linked.push(dest);
+                }
+            }
+        }
+    }
+    Ok(linked)
+}
+
+/// Remove symlinks under `<prefix>/share` that point into `<cellar>`.
+pub fn unlink_share(cellar: &Path, prefix: &Path) -> Result<usize> {
+    let prefix_share = prefix.join("share");
+    if !prefix_share.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    let mut stack = vec![prefix_share.clone()];
+    let mut dirs_to_prune = Vec::new();
+
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                dirs_to_prune.push(path.clone());
+                stack.push(path);
+                continue;
+            }
+            if let Ok(target) = std::fs::read_link(&path) {
+                if target.starts_with(cellar) {
+                    let _ = std::fs::remove_file(&path);
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    // Prune empty directories in reverse traversal order
+    dirs_to_prune.reverse();
+    for dir in dirs_to_prune {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(count)
 }
 
 /// Create `<prefix>/bin` symlink for a single-binary custom install.
 pub fn link_single_binary(binary: &Path, name: &str, prefix: &Path) -> Result<PathBuf> {
     config::ensure_dirs(prefix)?;
     let bin_dir = config::bin_dir(prefix);
+    require_component("binary name", name)?;
     let link = bin_dir.join(name);
-    if link.exists() || link.symlink_metadata().is_ok() {
-        let _ = std::fs::remove_file(&link);
-    }
-    #[cfg(windows)]
-    {
-        std::fs::copy(binary, &link)?;
-    }
-    #[cfg(not(windows))]
-    {
-        std::os::unix::fs::symlink(binary, &link)?;
+    let keg = binary.parent().unwrap_or(binary);
+    if !place_link(binary, &link, own_root(keg))? {
+        return Err(Error::Other(anyhow::anyhow!(
+            "{} already exists and is not owned by {name}",
+            link.display()
+        )));
     }
     Ok(link)
 }
@@ -295,5 +490,202 @@ mod tests {
                 .iter()
                 .all(|n| { n.contains('/') || n.contains('\\') || n.is_empty() })
         );
+    }
+
+    #[test]
+    fn link_bins_fallback_discovers_unlisted_binaries() {
+        let temp = std::env::temp_dir().join(format!("maca-test-bins-{}", std::process::id()));
+        let cellar = temp.join("cellar/pkg/1.0.0");
+        let prefix = temp.join("prefix");
+        let bin_dir = cellar.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("cmd_a"), b"echo a").unwrap();
+        std::fs::write(bin_dir.join("cmd_b"), b"echo b").unwrap();
+
+        let linked = link_bins(&cellar, &[], &prefix).unwrap();
+        assert_eq!(linked.len(), 2);
+        assert!(prefix.join("bin/cmd_a").exists());
+        assert!(prefix.join("bin/cmd_b").exists());
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn share_linking_and_unlinking_roundtrip() {
+        let temp = std::env::temp_dir().join(format!("maca-test-share-{}", std::process::id()));
+        let cellar = temp.join("cellar/pkg/1.0.0");
+        let prefix = temp.join("prefix");
+        let man_dir = cellar.join("share/man/man1");
+        std::fs::create_dir_all(&man_dir).unwrap();
+        std::fs::write(man_dir.join("foo.1"), b"man foo").unwrap();
+
+        let linked = link_share(&cellar, &prefix).unwrap();
+        assert_eq!(linked.len(), 1);
+        assert!(prefix.join("share/man/man1/foo.1").exists());
+
+        let unlinked = unlink_share(&cellar, &prefix).unwrap();
+        assert_eq!(unlinked, 1);
+        assert!(!prefix.join("share/man/man1/foo.1").exists());
+
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("maca-ut-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Build a tar.gz from `(path, contents)` files and `(path, target)` symlinks.
+    fn tar_gz(files: &[(&str, &[u8])], links: &[(&str, &str)]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        for (path, data) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            tar.append_data(&mut h, path, *data).unwrap();
+        }
+        for (path, target) in links {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Symlink);
+            h.set_size(0);
+            h.set_mode(0o777);
+            tar.append_link(&mut h, path, target).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[test]
+    fn valid_component_rejects_traversal() {
+        for ok in ["jq", "1.8.2", "1.2.3+build", "v1.0_1", "node@20"] {
+            assert!(valid_component(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "", ".", "..", "../evil", "a/b", "/abs", "a\\b", "x\n", "a\0b",
+        ] {
+            assert!(!valid_component(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn extraction_refuses_traversing_names() {
+        let prefix = temp("trav");
+        let bytes = tar_gz(&[("pkg/bin/tool", b"x")], &[]);
+        assert!(extract_tar_gz_to_cellar("../evil", "1.0", &bytes, &prefix).is_err());
+        assert!(extract_tar_gz_to_cellar("ok", "../../evil", &bytes, &prefix).is_err());
+        assert!(extract_bottle("a/b", "1.0", &bytes, &prefix).is_err());
+        assert!(!prefix.parent().unwrap().join("evil").exists());
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tarball_symlinks_survive_and_single_top_dir_is_stripped() {
+        let prefix = temp("symlink");
+        let bytes = tar_gz(
+            &[
+                ("pkg-1.0/lib/libfoo.so.1", b"lib"),
+                ("pkg-1.0/bin/tool", b"#!/bin/sh\n"),
+            ],
+            &[
+                ("pkg-1.0/lib/libfoo.so", "libfoo.so.1"),
+                ("pkg-1.0/dangling", "nowhere"),
+            ],
+        );
+        let keg = extract_tar_gz_to_cellar("pkg", "1.0", &bytes, &prefix).unwrap();
+        assert!(keg.join("bin/tool").is_file());
+        let link = keg.join("lib/libfoo.so");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("libfoo.so.1")
+        );
+        assert!(keg.join("dangling").symlink_metadata().is_ok());
+        // No staging directory is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(config::cellar_dir(&prefix))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(leftovers.is_empty(), "staging dir leaked: {leftovers:?}");
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn failed_extraction_leaves_no_keg() {
+        let prefix = temp("partial");
+        // Truncated gzip stream: unpack fails part-way.
+        let mut bytes = tar_gz(&[("pkg/bin/tool", &[7u8; 4096])], &[]);
+        bytes.truncate(bytes.len() / 2);
+        assert!(extract_tar_gz_to_cellar("pkg", "1.0", &bytes, &prefix).is_err());
+        assert!(!config::cellar_dir(&prefix).join("pkg/1.0").exists());
+        // A bottle without the expected <name>/<version> layout also leaves nothing.
+        let wrong = tar_gz(&[("other/9/bin/x", b"x")], &[]);
+        assert!(extract_bottle("pkg", "1.0", &wrong, &prefix).is_err());
+        assert!(!config::cellar_dir(&prefix).join("pkg/1.0").exists());
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_never_clobber_foreign_files_or_other_packages() {
+        let prefix = temp("clobber");
+        let a = config::cellar_dir(&prefix).join("a/1.0");
+        let b = config::cellar_dir(&prefix).join("b/1.0");
+        for keg in [&a, &b] {
+            std::fs::create_dir_all(keg.join("bin")).unwrap();
+            std::fs::write(keg.join("bin/tool"), b"x").unwrap();
+            std::fs::write(keg.join("bin/mine"), b"x").unwrap();
+        }
+        std::fs::create_dir_all(config::bin_dir(&prefix)).unwrap();
+        let user_file = config::bin_dir(&prefix).join("mine");
+        std::fs::write(&user_file, b"user data").unwrap();
+
+        // A links `tool`; the user's regular file `mine` is left untouched.
+        let linked = link_bins(&a, &[], &prefix).unwrap();
+        assert_eq!(linked, vec![config::bin_dir(&prefix).join("tool")]);
+        assert_eq!(std::fs::read(&user_file).unwrap(), b"user data");
+
+        // B must not steal A's link.
+        assert!(link_bins(&b, &[], &prefix).unwrap().is_empty());
+        let tool = config::bin_dir(&prefix).join("tool");
+        assert!(std::fs::read_link(&tool).unwrap().starts_with(&a));
+
+        // A new version of A may replace A's own link.
+        let a2 = config::cellar_dir(&prefix).join("a/2.0");
+        std::fs::create_dir_all(a2.join("bin")).unwrap();
+        std::fs::write(a2.join("bin/tool"), b"x").unwrap();
+        assert_eq!(link_bins(&a2, &[], &prefix).unwrap().len(), 1);
+        assert!(std::fs::read_link(&tool).unwrap().starts_with(&a2));
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn atomic_write_replaces_and_leaves_no_temp() {
+        let dir = temp("atomic");
+        let path = dir.join("state.json");
+        atomic_write(&path, b"one").unwrap();
+        atomic_write(&path, b"two").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"two");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_checksum_is_not_a_mismatch_but_wrong_one_is() {
+        assert!(verify_sha256("x", b"abc", None).is_ok());
+        assert!(verify_sha256("x", b"abc", Some(&sha256_hex(b"abc"))).is_ok());
+        assert!(matches!(
+            verify_sha256("x", b"abc", Some("00")),
+            Err(Error::Checksum { .. })
+        ));
     }
 }

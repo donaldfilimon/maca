@@ -2,10 +2,11 @@
 //!
 //! Release asset convention (documented, not yet published):
 //! ```text
-//! maca-<target>-<version>.tar.gz      (contains the `maca` binary)
-//! maca-<target>-<version>.tar.gz.sha256
+//! maca-<target>.tar.gz      (contains the `maca` binary)
+//! maca-<target>.tar.gz.sha256
 //! ```
 //! where `<target>` is a Rust target triple such as `aarch64-apple-darwin`.
+//! The asset name carries no version; the release tag does.
 //!
 //! The current binary is backed up next to itself as `maca.bak.<timestamp>`
 //! before replacement, so a bad update can be reverted manually.
@@ -139,21 +140,34 @@ pub async fn run(repo: &str, current_version: &str, force: bool) -> Result<Strin
                 .to_string();
         let expected = text.split_whitespace().next().unwrap_or("").to_string();
         install::verify_sha256(&asset.name, &archive, Some(&expected))?;
-    } else {
-        tracing::warn!(
-            "no .sha256 asset for {}; installing without checksum verification",
+    } else if force {
+        eprintln!(
+            "maca: warning: release {tag} has no .sha256 for {}; installing UNVERIFIED (--force)",
             asset.name
         );
+    } else {
+        return Err(Error::Unsupported(format!(
+            "release {tag} has no .sha256 for {}; refusing to replace the running binary with unverified bytes (use --force to override)",
+            asset.name
+        )));
     }
     let exe = current_exe_path()?;
     let tmp = extract_binary(&archive, &exe)?;
-    replace_with_backup(&exe, &tmp)?;
+    if let Err(e) = replace_with_backup(&exe, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(tag)
 }
 
 /// Extract the `maca` binary from a `.tar.gz` or `.zip` archive into a temp path.
 fn extract_binary(archive: &[u8], exe: &Path) -> Result<PathBuf> {
-    let tmp = std::env::temp_dir().join(format!("maca-update-{}", std::process::id()));
+    // Staged next to the running binary so the final rename never crosses a
+    // filesystem boundary.
+    let tmp = exe
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".maca-update-{}", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
     #[cfg(target_os = "windows")]
     {
