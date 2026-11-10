@@ -109,8 +109,10 @@ enum Commands {
         cask: bool,
         /// Install this version instead of the catalog's current one.
         ///
-        /// GitHub Releases and the Aqua registry can fetch it. The other
-        /// backends only publish their current version and refuse the request.
+        /// Served where the catalog can provide it: GitHub Releases and Aqua
+        /// name a tag, Homebrew resolves a versioned formula, winget an older
+        /// manifest, and custom its registration history. Anything else is
+        /// refused rather than rounded to a nearby version.
         #[arg(long)]
         version: Option<String>,
     },
@@ -1358,6 +1360,7 @@ fn cmd_custom(ctx: &Ctx, action: CustomCommands) -> Result<()> {
                 homepage,
                 artifacts,
                 build_steps: build_step,
+                history: Vec::new(),
             });
             reg.save_local()?;
             println!(
@@ -1786,10 +1789,12 @@ fn requested_version(locked: Option<&str>) -> Option<String> {
 
 fn check_locked_version(out: &backend::InstallOutcome, locked: Option<&str>) -> Result<()> {
     match locked {
-        Some(v) if v != "latest" && v != out.version => Err(Error::Unsupported(format!(
-            "{}: lock pins {v} but {} now provides {}",
-            out.name, out.backend, out.version
-        ))),
+        Some(v) if v != "latest" && !backend::version_satisfies(v, &out.version) => {
+            Err(Error::Unsupported(format!(
+                "{}: lock pins {v} but {} now provides {}",
+                out.name, out.backend, out.version
+            )))
+        }
         _ => Ok(()),
     }
 }

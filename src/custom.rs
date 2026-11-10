@@ -59,6 +59,12 @@ pub struct Entry {
     /// source archive and built instead of being linked directly.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub build_steps: Vec<String>,
+    /// Earlier versions of this package, newest first, kept when `custom add`
+    /// registers a different version of an existing name. They are what
+    /// `--version`, groups and lockfiles can ask for; `version` above stays
+    /// the current one. Entries here carry no history of their own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<Entry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,8 +152,33 @@ impl Registry {
         self.packages.iter().find(|p| p.name == name)
     }
 
-    pub fn upsert(&mut self, entry: Entry) {
+    /// The entry for `name` at `requested` (the current one when `None`),
+    /// looking through its history for an older version.
+    pub fn find_version(&self, name: &str, requested: Option<&str>) -> Option<&Entry> {
+        let entry = self.find(name)?;
+        let Some(req) = requested.map(str::trim) else {
+            return Some(entry);
+        };
+        if entry.version == req {
+            return Some(entry);
+        }
+        entry.history.iter().find(|h| h.version == req)
+    }
+
+    /// Add or replace a package. Registering the same version again replaces
+    /// it; registering a different version makes the old one history, so an
+    /// older release stays installable by `--version` or a lockfile.
+    pub fn upsert(&mut self, mut entry: Entry) {
+        entry.history.clear();
         if let Some(existing) = self.packages.iter_mut().find(|p| p.name == entry.name) {
+            let mut history = std::mem::take(&mut existing.history);
+            if existing.version != entry.version {
+                let mut old = existing.clone();
+                old.history.clear();
+                history.insert(0, old);
+            }
+            history.retain(|h| h.version != entry.version);
+            entry.history = history;
             *existing = entry;
         } else {
             self.packages.push(entry);
@@ -271,10 +302,30 @@ impl CustomBackend {
     }
 
     pub fn plan(&self, name: &str) -> Result<InstallPlan> {
-        let entry = self
+        self.plan_version(name, None)
+    }
+
+    /// The entry to install: the current one, or the one `requested` names.
+    fn pick_entry(&self, name: &str, requested: Option<&str>) -> Result<&Entry> {
+        let current = self
             .registry
             .find(name)
             .ok_or_else(|| Error::NotFound(format!("custom package '{name}' not found")))?;
+        self.registry.find_version(name, requested).ok_or_else(|| {
+            let mut have: Vec<&str> = std::iter::once(current.version.as_str())
+                .chain(current.history.iter().map(|h| h.version.as_str()))
+                .collect();
+            have.dedup();
+            Error::Unsupported(format!(
+                "custom registry has no version {} of {name} (have: {})",
+                requested.unwrap_or_default(),
+                have.join(", ")
+            ))
+        })
+    }
+
+    pub fn plan_version(&self, name: &str, requested: Option<&str>) -> Result<InstallPlan> {
+        let entry = self.pick_entry(name, requested)?;
         // Name and version become path components under the cellar and bin/.
         if !install::valid_component(&entry.name) || !install::valid_component(&entry.version) {
             return Err(Error::Unsupported(format!(
@@ -305,19 +356,9 @@ impl CustomBackend {
     }
 
     pub async fn install(&self, name: &str, opts: &InstallOptions) -> Result<InstallOutcome> {
-        let plan = self.plan(name)?;
-        let entry = self
-            .registry
-            .find(name)
-            .ok_or_else(|| Error::NotFound(format!("custom package '{name}' not found")))?;
-        if let Some(req) = &opts.version
-            && req.trim() != entry.version
-        {
-            return Err(Error::Unsupported(format!(
-                "custom only publishes its current version; cannot install {} at {}",
-                name, req
-            )));
-        }
+        let requested = opts.version.as_deref();
+        let plan = self.plan_version(name, requested)?;
+        let entry = self.pick_entry(name, requested)?;
         let (_, art) = pick_artifact(entry).ok_or_else(|| {
             Error::Unsupported(format!(
                 "custom package '{name}' has no artifact for this host"
@@ -513,6 +554,7 @@ mod tests {
             homepage: String::new(),
             artifacts,
             build_steps: vec![],
+            history: vec![],
         }
     }
 
@@ -526,6 +568,82 @@ mod tests {
         assert_eq!(back.find("x").unwrap().version, "1.0.0");
     }
 
+    fn versioned(version: &str, url: &str) -> Entry {
+        let mut e = entry_with(&["macos", "linux", "windows"]);
+        e.version = version.into();
+        for a in e.artifacts.values_mut() {
+            a.url = url.into();
+        }
+        e
+    }
+
+    #[test]
+    fn registering_a_new_version_keeps_the_old_one_installable() {
+        let mut reg = Registry::default();
+        reg.upsert(versioned("1.0.0", "https://example.com/1"));
+        reg.upsert(versioned("2.0.0", "https://example.com/2"));
+        reg.upsert(versioned("1.5.0", "https://example.com/15"));
+        let e = reg.find("x").unwrap();
+        assert_eq!(e.version, "1.5.0", "the latest registration is current");
+        assert_eq!(
+            e.history
+                .iter()
+                .map(|h| h.version.as_str())
+                .collect::<Vec<_>>(),
+            ["2.0.0", "1.0.0"]
+        );
+        assert!(e.history.iter().all(|h| h.history.is_empty()));
+        assert_eq!(
+            reg.find_version("x", Some("1.0.0")).unwrap().version,
+            "1.0.0"
+        );
+        assert_eq!(
+            reg.find_version("x", Some(" 2.0.0 ")).unwrap().version,
+            "2.0.0"
+        );
+        assert!(reg.find_version("x", Some("9.9.9")).is_none());
+        assert_eq!(reg.find_version("x", None).unwrap().version, "1.5.0");
+
+        // Re-registering a version replaces it rather than duplicating it.
+        reg.upsert(versioned("1.0.0", "https://example.com/1b"));
+        let e = reg.find("x").unwrap();
+        assert_eq!(e.version, "1.0.0");
+        assert_eq!(
+            e.history
+                .iter()
+                .map(|h| h.version.as_str())
+                .collect::<Vec<_>>(),
+            ["1.5.0", "2.0.0"]
+        );
+        assert_eq!(
+            e.artifacts.values().next().unwrap().url,
+            "https://example.com/1b"
+        );
+    }
+
+    #[test]
+    fn plan_version_serves_history_and_refuses_unknown_versions() {
+        let mut reg = Registry::default();
+        reg.upsert(versioned("1.0.0", "https://example.com/1"));
+        reg.upsert(versioned("2.0.0", "https://example.com/2"));
+        let backend = CustomBackend::new(reg);
+        let old = backend.plan_version("x", Some("1.0.0")).unwrap();
+        assert_eq!(
+            (old.version.as_str(), old.url.as_str()),
+            ("1.0.0", "https://example.com/1")
+        );
+        let cur = backend.plan_version("x", None).unwrap();
+        assert_eq!(cur.version, "2.0.0");
+        let err = backend
+            .plan_version("x", Some("0.1.0"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no version 0.1.0") && err.contains("2.0.0, 1.0.0"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn search_filters_by_query() {
         let mut reg = Registry::default();
@@ -536,6 +654,7 @@ mod tests {
             homepage: String::new(),
             artifacts: BTreeMap::new(),
             build_steps: vec![],
+            history: vec![],
         });
         let backend = CustomBackend { registry: reg };
         assert_eq!(backend.search("hello", 10).unwrap().len(), 1);
@@ -589,6 +708,7 @@ mod mirror_tests {
                 homepage: String::new(),
                 artifacts,
                 build_steps: vec![],
+                history: vec![],
             });
         }
         let backend = CustomBackend::new(reg);

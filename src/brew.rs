@@ -17,7 +17,12 @@ use crate::source;
 use crate::state;
 use crate::{Error, Result};
 
-const FORMULA_API: &str = "https://formulae.brew.sh/api/formula";
+fn formula_api() -> String {
+    std::env::var("MACA_FORMULA_API")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://formulae.brew.sh/api/formula".to_string())
+}
 fn cask_api() -> String {
     std::env::var("MACA_CASK_API")
         .ok()
@@ -87,6 +92,21 @@ struct BottleStable {
 struct BottleFile {
     url: String,
     sha256: String,
+}
+
+/// Names of versioned formulae that could carry `requested` for `base`:
+/// `python@3.12.4` is tried as `python@3.12.4`, `python@3.12`, `python@3`.
+fn versioned_formula_names(base: &str, requested: &str) -> Vec<String> {
+    let req = requested.trim().trim_start_matches('v');
+    let mut out = Vec::new();
+    let parts: Vec<&str> = req.split('.').collect();
+    for n in (1..=parts.len()).rev() {
+        let name = format!("{base}@{}", parts[..n].join("."));
+        if install::valid_component(&name) && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// A cask spec is `cask:<token>`. The token is the cellar name.
@@ -333,7 +353,7 @@ impl BrewBackend {
         if normalized.is_empty() {
             return Err(Error::NotFound("empty formula name".into()));
         }
-        let url = format!("{FORMULA_API}/{normalized}.json");
+        let url = format!("{}/{normalized}.json", formula_api());
         let data = install::download(&url).await.map_err(|e| match e {
             Error::Network(m) if m.contains("404") => {
                 Error::NotFound(format!("formula '{normalized}' not found"))
@@ -504,8 +524,49 @@ impl BrewBackend {
         if let Some(token) = cask_token(name) {
             return self.install_cask(&token, opts).await;
         }
+        // A requested version is settled here, once, for the package itself:
+        // dependencies are installed at whatever version the formula needs.
+        let (name, opts) = match opts.version.as_deref().map(str::trim) {
+            Some(req) => {
+                let target = self.resolve_version(name, req).await?;
+                let mut plain = opts.clone();
+                plain.version = None;
+                (target, plain)
+            }
+            None => (name.to_string(), opts.clone()),
+        };
         let mut visited = Vec::new();
-        self.install_with_deps(name, opts, &mut visited).await
+        self.install_with_deps(&name, &opts, &mut visited).await
+    }
+
+    /// The formula that provides `name` at `requested`.
+    ///
+    /// Homebrew publishes one version per formula, plus separate versioned
+    /// formulae for some packages (`python@3.12`, `node@22`). So the request
+    /// is served by `name` itself when its current version satisfies it,
+    /// otherwise by `name@<requested>` when that exists and satisfies it, and
+    /// is refused when neither does. A request is never rounded to a nearby
+    /// version.
+    async fn resolve_version(&self, name: &str, requested: &str) -> Result<String> {
+        let base = name.trim().to_ascii_lowercase();
+        let current = self.fetch_formula(&base).await?;
+        if crate::backend::version_satisfies(requested, &current.versions.stable) {
+            return Ok(base);
+        }
+        for candidate in versioned_formula_names(&base, requested) {
+            match self.fetch_formula(&candidate).await {
+                Ok(f) if crate::backend::version_satisfies(requested, &f.versions.stable) => {
+                    return Ok(candidate);
+                }
+                Ok(_) | Err(Error::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(Error::Unsupported(format!(
+            "brew has {base} {} and no versioned formula for {requested}; \
+             it only serves a version it publishes (for example `{base}@<major>`)",
+            current.versions.stable
+        )))
     }
 
     async fn install_cask(&self, token: &str, opts: &InstallOptions) -> Result<InstallOutcome> {
@@ -738,6 +799,7 @@ impl BrewBackend {
             // not another instance of that package's kind.
             let dep_opts = InstallOptions {
                 kind: crate::group::Kind::Library,
+                version: None,
                 ..opts.clone()
             };
             Box::pin(self.install_with_deps(dep, &dep_opts, visited)).await?;
@@ -1003,5 +1065,19 @@ mod tests {
         let got = BrewBackend::pick_bottle_key(&files, "macos", "arm64", None);
         // arm64_linux should NOT match macOS.
         assert_eq!(got, None);
+    }
+
+    #[test]
+    fn versioned_formula_names_try_the_most_specific_first() {
+        assert_eq!(
+            versioned_formula_names("python", "3.12.4"),
+            ["python@3.12.4", "python@3.12", "python@3"]
+        );
+        assert_eq!(versioned_formula_names("node", "v22"), ["node@22"]);
+        assert!(
+            versioned_formula_names("x", "../evil")
+                .iter()
+                .all(|n| install::valid_component(n))
+        );
     }
 }

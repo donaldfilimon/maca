@@ -142,6 +142,42 @@ pub fn is_newer_version(candidate: &str, installed: &str) -> bool {
     compare_loose(c, i) == Some(std::cmp::Ordering::Greater)
 }
 
+/// True when `actual` is the version `requested` asks for: the same string
+/// (ignoring whitespace and a leading `v`), or `requested` is a leading
+/// run of `actual`'s dotted parts or its Homebrew revision (`3.12` is met by
+/// `3.12.4`, `1.8.2` by `1.8.2_1`). `3.1` is not met by `3.10`, and a
+/// pre-release (`1.0-rc1`) never meets `1.0`.
+pub fn version_satisfies(requested: &str, actual: &str) -> bool {
+    let req = requested.trim().trim_start_matches('v');
+    let act = actual.trim().trim_start_matches('v');
+    if req.is_empty() {
+        return false;
+    }
+    if req == act {
+        return true;
+    }
+    act.strip_prefix(req)
+        .is_some_and(|rest| rest.starts_with(['.', '_']))
+}
+
+/// Sort version strings newest first with the same loose ordering `upgrade`
+/// uses. Strings that cannot be ordered reliably keep their relative order.
+pub fn sort_versions_newest_first(versions: &mut [String]) {
+    versions.sort_by(|a, b| {
+        let (a, b) = (
+            a.trim().trim_start_matches('v'),
+            b.trim().trim_start_matches('v'),
+        );
+        if is_newer_version(a, b) {
+            std::cmp::Ordering::Less
+        } else if is_newer_version(b, a) {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    });
+}
+
 #[derive(Debug, PartialEq)]
 enum Tok {
     Num(u64),
@@ -572,5 +608,18 @@ mod tests {
     #[test]
     fn resolve_auto_is_custom_first() {
         assert_eq!(resolve(BackendKind::Auto), BackendKind::Custom);
+    }
+
+    #[test]
+    fn version_satisfies_matches_whole_components_only() {
+        assert!(version_satisfies("3.12", "3.12.4"));
+        assert!(version_satisfies("v3.12", "3.12"));
+        assert!(version_satisfies("1.8.2", "1.8.2_1"));
+        assert!(version_satisfies(" 1.0.0 ", "1.0.0"));
+        assert!(!version_satisfies("3.1", "3.10"));
+        assert!(!version_satisfies("1.0", "1.0-rc1"));
+        assert!(!version_satisfies("2", "10.2"));
+        assert!(!version_satisfies("", "1.0"));
+        assert!(!version_satisfies("1.0.1", "1.0"));
     }
 }

@@ -537,14 +537,22 @@ fn e2e_pins_upgrade_lock_sync_and_snapshot_restore() {
     assert!(!sb.prefix().join("cellar/hello/1.0.0").exists());
     assert!(sb.prefix().join("cellar/hello/2.0.0").exists());
 
-    // The lock still pins 1.0.0, which the registry no longer serves: sync
-    // must fail loudly and leave the installed state as it was.
+    // The lock still pins 1.0.0. The registry now serves 2.0.0 but kept 1.0.0
+    // as history, so sync replays the lock: it installs 1.0.0 again.
+    let text = sb.ok(&["sync"]);
+    assert!(text.contains("hello 1.0.0"), "{text}");
+    assert_eq!(sb.installed_version("hello").as_deref(), Some("1.0.0"));
+    assert_eq!(sb.exec("hello"), "hello-1");
+    sb.ok(&["upgrade"]);
+    assert_eq!(sb.installed_version("hello").as_deref(), Some("2.0.0"));
+
+    // A lock naming a version the registry never held fails loudly and
+    // leaves the installed state as it was.
+    let lock_path = sb.prefix().join("maca.lock.json");
+    let good_lock = std::fs::read_to_string(&lock_path).unwrap();
+    std::fs::write(&lock_path, good_lock.replace("1.0.0", "0.0.1")).unwrap();
     let text = sb.fails(&["sync"]);
-    assert!(
-        text.contains("custom only publishes its current version")
-            || text.contains("lock pins 1.0.0"),
-        "{text}"
-    );
+    assert!(text.contains("no version 0.0.1"), "{text}");
     assert_eq!(sb.installed_version("hello").as_deref(), Some("2.0.0"));
     assert_eq!(sb.exec("hello"), "hello-2");
 
@@ -762,8 +770,7 @@ fn e2e_binary_kind_build_steps_and_groups() {
     ]);
     let text = sb.fails(&["group", "install", "dev"]);
     assert!(
-        text.contains("custom only publishes its current version")
-            || text.contains("lock pins 9.9.9"),
+        text.contains("no version 9.9.9") || text.contains("lock pins 9.9.9"),
         "{text}"
     );
     let group = std::fs::read_to_string(sb.home.join("groups/dev.json")).unwrap();
@@ -910,17 +917,20 @@ fn e2e_cask_refuses_a_bad_checksum_a_wrong_version_and_leaves_nothing() {
     assert_eq!(sb.exec("pinned"), "cask-bin");
 }
 
-/// Versions that only the current catalog entry can serve are refused by
-/// the custom backend, and the registry entry is left untouched.
+/// The custom registry keeps earlier versions, so `--version` can install one,
+/// and refuses a version it never held.
 #[cfg(unix)]
 #[test]
-fn e2e_custom_refuses_a_version_it_does_not_publish() {
+fn e2e_custom_serves_a_registered_older_version_and_refuses_unknown_ones() {
     let a1 = script_tarball("a", "alpha", "alpha-1");
+    let a2 = script_tarball("a", "alpha", "alpha-2");
     let mut routes = HashMap::new();
     routes.insert("/a1".to_string(), a1.clone());
+    routes.insert("/a2".to_string(), a2.clone());
     let base = serve(routes);
     let sb = Sandbox::new("customver");
     sb.add("alpha", "1.0.0", &format!("{base}/a1"), &sha256(&a1));
+    sb.add("alpha", "2.0.0", &format!("{base}/a2"), &sha256(&a2));
 
     let text = sb.fails(&[
         "install",
@@ -930,13 +940,16 @@ fn e2e_custom_refuses_a_version_it_does_not_publish() {
         "--version",
         "0.5.0",
     ]);
-    assert!(
-        text.contains("only publishes its current version"),
-        "{text}"
-    );
+    assert!(text.contains("no version 0.5.0"), "{text}");
     assert_eq!(sb.installed_version("alpha"), None);
     assert!(!sb.prefix().join("cellar/alpha").exists());
 
+    // Unversioned installs the current registration.
+    sb.ok(&["install", "alpha", "--backend", "custom"]);
+    assert_eq!(sb.exec("alpha"), "alpha-2");
+    sb.ok(&["remove", "alpha", "--no-snapshot"]);
+
+    // An older registration installs on request, and a lock of it syncs back.
     sb.ok(&[
         "install",
         "alpha",
@@ -945,6 +958,12 @@ fn e2e_custom_refuses_a_version_it_does_not_publish() {
         "--version",
         "1.0.0",
     ]);
+    assert_eq!(sb.exec("alpha"), "alpha-1");
+    assert_eq!(sb.installed_version("alpha").as_deref(), Some("1.0.0"));
+    sb.ok(&["lock"]);
+    sb.ok(&["remove", "alpha", "--no-snapshot"]);
+    sb.ok(&["sync"]);
+    assert_eq!(sb.installed_version("alpha").as_deref(), Some("1.0.0"));
     assert_eq!(sb.exec("alpha"), "alpha-1");
 }
 
@@ -1219,4 +1238,225 @@ fn e2e_github_dry_run_prints_host_asset() {
     );
     assert!(!ok, "{text}");
     assert!(text.contains("needs an explicit backend"), "{text}");
+}
+
+/// A Homebrew formula JSON fixture with a bottle for the test host.
+#[cfg(unix)]
+fn formula_json(name: &str, version: &str, bottle_url: &str) -> Vec<u8> {
+    let keys: &[&str] = if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            &[
+                "arm64_sequoia",
+                "arm64_sonoma",
+                "arm64_ventura",
+                "arm64_monterey",
+            ]
+        } else {
+            &["sequoia", "sonoma", "ventura", "monterey"]
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        &["arm64_linux"]
+    } else {
+        &["x86_64_linux"]
+    };
+    let mut files = serde_json::Map::new();
+    for key in keys {
+        files.insert(
+            (*key).to_string(),
+            serde_json::json!({ "url": bottle_url, "sha256": "00".repeat(32) }),
+        );
+    }
+    serde_json::to_vec(&serde_json::json!({
+        "name": name,
+        "desc": "test formula",
+        "homepage": "https://example.test",
+        "versions": { "stable": version },
+        "urls": { "stable": { "url": bottle_url } },
+        "executables": [],
+        "bottle": { "stable": { "files": files } },
+        "dependencies": [],
+        "uses_from_macos": [],
+        "disabled": false
+    }))
+    .unwrap()
+}
+
+/// A named brew version is served by a versioned formula (`python@3.12`) when
+/// the current one does not satisfy it, and a version no formula publishes is
+/// refused rather than rounded to a nearby one.
+#[cfg(unix)]
+#[test]
+fn e2e_brew_resolves_a_versioned_formula_and_refuses_unknown_ones() {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/python.json".to_string(),
+        formula_json(
+            "python",
+            "3.13.0",
+            "https://example.test/python-3.13.0.tar.gz",
+        ),
+    );
+    routes.insert(
+        "/python@3.12.json".to_string(),
+        formula_json(
+            "python@3.12",
+            "3.12.4",
+            "https://example.test/python@3.12-3.12.4.tar.gz",
+        ),
+    );
+    let base = serve(routes);
+    let sb = Sandbox::new("brew-version");
+    let env = [("MACA_FORMULA_API", base.as_str())];
+
+    // The current formula satisfies a prefix of its own version.
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "python",
+            "--backend",
+            "brew",
+            "--version",
+            "3.13",
+            "--dry-run",
+            "--no-snapshot",
+        ],
+        &env,
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("python 3.13.0"), "{text}");
+
+    // A version only a versioned formula publishes resolves to it.
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "python",
+            "--backend",
+            "brew",
+            "--version",
+            "3.12",
+            "--dry-run",
+            "--no-snapshot",
+        ],
+        &env,
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("python@3.12 3.12.4"), "{text}");
+
+    // A version nothing publishes is refused, not rounded.
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "python",
+            "--backend",
+            "brew",
+            "--version",
+            "3.11",
+            "--dry-run",
+            "--no-snapshot",
+        ],
+        &env,
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("no versioned formula for 3.11"), "{text}");
+}
+
+fn winget_manifest(id: &str, version: &str, url: &str) -> Vec<u8> {
+    let arch = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "x64"
+    };
+    format!(
+        "PackageIdentifier: {id}\nPackageVersion: {version}\nInstallers:\n  - Architecture: {arch}\n    InstallerUrl: {url}\n    InstallerSha256: {}\n",
+        "00".repeat(32)
+    )
+    .into_bytes()
+}
+
+/// A named winget version is served by an older manifest directory, and a
+/// version winget-pkgs does not publish is refused.
+#[cfg(unix)]
+#[test]
+fn e2e_winget_resolves_an_older_manifest_and_refuses_unknown_ones() {
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/a/acme/hello".to_string(),
+        serde_json::to_vec(&serde_json::json!([
+            { "name": "1.0.0", "type": "dir" },
+            { "name": "2.0.0", "type": "dir" },
+        ]))
+        .unwrap(),
+    );
+    routes.insert(
+        "/a/acme/hello/1.0.0/acme.hello.installer.yaml".to_string(),
+        winget_manifest(
+            "acme.hello",
+            "1.0.0",
+            "https://example.test/hello-1.0.0.exe",
+        ),
+    );
+    routes.insert(
+        "/a/acme/hello/2.0.0/acme.hello.installer.yaml".to_string(),
+        winget_manifest(
+            "acme.hello",
+            "2.0.0",
+            "https://example.test/hello-2.0.0.exe",
+        ),
+    );
+    let base = serve(routes);
+    let sb = Sandbox::new("winget-version");
+    let env = [
+        ("MACA_WINGET_CONTENTS_API", base.as_str()),
+        ("MACA_WINGET_PKGS_RAW", base.as_str()),
+    ];
+
+    // A published older version is fetched by name.
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "acme.hello",
+            "--backend",
+            "winget",
+            "--version",
+            "1.0.0",
+            "--dry-run",
+            "--no-snapshot",
+        ],
+        &env,
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("acme.hello 1.0.0"), "{text}");
+    assert!(text.contains("hello-1.0.0.exe"), "{text}");
+
+    // Without a request the newest published version wins.
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "acme.hello",
+            "--backend",
+            "winget",
+            "--dry-run",
+            "--no-snapshot",
+        ],
+        &env,
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("acme.hello 2.0.0"), "{text}");
+
+    // A version winget-pkgs never published is refused.
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "acme.hello",
+            "--backend",
+            "winget",
+            "--version",
+            "1.5",
+            "--dry-run",
+            "--no-snapshot",
+        ],
+        &env,
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("no version 1.5"), "{text}");
 }

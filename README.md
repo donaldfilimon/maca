@@ -73,13 +73,15 @@ piece being added on top of it, not a different design.
 The gaps against the specialists are features in progress, not reasons to pick
 something else.
 
-- **Pinned versions, fetched where the catalog can serve them.** GitHub
-  Releases and the Aqua registry already do: `--version`, a group version, and
-  a lockfile version fetch that release instead of the current one (the tag is
-  tried with and without its leading `v`). Homebrew, winget, and a custom entry
-  only publish one version, so they refuse the request rather than installing
-  the wrong one. `maca sync` still rolls back if what comes back is not what the
-  lock named.
+- **Pinned versions, fetched where the catalog can serve them.** `--version`,
+  a group version, and a lockfile version fetch that release instead of the
+  current one. GitHub Releases and the Aqua registry name a tag (tried with and
+  without its leading `v`); Homebrew resolves a versioned formula (`python@3.12`)
+  or its current version when that satisfies the request; winget resolves an
+  older manifest directory; a custom entry keeps its earlier registrations. A
+  catalog that cannot serve the request is refused, never rounded to a nearby
+  version. `maca sync` still rolls back if what comes back is not what the lock
+  named.
 - **Per-directory versions.** asdf and mise switch language versions per
   project. A `maca.toml` in a directory (or any parent) scopes the prefix, and
   optionally the cellar, for every command run below it; see
@@ -354,8 +356,10 @@ renaming the new file into place. The repository's release workflow and
   it into a second prefix is refused. Use a separate `MACA_HOME` per prefix
   for fully independent installs.
 - **Older versions only where the catalog serves them.** `--version`, a group
-  version and a lockfile version are requested from GitHub Releases and Aqua.
-  Homebrew, winget and custom refuse a version that is not the current one.
+  version and a lockfile version are honoured by GitHub Releases, Aqua,
+  Homebrew (versioned formulae), winget (older manifests) and the custom
+  registry (registration history). A request no catalog can serve is refused,
+  never rounded to a nearby version.
 - **`scripts/package-release.sh` packages the host build only.** Pushing a
   `v<version>` tag runs `.github/workflows/release.yml`, which attaches the
   Linux x86_64 and macOS arm64 archives to the GitHub release. That workflow

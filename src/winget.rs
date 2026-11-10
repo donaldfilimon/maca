@@ -15,9 +15,35 @@ use crate::install;
 use crate::state;
 use crate::{Error, Result};
 
-const WINGET_API: &str = "https://api.winget.run/v2/packages";
-const WINGET_PKGS_RAW: &str =
-    "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests";
+/// Catalog search API. `MACA_WINGET_API` overrides it (tests point it at a
+/// loopback server).
+fn winget_api() -> String {
+    std::env::var("MACA_WINGET_API")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "https://api.winget.run/v2/packages".to_string())
+}
+
+/// Raw manifest host for winget-pkgs. `MACA_WINGET_PKGS_RAW` overrides it.
+fn winget_pkgs_raw() -> String {
+    std::env::var("MACA_WINGET_PKGS_RAW")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            "https://raw.githubusercontent.com/microsoft/winget-pkgs/master/manifests".to_string()
+        })
+}
+
+/// GitHub contents API base for the winget-pkgs version listing.
+/// `MACA_WINGET_CONTENTS_API` overrides it.
+fn winget_contents_api() -> String {
+    std::env::var("MACA_WINGET_CONTENTS_API")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests".to_string()
+        })
+}
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)] // total reserved for pagination
@@ -153,6 +179,47 @@ struct LocaleManifest {
     tags: Option<Vec<String>>,
 }
 
+/// Choose a version from the directory names under a winget-pkgs id.
+///
+/// Only names that start like a version (a digit, optionally after `v`) count,
+/// so a sub-package folder is never mistaken for one. Winget versions are free
+/// text (`1.2`, `2024.10.1.0`, `5.0.0-beta`), so ordering uses the loose
+/// comparison shared with `upgrade` rather than strict semver, which would
+/// drop most of them. A requested version must match exactly (ignoring case
+/// and a leading `v`); it is never rounded to a nearby one.
+fn pick_version(id: &str, names: Vec<String>, requested: Option<&str>) -> Result<String> {
+    let looks_like_version = |n: &str| {
+        let t = n.strip_prefix(['v', 'V']).unwrap_or(n);
+        t.chars().next().is_some_and(|c| c.is_ascii_digit())
+    };
+    let mut versions: Vec<String> = names
+        .into_iter()
+        .filter(|n| looks_like_version(n))
+        .collect();
+    if versions.is_empty() {
+        return Err(Error::NotFound(format!(
+            "no published versions for winget id '{id}'"
+        )));
+    }
+    if let Some(req) = requested {
+        let want = req.trim().trim_start_matches(['v', 'V']);
+        return versions
+            .iter()
+            .find(|v| v.trim_start_matches(['v', 'V']).eq_ignore_ascii_case(want))
+            .cloned()
+            .ok_or_else(|| {
+                crate::backend::sort_versions_newest_first(&mut versions);
+                let shown: Vec<_> = versions.iter().take(8).cloned().collect();
+                Error::NotFound(format!(
+                    "winget-pkgs has no version {req} of {id} (newest: {})",
+                    shown.join(", ")
+                ))
+            });
+    }
+    crate::backend::sort_versions_newest_first(&mut versions);
+    Ok(versions.remove(0))
+}
+
 #[derive(Debug, Default)]
 pub struct WingetBackend;
 
@@ -163,10 +230,11 @@ impl WingetBackend {
 
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Package>> {
         let q = query.trim();
+        let api = winget_api();
         let url = if q.is_empty() {
-            WINGET_API.to_string()
+            api
         } else {
-            format!("{WINGET_API}?query={}", urlencoding_lite(q))
+            format!("{api}?query={}", urlencoding_lite(q))
         };
         let data = install::download(&url).await?;
         let env: ApiEnvelope = serde_json::from_slice(&data)
@@ -207,6 +275,12 @@ impl WingetBackend {
     /// using the winget-pkgs repository layout (source of truth for ids).
     /// Returns `(id, version)`.
     pub async fn resolve_exact(id: &str) -> Result<(String, String)> {
+        Self::resolve_version(id, None).await
+    }
+
+    /// Like [`resolve_exact`](Self::resolve_exact), but a `requested` version
+    /// must be one winget-pkgs actually publishes for the id.
+    pub async fn resolve_version(id: &str, requested: Option<&str>) -> Result<(String, String)> {
         let url = Self::versions_url(id).ok_or_else(|| {
             Error::Unsupported(format!("winget id '{id}' is not in Publisher.Name form"))
         })?;
@@ -224,19 +298,12 @@ impl WingetBackend {
         }
         let entries: Vec<Entry> = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Network(format!("decoding winget-pkgs listing: {e}")))?;
-        let mut versions: Vec<(semver::Version, String)> = entries
+        let names = entries
             .into_iter()
             .filter(|e| e.kind == "dir")
-            .filter_map(|e| semver::Version::parse(&e.name).ok().map(|v| (v, e.name)))
+            .map(|e| e.name)
             .collect();
-        versions.sort_by(|a, b| b.0.cmp(&a.0));
-        let version = versions
-            .into_iter()
-            .next()
-            .map(|(_, name)| name)
-            .ok_or_else(|| {
-                Error::NotFound(format!("no published versions for winget id '{id}'"))
-            })?;
+        let version = pick_version(id, names, requested)?;
         Ok((id.to_string(), version))
     }
 
@@ -248,8 +315,10 @@ impl WingetBackend {
         }
         let first = parts[0].chars().next()?.to_ascii_lowercase();
         Some(format!(
-            "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/{first}/{}/{}",
-            parts[0], parts[1]
+            "{}/{first}/{}/{}",
+            winget_contents_api(),
+            parts[0],
+            parts[1]
         ))
     }
 
@@ -261,8 +330,12 @@ impl WingetBackend {
         }
         let first = parts[0].chars().next()?.to_ascii_lowercase();
         Some(format!(
-            "{WINGET_PKGS_RAW}/{first}/{}/{}/{}/{}.locale.en-US.yaml",
-            parts[0], parts[1], version, id
+            "{}/{first}/{}/{}/{}/{}.locale.en-US.yaml",
+            winget_pkgs_raw(),
+            parts[0],
+            parts[1],
+            version,
+            id
         ))
     }
 
@@ -272,7 +345,7 @@ impl WingetBackend {
             return Err(Error::NotFound("empty winget id".into()));
         }
         // Prefer an exact match from the search API (rich metadata).
-        let search_url = format!("{}/{}", WINGET_API, urlencoding_lite(id));
+        let search_url = format!("{}/{}", winget_api(), urlencoding_lite(id));
         if let Ok(data) = install::download(&search_url).await
             && let Ok(env) = serde_json::from_slice::<ApiEnvelope>(&data)
             && let Some(exact) = env
@@ -332,18 +405,22 @@ impl WingetBackend {
         }
         let first = parts[0].chars().next()?.to_ascii_lowercase();
         Some(format!(
-            "{WINGET_PKGS_RAW}/{first}/{}/{}/{}/{}.installer.yaml",
-            parts[0], parts[1], version, id
+            "{}/{first}/{}/{}/{}/{}.installer.yaml",
+            winget_pkgs_raw(),
+            parts[0],
+            parts[1],
+            version,
+            id
         ))
     }
 
     pub async fn plan(&self, name: &str) -> Result<InstallPlan> {
-        self.plan_inner(name).await
+        self.plan_inner(name, None).await
     }
 
-    async fn plan_inner(&self, name: &str) -> Result<InstallPlan> {
-        // Resolve the exact id + latest version from winget-pkgs (source of truth).
-        let (id, version) = Self::resolve_exact(name).await?;
+    async fn plan_inner(&self, name: &str, requested: Option<&str>) -> Result<InstallPlan> {
+        // Resolve the exact id + version from winget-pkgs (source of truth).
+        let (id, version) = Self::resolve_version(name, requested).await?;
         let url = Self::manifest_url(&id, &version).ok_or_else(|| {
             Error::Unsupported(format!("winget id '{id}' is not in Publisher.Name form"))
         })?;
@@ -376,15 +453,9 @@ impl WingetBackend {
     }
 
     pub async fn install(&self, name: &str, opts: &InstallOptions) -> Result<InstallOutcome> {
-        let plan = self.plan_inner(name).await?;
-        if let Some(req) = &opts.version
-            && req.trim() != plan.version
-        {
-            return Err(Error::Unsupported(format!(
-                "winget only publishes its current version; cannot install {} at {}",
-                plan.name, req
-            )));
-        }
+        let plan = self
+            .plan_inner(name, opts.version.as_deref().map(str::trim))
+            .await?;
         if opts.dry_run {
             println!(
                 "[dry-run] would install {} {} via {} ({})",
@@ -583,5 +654,40 @@ mod tests {
             scope: None,
         }];
         assert!(pick_installer(&installers, "arm64").is_some());
+    }
+
+    #[test]
+    fn pick_version_takes_the_newest_even_when_versions_are_not_semver() {
+        let names = ["1.9", "1.10", "1.2.3.4", "Insiders", "docs"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(pick_version("A.B", names, None).unwrap(), "1.10");
+    }
+
+    #[test]
+    fn pick_version_requires_an_exact_published_version() {
+        let names = ["2.0.0", "1.5.0", "v1.4.0"].map(String::from).to_vec();
+        assert_eq!(
+            pick_version("A.B", names.clone(), Some("1.5.0")).unwrap(),
+            "1.5.0"
+        );
+        // A leading v on either side is ignored, and the published spelling wins.
+        assert_eq!(
+            pick_version("A.B", names.clone(), Some("1.4.0")).unwrap(),
+            "v1.4.0"
+        );
+        let err = pick_version("A.B", names, Some("1.5"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no version 1.5") && err.contains("2.0.0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pick_version_with_no_version_folders_is_not_found() {
+        let err = pick_version("A.B", vec!["Insiders".into()], None).unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)));
     }
 }
