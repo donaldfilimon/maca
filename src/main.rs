@@ -103,6 +103,10 @@ enum Commands {
         /// Do not snapshot the prefix before mutating.
         #[arg(long)]
         no_snapshot: bool,
+        /// Install as a Homebrew cask (zip/tar only). Equivalent to the
+        /// `cask:` prefix, e.g. `maca install iterm2 --cask`.
+        #[arg(long)]
+        cask: bool,
         /// Install this version instead of the catalog's current one.
         ///
         /// GitHub Releases and the Aqua registry can fetch it. The other
@@ -497,8 +501,23 @@ async fn run(cli: Cli) -> Result<()> {
             kind,
             no_snapshot,
             version,
+            cask,
             ..
         } => {
+            let packages = if cask {
+                packages
+                    .iter()
+                    .map(|p| {
+                        if p.starts_with("cask:") {
+                            p.clone()
+                        } else {
+                            format!("cask:{p}")
+                        }
+                    })
+                    .collect()
+            } else {
+                packages
+            };
             let mut opts = ctx.opts(dry_run, kind, build_from_source, no_snapshot);
             opts.version = version;
             cmd_install(&ctx, &packages, &opts).await
