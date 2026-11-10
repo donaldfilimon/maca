@@ -889,7 +889,21 @@ fn e2e_github_dry_run_prints_host_asset() {
     }))
     .unwrap();
     let mut routes = HashMap::new();
-    routes.insert("/repos/acme/hello/releases/latest".into(), body);
+    routes.insert("/repos/acme/hello/releases/latest".into(), body.clone());
+    // An older release, published under the tag spelling with no leading v.
+    let older = serde_json::to_vec(&serde_json::json!({
+        "tag_name": "1.0.0",
+        "assets": [{
+            "name": asset,
+            "browser_download_url": format!("https://example.test/old/{asset}"),
+        }],
+    }))
+    .unwrap();
+    routes.insert(
+        "/repos/acme/hello/releases/tags/v1.0.0".into(),
+        older.clone(),
+    );
+    routes.insert("/repos/acme/hello/releases/tags/1.0.0".into(), older);
     let base = serve(routes);
     let sb = Sandbox::new("github-plan");
     let (ok, text) = sb.run_env(
@@ -909,4 +923,37 @@ fn e2e_github_dry_run_prints_host_asset() {
         text.contains(&format!("https://example.test/{asset}")),
         "{text}"
     );
+
+    // The version is requested, so the current release must not be used.
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "acme/hello",
+            "--backend",
+            "github",
+            "--version",
+            "1.0.0",
+            "--dry-run",
+            "--no-snapshot",
+        ],
+        &[("MACA_GITHUB_API", base.as_str())],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("https://example.test/old/"), "{text}");
+    assert!(text.contains("1.0.0"), "{text}");
+
+    // A requested version with no backend named has no catalog to fetch it
+    // from, so it fails before anything is installed.
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "acme/hello",
+            "--version",
+            "1.0.0",
+            "--no-snapshot",
+        ],
+        &[("MACA_GITHUB_API", base.as_str())],
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("needs an explicit backend"), "{text}");
 }

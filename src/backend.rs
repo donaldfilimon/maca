@@ -78,6 +78,12 @@ pub struct InstallOptions {
     pub no_snapshot: bool,
     /// Concurrent install jobs for multi-package commands.
     pub jobs: usize,
+    /// Version to install instead of the catalog's current one.
+    ///
+    /// `None` means the catalog's current version. A backend that can address
+    /// an older artifact fetches it; one that cannot refuses, rather than
+    /// installing the current version and leaving the caller to notice.
+    pub version: Option<String>,
 }
 
 impl Default for InstallOptions {
@@ -89,6 +95,7 @@ impl Default for InstallOptions {
             build_from_source: false,
             no_snapshot: false,
             jobs: 4,
+            version: None,
         }
     }
 }
@@ -312,7 +319,19 @@ pub async fn install_with_backend(
     if let Some(existing) = state::installed_elsewhere(name, &config::cellar_dir(&opts.prefix))? {
         return Err(state::elsewhere_error(name, &existing));
     }
+    // A requested version under `auto` has nowhere to go: falling through
+    // could install a different backend's current version, and the caller
+    // would have no way to tell the request was ignored. A named backend that
+    // cannot fetch an older artifact still installs its current one; the
+    // caller's version check then reports the mismatch.
     let kind = BackendKind::from_str_lossy(backend);
+    if opts.version.is_some() && kind == BackendKind::Auto {
+        let version = opts.version.as_deref().unwrap_or_default();
+        return Err(crate::Error::Unsupported(format!(
+            "installing {name} at version {version} needs an explicit backend; \
+             `--backend auto` cannot tell which catalog should serve it"
+        )));
+    }
     match kind {
         BackendKind::Brew => brew::BrewBackend::new().install(name, opts).await,
         BackendKind::Winget => winget::WingetBackend::new().install(name, opts).await,

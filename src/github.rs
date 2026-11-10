@@ -68,16 +68,12 @@ impl GithubBackend {
     }
 
     pub async fn plan(&self, name: &str) -> Result<InstallPlan> {
-        Ok(self.plan_release(name).await?.plan)
+        Ok(self.plan_release(name, None).await?.plan)
     }
 
-    async fn plan_release(&self, name: &str) -> Result<PlannedRelease> {
+    async fn plan_release(&self, name: &str, version: Option<&str>) -> Result<PlannedRelease> {
         let (owner, repo, cellar) = split_spec(name)?;
-        let body = github_json(&format!(
-            "{}/repos/{owner}/{repo}/releases/latest",
-            api_base()
-        ))
-        .await?;
+        let body = fetch_release(&owner, &repo, version).await?;
         let (tag, assets) = assets_from_release(&body);
         plan_from_assets(
             &cellar,
@@ -96,7 +92,7 @@ impl GithubBackend {
                 "github releases have no source-build recipe".into(),
             ));
         }
-        let planned = self.plan_release(name).await?;
+        let planned = self.plan_release(name, opts.version.as_deref()).await?;
         if opts.dry_run {
             println!(
                 "[dry-run] would install {} {} via github ({})",
@@ -620,6 +616,46 @@ fn cellar_path(prefix: &Path, name: &str, version: &str) -> PathBuf {
     crate::config::cellar_dir(prefix).join(name).join(version)
 }
 
+/// Tag spellings a release might be published under for one version.
+///
+/// Cellar versions have no leading `v` (`sanitize_version` strips it), but
+/// release tags usually have one. Both are tried; the first that exists wins.
+pub fn tag_candidates(version: &str) -> Vec<String> {
+    let version = version.trim();
+    let bare = version.strip_prefix('v').unwrap_or(version);
+    let mut out = Vec::new();
+    if !bare.is_empty() {
+        out.push(format!("v{bare}"));
+        if bare != version || !version.starts_with('v') {
+            out.push(bare.to_string());
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// The release to install: the current one, or the one a caller named.
+async fn fetch_release(
+    owner: &str,
+    repo: &str,
+    version: Option<&str>,
+) -> Result<serde_json::Value> {
+    let base = api_base();
+    let Some(version) = version.map(str::trim).filter(|s| !s.is_empty()) else {
+        return github_json(&format!("{base}/repos/{owner}/{repo}/releases/latest")).await;
+    };
+    let mut last = Error::NotFound(format!(
+        "no github release of {owner}/{repo} matches version {version}"
+    ));
+    for tag in tag_candidates(version) {
+        match github_json(&format!("{base}/repos/{owner}/{repo}/releases/tags/{tag}")).await {
+            Ok(body) => return Ok(body),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 fn api_base() -> String {
     std::env::var("MACA_GITHUB_API")
         .ok()
@@ -683,6 +719,14 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn a_version_is_looked_up_under_both_tag_spellings() {
+        assert_eq!(tag_candidates("1.2.3"), vec!["v1.2.3", "1.2.3"]);
+        assert_eq!(tag_candidates("v1.2.3"), vec!["v1.2.3", "1.2.3"]);
+        assert_eq!(tag_candidates("  v1.2.3 "), vec!["v1.2.3", "1.2.3"]);
+        assert!(tag_candidates("v").is_empty());
     }
 
     #[test]

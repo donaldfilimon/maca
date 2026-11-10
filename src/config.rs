@@ -125,6 +125,37 @@ fn default_prefix() -> PathBuf {
     data_dir().join("prefix")
 }
 
+/// The nearest `maca.toml` walking up from `start`, if one names a prefix.
+///
+/// This is how a directory gets its own install root without a flag: a project
+/// checks in `prefix = "..."` and every command run inside it uses that
+/// prefix. `--prefix` and `MACA_PREFIX` still win, because both are explicit.
+pub fn project_prefix(start: &std::path::Path) -> Option<PathBuf> {
+    let mut dir = if start.is_dir() {
+        Some(start)
+    } else {
+        start.parent()
+    };
+    while let Some(cur) = dir {
+        let file = cur.join("maca.toml");
+        if let Some(prefix) = prefix_in_project_file(&file) {
+            return Some(if prefix.is_absolute() {
+                prefix
+            } else {
+                cur.join(prefix)
+            });
+        }
+        dir = cur.parent();
+    }
+    None
+}
+
+fn prefix_in_project_file(path: &std::path::Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let cfg: Config = toml::from_str(&text).ok()?;
+    cfg.prefix.filter(|p| !p.as_os_str().is_empty())
+}
+
 /// True when `path` lies inside `root`. Compared as written first, then with
 /// both sides resolved, so a prefix reached through a symlink still matches.
 pub fn path_under(path: &std::path::Path, root: &std::path::Path) -> bool {
@@ -219,6 +250,25 @@ mod tests {
             name == "maca" || name == ".maca",
             "unexpected data dir name: {name}"
         );
+    }
+
+    #[test]
+    fn a_project_file_scopes_the_prefix_and_a_nearer_one_wins() {
+        let root = std::env::temp_dir().join(format!("maca-proj-{}", std::process::id()));
+        let nested = root.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("maca.toml"), "prefix = \"prefix\"\n").unwrap();
+        assert_eq!(project_prefix(&nested), Some(root.join("prefix")));
+
+        // The nearer file wins over the one further up.
+        std::fs::write(nested.join("maca.toml"), "prefix = \"/opt/near\"\n").unwrap();
+        assert_eq!(project_prefix(&nested), Some(PathBuf::from("/opt/near")));
+
+        // A file that names no prefix is not a project, so the walk continues.
+        std::fs::write(nested.join("maca.toml"), "default_backend = \"brew\"\n").unwrap();
+        assert_eq!(project_prefix(&nested), Some(root.join("prefix")));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

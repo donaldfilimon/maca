@@ -660,9 +660,9 @@
                             installed.
                             <span class="font-mono">maca sync</span> fails and
                             rolls back if the version it gets is not the one the
-                            lock recorded. Fetching a specific older artifact —
-                            what Nix and aqua do today — is the piece being
-                            added on top of that verification.
+                            lock recorded. GitHub Releases and Aqua fetch that
+                            exact release; Homebrew and winget only publish
+                            their current version and refuse the request.
                         </p>
                     </div>
                 </div>
@@ -750,7 +750,10 @@
                                 >
                                     Reproducible environment
                                 </th>
-                                <td class="px-4 py-3">verified, not fetched</td>
+                                <td class="px-4 py-3">
+                                    fetched from GitHub and Aqua; checked
+                                    everywhere
+                                </td>
                                 <td class="px-4 py-3">Brewfile</td>
                                 <td class="px-4 py-3">no</td>
                                 <td class="px-4 py-3">
@@ -779,10 +782,11 @@
                             <span class="text-slate-200"
                                 >Pinned versions, fetched.</span
                             >
-                            A lockfile already names a version and refuses a
-                            mismatch. Requesting that exact older artifact from
-                            the catalog is the next step, on top of the
-                            verification that already exists.
+                            GitHub Releases and Aqua fetch the release a lock or
+                            <span class="font-mono">--version</span> names.
+                            Homebrew and winget publish only their current
+                            version and refuse, so the wrong one is never
+                            installed quietly.
                         </li>
                         <li>
                             <span class="text-slate-200"

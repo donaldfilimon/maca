@@ -46,10 +46,10 @@ impl AquaBackend {
     }
 
     pub async fn plan(&self, name: &str) -> Result<InstallPlan> {
-        Ok(self.prepare(name).await?.plan)
+        Ok(self.prepare(name, None).await?.plan)
     }
 
-    async fn prepare(&self, name: &str) -> Result<Prepared> {
+    async fn prepare(&self, name: &str, version: Option<&str>) -> Result<Prepared> {
         let slash = slash_spec(name)?;
         let cellar = slash.replace('/', "--");
         let pkg = load_package(&slash).await?;
@@ -58,7 +58,7 @@ impl AquaBackend {
         }
         let owner = pkg.repo_owner.clone().unwrap_or_default();
         let repo = pkg.repo_name.clone().unwrap_or_default();
-        let body = github_release_json(&owner, &repo).await?;
+        let body = github_release_json(&owner, &repo, version).await?;
         let tag = body
             .get("tag_name")
             .and_then(|v| v.as_str())
@@ -78,7 +78,7 @@ impl AquaBackend {
                 "aqua packages have no source-build recipe".into(),
             ));
         }
-        let prepared = self.prepare(name).await?;
+        let prepared = self.prepare(name, opts.version.as_deref()).await?;
         if opts.dry_run {
             println!(
                 "[dry-run] would install {} {} via aqua ({})",
@@ -680,7 +680,7 @@ async fn latest_tag(pkg: &AquaPkg) -> Result<String> {
             "aqua package has no repo_owner/repo_name".into(),
         ));
     }
-    let body = github_release_json(owner, repo).await?;
+    let body = github_release_json(owner, repo, None).await?;
     let tag = body
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -694,15 +694,38 @@ async fn latest_tag(pkg: &AquaPkg) -> Result<String> {
     Ok(tag)
 }
 
-async fn github_release_json(owner: &str, repo: &str) -> Result<serde_json::Value> {
+async fn github_release_json(
+    owner: &str,
+    repo: &str,
+    version: Option<&str>,
+) -> Result<serde_json::Value> {
     let base = std::env::var("MACA_GITHUB_API")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "https://api.github.com".into());
-    let url = format!(
-        "{}/repos/{owner}/{repo}/releases/latest",
-        base.trim_end_matches('/')
-    );
+    let base = base.trim_end_matches('/');
+    let url = match version.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(version) => {
+            // The tag a project actually published may or may not carry the
+            // leading `v` the cellar version had stripped. Try both.
+            let mut last = Error::NotFound(format!(
+                "no github release of {owner}/{repo} matches version {version}"
+            ));
+            for tag in github::tag_candidates(version) {
+                let url = format!("{base}/repos/{owner}/{repo}/releases/tags/{tag}");
+                match github_json(&url).await {
+                    Ok(body) => return Ok(body),
+                    Err(e) => last = e,
+                }
+            }
+            return Err(last);
+        }
+        None => format!("{base}/repos/{owner}/{repo}/releases/latest"),
+    };
+    github_json(&url).await
+}
+
+async fn github_json(url: &str) -> Result<serde_json::Value> {
     let client = install::http_client()?;
     let mut req = client
         .get(url)
@@ -725,7 +748,7 @@ async fn github_release_json(owner: &str, repo: &str) -> Result<serde_json::Valu
         .map_err(|e| Error::Network(e.to_string()))?;
     if !status.is_success() {
         return Err(Error::Network(format!(
-            "github release for {owner}/{repo} returned {status}"
+            "github returned {status} for {url}"
         )));
     }
     Ok(serde_json::from_slice(&bytes)?)

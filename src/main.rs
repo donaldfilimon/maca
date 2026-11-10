@@ -102,6 +102,12 @@ enum Commands {
         /// Do not snapshot the prefix before mutating.
         #[arg(long)]
         no_snapshot: bool,
+        /// Install this version instead of the catalog's current one.
+        ///
+        /// GitHub Releases and the Aqua registry can fetch it. The other
+        /// backends only publish their current version and refuse the request.
+        #[arg(long)]
+        version: Option<String>,
     },
     /// List installed packages.
     List {
@@ -396,7 +402,15 @@ impl Ctx {
                 .unwrap_or(BackendKind::Auto)
         });
         Ok(Self {
-            prefix: prefix.unwrap_or_else(|| cfg.prefix()),
+            // A flag or MACA_PREFIX is explicit and wins. Otherwise a
+            // maca.toml in this directory or one above it scopes the prefix
+            // to the project, and only then does the user config apply.
+            prefix: prefix.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|dir| config::project_prefix(&dir))
+                    .unwrap_or_else(|| cfg.prefix())
+            }),
             backend: resolved_backend,
             jobs: jobs.max(1),
             custom_registry_urls: cfg.custom_registry_urls,
@@ -417,6 +431,7 @@ impl Ctx {
             build_from_source,
             no_snapshot,
             jobs: self.jobs,
+            version: None,
         }
     }
 }
@@ -449,9 +464,11 @@ async fn run(cli: Cli) -> Result<()> {
             build_from_source,
             kind,
             no_snapshot,
+            version,
             ..
         } => {
-            let opts = ctx.opts(dry_run, kind, build_from_source, no_snapshot);
+            let mut opts = ctx.opts(dry_run, kind, build_from_source, no_snapshot);
+            opts.version = version;
             cmd_install(&ctx, &packages, &opts).await
         }
         Commands::List { kind, json } => cmd_list(kind, json),
@@ -645,6 +662,7 @@ async fn install_many(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> 
         let bfs = opts.build_from_source;
         let dry = opts.dry_run;
         let jobs = ctx.jobs;
+        let version = opts.version.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             let opts = InstallOptions {
@@ -654,6 +672,7 @@ async fn install_many(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> 
                 build_from_source: bfs,
                 no_snapshot: true,
                 jobs,
+                version,
             };
             // One entry point for every install, so its checks (such as
             // "already installed in another prefix") always run.
@@ -793,6 +812,7 @@ impl maca::upgrade::UpgradeEnv for LiveUpgradeEnv<'_> {
             build_from_source: false,
             no_snapshot: true,
             jobs: self.ctx.jobs,
+            version: None,
         };
         let out = backend::install_with_backend(&record.backend, &record.name, &opts).await?;
         // Reclaim the previous version's keg now that the new one is linked
@@ -1610,6 +1630,7 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
                         build_from_source: false,
                         no_snapshot: true,
                         jobs: 1,
+                        version: requested_version(entry.version.as_deref()),
                     };
                     let out = backend::install_with_backend(
                         entry.backend.as_deref().unwrap_or("auto"),
@@ -1699,9 +1720,17 @@ fn cmd_lock(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The catalogs only serve their current version, so a locked version cannot
-/// be requested; instead an install whose resolved version differs from the
-/// lock is reported as a failure. `latest` (or no version) accepts anything.
+/// A version a lock or group names, unless it is only asking for the current one.
+///
+/// `latest` and an absent version both mean the catalog's current version,
+/// which is not a version to go and fetch.
+fn requested_version(locked: Option<&str>) -> Option<String> {
+    locked
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "latest")
+        .map(str::to_string)
+}
+
 fn check_locked_version(out: &backend::InstallOutcome, locked: Option<&str>) -> Result<()> {
     match locked {
         Some(v) if v != "latest" && v != out.version => Err(Error::Unsupported(format!(
@@ -1771,6 +1800,7 @@ async fn sync_inner(ctx: &Ctx, lock: &group::Lockfile, dry_run: bool, prune: boo
                 build_from_source: false,
                 no_snapshot: true,
                 jobs: 1,
+                version: requested_version(Some(&entry.version)),
             };
             let out = backend::install_with_backend(&entry.backend, &entry.name, &opts).await?;
             check_locked_version(&out, Some(&entry.version))?;

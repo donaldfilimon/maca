@@ -34,14 +34,14 @@ One machine. Several catalogs. One binary. maca installs from Homebrew, winget,
 GitHub Releases, the Aqua registry, and a registry of your own without making
 you install a package manager for each of them first.
 
-|                                             | maca                                 | Homebrew                            | winget         | aqua                    | Nix                                     |
-| ------------------------------------------- | ------------------------------------ | ----------------------------------- | -------------- | ----------------------- | --------------------------------------- |
-| Runs on                                     | macOS and Linux, Windows in progress | macOS (Linux is a separate install) | Windows        | macOS, Linux, Windows   | macOS, Linux                            |
-| Installs without the other tool present     | yes                                  | it is the tool                      | it is the tool | it is the tool          | it is the tool                          |
-| Catalogs from one binary                    | five, and growing                    | one                                 | one            | one                     | one, from source descriptions           |
-| A failed install puts the machine back      | automatic snapshot and rollback      | no                                  | no             | no                      | the store waits for a generation switch |
-| Two installs at once stay consistent        | exclusive prefix lock                | no                                  | no             | no                      | builds are isolated                     |
-| An environment you can hand to someone else | groups, pins, and a lockfile         | `Brewfile`                          | no             | version-pinned registry | fully hermetic                          |
+|                                             | maca                                           | Homebrew                            | winget         | aqua                    | Nix                                     |
+| ------------------------------------------- | ---------------------------------------------- | ----------------------------------- | -------------- | ----------------------- | --------------------------------------- |
+| Runs on                                     | macOS and Linux, Windows in progress           | macOS (Linux is a separate install) | Windows        | macOS, Linux, Windows   | macOS, Linux                            |
+| Installs without the other tool present     | yes                                            | it is the tool                      | it is the tool | it is the tool          | it is the tool                          |
+| Catalogs from one binary                    | five, and growing                              | one                                 | one            | one                     | one, from source descriptions           |
+| A failed install puts the machine back      | automatic snapshot and rollback                | no                                  | no             | no                      | the store waits for a generation switch |
+| Two installs at once stay consistent        | exclusive prefix lock                          | no                                  | no             | no                      | builds are isolated                     |
+| An environment you can hand to someone else | fetched for GitHub and Aqua, checked otherwise | `Brewfile`                          | no             | version-pinned registry | fully hermetic                          |
 
 **Five catalogs, zero extra tools.** Homebrew formula JSON, the winget catalog,
 GitHub Releases, the Aqua registry, and a local registry are HTTP APIs maca
@@ -73,10 +73,13 @@ piece being added on top of it, not a different design.
 The gaps against the specialists are features in progress, not reasons to pick
 something else.
 
-- **Pinned versions, fetched not just checked.** A lockfile already names a
-  version and refuses a mismatch. Requesting that exact older artifact from the
-  catalog — the Nix and aqua behaviour — is the next step, built on the
-  verification that already exists.
+- **Pinned versions, fetched where the catalog can serve them.** GitHub
+  Releases and the Aqua registry already do: `--version`, a group version, and
+  a lockfile version fetch that release instead of the current one (the tag is
+  tried with and without its leading `v`). Homebrew, winget, and a custom entry
+  only publish one version, so they refuse the request rather than installing
+  the wrong one. `maca sync` still rolls back if what comes back is not what the
+  lock named.
 - **Per-directory versions.** asdf and mise switch language versions per
   project. maca installs into a prefix today; a directory-scoped prefix on top
   of the same cellar is the planned shape, so version switching reuses the
@@ -115,6 +118,7 @@ maca search jq --json              # machine-readable
 maca info jq
 maca install jq                    # installs dependencies too
 maca install jq tree --jobs 4      # concurrent installs
+maca install owner/repo --backend github --version 14.1.0
 maca install jq --build-from-source
 maca install code --kind app       # kind: app|plugin|cli|library|other
 maca app install code              # kind-specific aliases
