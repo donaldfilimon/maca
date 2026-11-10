@@ -18,6 +18,7 @@ use crate::state;
 use crate::{Error, Result};
 
 const FORMULA_API: &str = "https://formulae.brew.sh/api/formula";
+const CASK_API: &str = "https://formulae.brew.sh/api/cask";
 const FORMULA_INDEX: &str = "https://formulae.brew.sh/api/formula.json";
 const GHCR_TOKEN: &str = "https://ghcr.io/token";
 const INDEX_TTL_SECS: u64 = 3600;
@@ -81,6 +82,146 @@ struct BottleStable {
 struct BottleFile {
     url: String,
     sha256: String,
+}
+
+/// A cask spec is `cask:<token>`. The token is the cellar name.
+fn cask_token(name: &str) -> Option<String> {
+    let token = name.strip_prefix("cask:")?.trim().to_ascii_lowercase();
+    if token.is_empty() || !install::valid_component(&token) {
+        return None;
+    }
+    Some(token)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaskArchive {
+    Zip,
+    TarGz,
+}
+
+#[derive(Debug)]
+struct CaskPlan {
+    token: String,
+    version: String,
+    url: String,
+    sha256: Option<String>,
+    archive: CaskArchive,
+    /// `(source relative to the keg, link name)`.
+    binaries: Vec<(String, String)>,
+}
+
+/// What a cask JSON means for this host. Disk images and installer packages
+/// are refused here, before anything is downloaded: maca does not mount or run
+/// them.
+fn plan_cask(body: &serde_json::Value) -> Result<CaskPlan> {
+    let token = json_str(body, "token")
+        .filter(|s| install::valid_component(s))
+        .ok_or_else(|| Error::Unsupported("cask JSON has no usable token".into()))?;
+    let version = json_str(body, "version")
+        .filter(|s| install::valid_component(s))
+        .ok_or_else(|| Error::Unsupported(format!("cask {token} has no usable version")))?;
+    let url = json_str(body, "url")
+        .filter(|s| s.starts_with("https://"))
+        .ok_or_else(|| Error::Unsupported(format!("cask {token} has no https url")))?;
+    let archive = cask_archive(&url).ok_or_else(|| {
+        Error::Unsupported(format!(
+            "cask {token} ships as {url}, which is not a zip or tar archive; \
+             disk images and installer packages are not installed"
+        ))
+    })?;
+    let sha256 = json_str(body, "sha256")
+        .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) && s != "no_check");
+    Ok(CaskPlan {
+        token,
+        version,
+        url,
+        sha256,
+        archive,
+        binaries: cask_binaries(body.get("artifacts")),
+    })
+}
+
+fn cask_archive(url: &str) -> Option<CaskArchive> {
+    let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".zip") {
+        Some(CaskArchive::Zip)
+    } else if path.ends_with(".tar.gz") || path.ends_with(".tgz") {
+        Some(CaskArchive::TarGz)
+    } else {
+        None
+    }
+}
+
+/// Binaries a cask declares, with `$APPDIR` rewritten to a path inside the keg.
+fn cask_binaries(artifacts: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Some(list) = artifacts.and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for item in list {
+        let Some(binaries) = item.get("binary").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let Some(source) = binaries.first().and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let source = source
+            .trim_start_matches("$APPDIR/")
+            .trim_start_matches('/')
+            .to_string();
+        if source.is_empty() || source.contains("..") {
+            continue;
+        }
+        let link = item
+            .get("target")
+            .and_then(|v| v.as_str())
+            .and_then(|t| t.rsplit(['/', '\\']).next())
+            .filter(|s| install::valid_component(s))
+            .unwrap_or_else(|| source.rsplit('/').next().unwrap_or(&source))
+            .to_string();
+        if install::valid_component(&link) {
+            out.push((source, link));
+        }
+    }
+    out
+}
+
+fn link_cask_binaries(
+    cellar: &std::path::Path,
+    binaries: &[(String, String)],
+    prefix: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>> {
+    let mut linked = Vec::new();
+    for (source, name) in binaries {
+        let src = cellar.join(source);
+        if !src.exists() {
+            eprintln!(
+                "maca: warning: cask binary {} is not in the archive",
+                src.display()
+            );
+            continue;
+        }
+        linked.push(install::link_single_binary(&src, name, prefix)?);
+    }
+    if linked.is_empty() {
+        linked.extend(install::link_bins(cellar, &[], prefix)?);
+    }
+    Ok(linked)
+}
+
+fn json_str(body: &serde_json::Value, key: &str) -> Option<String> {
+    body.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+async fn fetch_cask_json(token: &str) -> Result<serde_json::Value> {
+    let url = format!("{CASK_API}/{token}.json");
+    let data = install::download(&url).await.map_err(|e| match e {
+        Error::Network(m) if m.contains("404") => {
+            Error::NotFound(format!("cask '{token}' not found"))
+        }
+        other => other,
+    })?;
+    serde_json::from_slice(&data).map_err(|e| Error::Network(format!("decoding cask {token}: {e}")))
 }
 
 /// Runtime dependencies maca manages for `formula` (those the OS does not
@@ -350,8 +491,60 @@ impl BrewBackend {
     }
 
     pub async fn install(&self, name: &str, opts: &InstallOptions) -> Result<InstallOutcome> {
+        if let Some(token) = cask_token(name) {
+            return self.install_cask(&token, opts).await;
+        }
         let mut visited = Vec::new();
         self.install_with_deps(name, opts, &mut visited).await
+    }
+
+    async fn install_cask(&self, token: &str, opts: &InstallOptions) -> Result<InstallOutcome> {
+        let data = fetch_cask_json(token).await?;
+        let plan = plan_cask(&data)?;
+        if opts.dry_run {
+            println!(
+                "[dry-run] would install cask {} {} ({})",
+                plan.token, plan.version, plan.url
+            );
+            return Ok(InstallOutcome {
+                name: plan.token,
+                version: plan.version,
+                backend: "brew".into(),
+                cellar_path: crate::config::cellar_dir(&opts.prefix).join(token),
+                linked_bins: vec![],
+            });
+        }
+        let bytes = install::download(&plan.url).await?;
+        if plan.sha256.is_none() {
+            eprintln!(
+                "maca: warning: cask {} declares no sha256; installing {} UNVERIFIED",
+                plan.token, plan.url
+            );
+        }
+        install::verify_sha256(&plan.token, &bytes, plan.sha256.as_deref())?;
+        let cellar = match plan.archive {
+            CaskArchive::Zip => {
+                install::extract_zip_to_cellar(&plan.token, &plan.version, &bytes, &opts.prefix)?
+            }
+            CaskArchive::TarGz => {
+                install::extract_tar_gz_to_cellar(&plan.token, &plan.version, &bytes, &opts.prefix)?
+            }
+        };
+        let linked = link_cask_binaries(&cellar, &plan.binaries, &opts.prefix)?;
+        state::upsert_record(state::record_with_kind(
+            &plan.token,
+            &plan.version,
+            "brew",
+            cellar.clone(),
+            crate::group::Kind::App,
+        ))?;
+        Ok(InstallOutcome {
+            name: plan.token,
+            version: plan.version,
+            backend: "brew".into(),
+            cellar_path: cellar,
+            linked_bins: linked,
+        })
     }
 
     /// Compile `name` from its source tarball into the cellar.
@@ -714,6 +907,64 @@ mod tests {
         let files = keys(&["sonoma", "arm64_sequoia", "x86_64_linux"]);
         let got = BrewBackend::pick_bottle_key(&files, "macos", "x86_64", None);
         assert_eq!(got.as_deref(), Some("sonoma"));
+    }
+
+    #[test]
+    fn a_zip_cask_plans_its_binaries_and_drops_the_app_prefix() {
+        let body = serde_json::json!({
+            "token": "iterm2",
+            "version": "3.7.7",
+            "url": "https://iterm2.com/downloads/stable/iTerm2-3_7_7.zip",
+            "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "artifacts": [
+                {"app": ["iTerm.app"], "target": "/Applications/iTerm.app"},
+                {"binary": ["$APPDIR/iTerm.app/Contents/Resources/iterm2_shell_integration.sh"],
+                 "target": "$HOMEBREW_PREFIX/bin/it2"}
+            ]
+        });
+        let plan = plan_cask(&body).unwrap();
+        assert_eq!(plan.archive, CaskArchive::Zip);
+        assert_eq!(plan.version, "3.7.7");
+        assert_eq!(
+            plan.binaries,
+            vec![(
+                "iTerm.app/Contents/Resources/iterm2_shell_integration.sh".into(),
+                "it2".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_disk_image_cask_is_refused_before_download() {
+        let body = serde_json::json!({
+            "token": "rectangle",
+            "version": "2.0.4",
+            "url": "https://example.com/Rectangle.dmg",
+            "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        });
+        let err = plan_cask(&body).unwrap_err().to_string();
+        assert!(err.contains("disk images"), "{err}");
+    }
+
+    #[test]
+    fn an_unchecked_cask_hash_is_not_treated_as_a_checksum() {
+        let body = serde_json::json!({
+            "token": "font-example",
+            "version": "1.0",
+            "url": "https://example.com/font.zip",
+            "sha256": "no_check"
+        });
+        assert!(plan_cask(&body).unwrap().sha256.is_none());
+    }
+
+    #[test]
+    fn cask_spec_is_a_prefix_and_a_plain_name_is_not() {
+        assert_eq!(
+            cask_token("cask:Visual-Studio-Code").as_deref(),
+            Some("visual-studio-code")
+        );
+        assert_eq!(cask_token("jq"), None);
+        assert_eq!(cask_token("cask:../etc"), None);
     }
 
     #[test]

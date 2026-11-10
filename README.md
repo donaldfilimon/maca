@@ -84,12 +84,14 @@ something else.
   project. maca installs into a prefix today; a directory-scoped prefix on top
   of the same cellar is the planned shape, so version switching reuses the
   installs you already have.
-- **The rest of Homebrew.** Bottles and source builds from formula JSON work
-  now. Taps, casks, and services are the remaining Homebrew surface, and each
-  is another catalog call rather than a dependency on Homebrew's Ruby DSL.
-- **Hermetic builds.** Source builds already detect Autotools, CMake, Meson,
-  Make, Cargo, and Python. Sandboxed, reproducible builds in the Nix sense are
-  the longer piece of that same pipeline.
+- **Casks.** Zip and tar casks install from the Homebrew cask API
+  (`maca install cask:<token>`), checksummed, with their binaries linked and
+  the app bundle left in the cellar rather than copied into `/Applications`.
+  Disk images and installer packages are refused. Taps and services remain.
+- **Hermetic builds.** A source build inherits only its search path, locale,
+  and temporary directory. Tokens, `CFLAGS`, and anything else in the caller's
+  environment are dropped, and `SOURCE_DATE_EPOCH` is fixed. A sandbox in the
+  Nix sense is still the longer piece.
 - **Windows installs, not just Windows plans.** The winget catalog, manifest
   resolution, checksum verification, and dry-run plans run today. The installer
   launch path is written and compile-gated to Windows, and is waiting on a
@@ -119,6 +121,7 @@ maca info jq
 maca install jq                    # installs dependencies too
 maca install jq tree --jobs 4      # concurrent installs
 maca install owner/repo --backend github --version 14.1.0
+maca install cask:iterm2 --backend brew   # zip/tar casks; disk images are refused
 maca install jq --build-from-source
 maca install code --kind app       # kind: app|plugin|cli|library|other
 maca app install code              # kind-specific aliases

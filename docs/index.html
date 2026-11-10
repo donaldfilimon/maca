@@ -801,16 +801,19 @@
                             <span class="text-slate-200"
                                 >The rest of Homebrew.</span
                             >
-                            Bottles and source builds work now. Taps, casks, and
-                            services are more catalog calls, not a dependency on
-                            Homebrew's Ruby DSL.
+                            <span class="text-slate-200">Casks.</span>
+                            Zip and tar casks install from the Homebrew cask
+                            API, checksummed, with the app left in the cellar
+                            rather than copied into /Applications. Disk images
+                            and installer packages are refused. Taps and
+                            services remain.
                         </li>
                         <li>
                             <span class="text-slate-200">Hermetic builds.</span>
-                            Source builds already detect Autotools, CMake,
-                            Meson, Make, Cargo, and Python. Sandboxed,
-                            reproducible builds are the longer piece of that
-                            same pipeline.
+                            A source build inherits only its search path,
+                            locale, and temporary directory. Tokens and anything
+                            else in the caller's environment are dropped. A Nix
+                            sandbox is still the longer piece.
                         </li>
                         <li>
                             <span class="text-slate-200"

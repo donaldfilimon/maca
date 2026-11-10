@@ -293,7 +293,15 @@ fn run_logged(log: &mut std::fs::File, program: &str, args: &[String], cwd: &Pat
         args.join(" ")
     )?;
     log.flush()?;
-    let status = Command::new(program).args(args).current_dir(cwd).status();
+    let status = Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        // A build must not see the caller's environment. API tokens, a private
+        // GOPROXY, or a `CFLAGS` left over from something else would make two
+        // builds of the same source differ, and leak into the log.
+        .env_clear()
+        .envs(build_env())
+        .status();
     match status {
         Ok(s) => {
             writeln!(log, "[exit {}]", s.code().unwrap_or(-1))?;
@@ -311,6 +319,25 @@ fn run_logged(log: &mut std::fs::File, program: &str, args: &[String], cwd: &Pat
     }
 }
 
+/// The environment a source build is allowed to inherit.
+///
+/// Search paths and locales, nothing else. A variable not in this list is
+/// dropped even when the caller exported it.
+pub fn build_env() -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    for key in [
+        "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "USER", "LOGNAME",
+    ] {
+        if let Ok(value) = std::env::var(key)
+            && !value.is_empty()
+        {
+            env.push((key.to_string(), value));
+        }
+    }
+    env.push(("SOURCE_DATE_EPOCH".into(), "0".into()));
+    env
+}
+
 fn log_path(name: &str) -> PathBuf {
     let dir = crate::config::data_dir().join("logs");
     std::fs::create_dir_all(&dir).ok();
@@ -320,6 +347,16 @@ fn log_path(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_build_inherits_the_search_path_and_nothing_secret() {
+        let keys: Vec<String> = build_env().into_iter().map(|(k, _)| k).collect();
+        assert!(keys.contains(&"PATH".into()));
+        for dropped in ["CFLAGS", "GITHUB_TOKEN", "MACA_GITHUB_TOKEN", "GOPROXY"] {
+            assert!(!keys.iter().any(|k| k == dropped), "{dropped} leaked");
+        }
+        assert!(keys.iter().any(|k| k == "SOURCE_DATE_EPOCH"));
+    }
 
     #[test]
     fn detects_build_systems() {
