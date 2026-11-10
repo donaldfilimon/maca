@@ -339,36 +339,27 @@ impl BrewBackend {
         ));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch)?;
-        let source_dir = install::extract_tar_gz_to_cellar("src", &formula.name, &bytes, &scratch)?;
-        let system = source::detect(&source_dir).ok_or_else(|| {
-            Error::Unsupported(format!(
-                "could not detect a build system in {} source (looked for configure, \
-                 CMakeLists.txt, meson.build, Makefile, Cargo.toml, pyproject.toml)",
-                formula.name
-            ))
-        })?;
-        tracing::info!("building {} with {system:?}", formula.name);
         let version = formula.versions.stable.clone();
         let dest = crate::config::cellar_dir(&opts.prefix)
             .join(&formula.name)
             .join(&version);
-        let built = source::build(system, &source_dir, &dest, opts.jobs.max(1))?;
-        tracing::info!("{} built via {}", formula.name, built.build_system);
-        install::link_opt(&formula.name, &version, &dest, &opts.prefix)?;
-        let rewritten = mach_o::rewrite_placeholders(&dest, &opts.prefix)?;
-        if rewritten > 0 {
-            tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
-        }
-        let linked = install::link_bins(&dest, &formula.executables, &opts.prefix)?;
-        let _ = install::link_share(&dest, &opts.prefix);
-        state::upsert_record(state::record_with_kind(
-            &formula.name,
-            &version,
-            "brew",
-            dest.clone(),
-            opts.kind,
-        ))?;
+        let dest_existed = dest.exists();
+        let result = self.build_into(&formula, &bytes, &scratch, &dest, opts);
+        // The scratch tree always goes; a keg the build half-wrote goes too,
+        // so a failed build never looks installed.
         let _ = std::fs::remove_dir_all(&scratch);
+        let linked = match result {
+            Ok(linked) => linked,
+            Err(e) => {
+                if !dest_existed {
+                    let _ = std::fs::remove_dir_all(&dest);
+                    if let Some(name_dir) = dest.parent() {
+                        let _ = std::fs::remove_dir(name_dir);
+                    }
+                }
+                return Err(e);
+            }
+        };
         Ok(InstallOutcome {
             name: formula.name,
             version,
@@ -379,6 +370,45 @@ impl BrewBackend {
     }
 
     /// Whether a bottle exists for the current host.
+    /// Steps of a source build that can fail once the scratch dir exists:
+    /// unpack, detect, compile into `dest`, relocate, link, record.
+    fn build_into(
+        &self,
+        formula: &Formula,
+        bytes: &[u8],
+        scratch: &std::path::Path,
+        dest: &std::path::Path,
+        opts: &InstallOptions,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let source_dir = install::extract_tar_gz_to_cellar("src", &formula.name, bytes, scratch)?;
+        let system = source::detect(&source_dir).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "could not detect a build system in {} source (looked for configure, \
+                 CMakeLists.txt, meson.build, Makefile, Cargo.toml, pyproject.toml)",
+                formula.name
+            ))
+        })?;
+        tracing::info!("building {} with {system:?}", formula.name);
+        let version = &formula.versions.stable;
+        let built = source::build(system, &source_dir, dest, opts.jobs.max(1))?;
+        tracing::info!("{} built via {}", formula.name, built.build_system);
+        install::link_opt(&formula.name, version, dest, &opts.prefix)?;
+        let rewritten = mach_o::rewrite_placeholders(dest, &opts.prefix)?;
+        if rewritten > 0 {
+            tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
+        }
+        let linked = install::link_bins(dest, &formula.executables, &opts.prefix)?;
+        let _ = install::link_share(dest, &opts.prefix);
+        state::upsert_record(state::record_with_kind(
+            &formula.name,
+            version,
+            "brew",
+            dest.to_path_buf(),
+            opts.kind,
+        ))?;
+        Ok(linked)
+    }
+
     fn has_bottle_for_host(&self, formula: &Formula) -> bool {
         let Some(bottle) = formula.bottle.as_ref().and_then(|b| b.stable.as_ref()) else {
             return false;
@@ -425,7 +455,13 @@ impl BrewBackend {
                 continue;
             }
             tracing::info!("installing dependency {dep} for {normalized}");
-            Box::pin(self.install_with_deps(dep, opts, visited)).await?;
+            // A dependency is a library for the package that pulled it in,
+            // not another instance of that package's kind.
+            let dep_opts = InstallOptions {
+                kind: crate::group::Kind::Library,
+                ..opts.clone()
+            };
+            Box::pin(self.install_with_deps(dep, &dep_opts, visited)).await?;
         }
 
         // Prefer a bottle; fall back to a source build when unavailable or forced.

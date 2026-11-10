@@ -104,12 +104,7 @@ pub async fn fetch_latest(repo: &str) -> Result<Option<Release>> {
 
 /// Compare a release tag against the current version. `true` if newer.
 pub fn is_newer(tag: &str, current: &str) -> bool {
-    let a = semver::Version::parse(tag.trim_start_matches('v'));
-    let b = semver::Version::parse(current.trim_start_matches('v'));
-    match (a, b) {
-        (Ok(a), Ok(b)) => a > b,
-        _ => tag.trim_start_matches('v') != current,
-    }
+    crate::backend::is_newer_version(tag, current)
 }
 
 /// Download and install the latest binary. Returns the new version on success.
@@ -171,11 +166,12 @@ fn extract_binary(archive: &[u8], exe: &Path) -> Result<PathBuf> {
     let _ = std::fs::remove_file(&tmp);
     #[cfg(target_os = "windows")]
     {
-        // ZIP not supported by the current deps; require tar.gz on all hosts.
+        // Windows releases would be .zip, which the current deps cannot
+        // unpack, so self-update is not available there.
         let _ = (archive, exe, tmp);
-        return Err(Error::Unsupported(
-            "self-update currently expects a .tar.gz asset on every host".into(),
-        ));
+        Err(Error::Unsupported(
+            "self-update is not supported on Windows yet (no .zip extraction)".into(),
+        ))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -293,7 +289,8 @@ mod tests {
         assert!(is_newer("v0.2.0", "0.1.0"));
         assert!(!is_newer("v0.1.0", "0.1.0"));
         assert!(is_newer("0.10.0", "0.9.9"));
-        assert!(is_newer("custom", "0.1.0")); // non-semver: fall back to inequality
+        // A tag that cannot be ordered is not an update (use --force).
+        assert!(!is_newer("custom", "0.1.0"));
     }
 
     #[test]

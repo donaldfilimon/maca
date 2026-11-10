@@ -350,7 +350,22 @@ pub fn list() -> Result<Vec<SnapshotManifest>> {
             }
         }
     }
-    out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    // Newest first. Ids are `<secs>-<nanos>-<seq>`, so they order precisely;
+    // `created_at` has one-second resolution and only breaks ties for ids
+    // that do not parse.
+    let key = |m: &SnapshotManifest| -> (u64, u64, u64) {
+        let mut it = m.id.split('-').map(|p| p.parse::<u64>().unwrap_or(0));
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    };
+    out.sort_by(|a, b| {
+        key(b)
+            .cmp(&key(a))
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
     Ok(out)
 }
 

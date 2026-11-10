@@ -63,8 +63,9 @@ enum Commands {
         query: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
-        #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
-        backend: BackendKind,
+        /// Backend to use; defaults to `default_backend` in config, else auto.
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
         /// Output JSON instead of a table.
         #[arg(long)]
         json: bool,
@@ -72,8 +73,9 @@ enum Commands {
     /// Show package details.
     Info {
         package: String,
-        #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
-        backend: BackendKind,
+        /// Backend to use; defaults to `default_backend` in config, else auto.
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
         #[arg(long)]
         json: bool,
     },
@@ -81,8 +83,9 @@ enum Commands {
     Install {
         #[arg(required = true)]
         packages: Vec<String>,
-        #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
-        backend: BackendKind,
+        /// Backend to use; defaults to `default_backend` in config, else auto.
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
         #[arg(long)]
         dry_run: bool,
         /// Compile from source instead of using a bottle/installer.
@@ -313,8 +316,9 @@ enum KindCommands {
     Install {
         #[arg(required = true)]
         packages: Vec<String>,
-        #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
-        backend: BackendKind,
+        /// Backend to use; defaults to `default_backend` in config, else auto.
+        #[arg(long, value_enum)]
+        backend: Option<BackendKind>,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -356,14 +360,18 @@ struct Ctx {
 impl Ctx {
     fn from_cli(
         prefix: Option<std::path::PathBuf>,
-        backend: BackendKind,
+        backend: Option<BackendKind>,
         jobs: usize,
     ) -> Result<Self> {
         let cfg = config::Config::load()?;
-        let resolved_backend = match cfg.default_backend.as_deref() {
-            Some(s) if backend == BackendKind::Auto => BackendKind::from_str_lossy(s),
-            _ => backend,
-        };
+        // An explicit --backend (including `auto`) wins; otherwise the
+        // config's default_backend; otherwise auto.
+        let resolved_backend = backend.unwrap_or_else(|| {
+            cfg.default_backend
+                .as_deref()
+                .map(BackendKind::from_str_lossy)
+                .unwrap_or(BackendKind::Auto)
+        });
         Ok(Self {
             prefix: prefix.unwrap_or_else(|| cfg.prefix()),
             backend: resolved_backend,
@@ -395,7 +403,16 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Search { backend, .. } => *backend,
         Commands::Info { backend, .. } => *backend,
         Commands::Install { backend, .. } => *backend,
-        _ => BackendKind::Auto,
+        Commands::App {
+            action: KindCommands::Install { backend, .. },
+        }
+        | Commands::Plugin {
+            action: KindCommands::Install { backend, .. },
+        }
+        | Commands::Cli {
+            action: KindCommands::Install { backend, .. },
+        } => *backend,
+        _ => None,
     };
     let ctx = Ctx::from_cli(cli.prefix, backend, cli.jobs)?;
     match cli.command {
@@ -804,13 +821,7 @@ async fn upgrade_inner(ctx: &Ctx, only: &[String]) -> Result<()> {
 }
 
 fn is_newer(candidate: &str, installed: &str) -> bool {
-    match (
-        semver::Version::parse(candidate),
-        semver::Version::parse(installed),
-    ) {
-        (Ok(c), Ok(i)) => c > i,
-        _ => candidate != installed,
-    }
+    backend::is_newer_version(candidate, installed)
 }
 
 async fn latest_version(ctx: &Ctx, backend: &str, name: &str) -> Result<Option<String>> {
@@ -1160,9 +1171,9 @@ fn cmd_clean(ctx: &Ctx, all: bool, keep_snapshots: usize) -> Result<()> {
         }
     }
 
-    // 2. Clean build logs if all
+    // 2. Clean build logs (always; they only matter right after a failure)
     let logs_dir = config::data_dir().join("logs");
-    if logs_dir.exists() && all {
+    if logs_dir.exists() {
         if let Ok(entries) = std::fs::read_dir(&logs_dir) {
             for entry in entries.flatten() {
                 if let Ok(m) = entry.metadata() {
@@ -1690,19 +1701,14 @@ async fn cmd_kind(ctx: &Ctx, action: KindCommands, kind: Kind) -> Result<()> {
     match action {
         KindCommands::Install {
             packages,
-            backend,
             dry_run,
             build_from_source,
             no_snapshot,
+            ..
         } => {
-            let ctx = Ctx {
-                prefix: ctx.prefix.clone(),
-                backend,
-                jobs: ctx.jobs,
-                custom_registry_urls: ctx.custom_registry_urls.clone(),
-            };
+            // `ctx.backend` already resolved this subcommand's --backend.
             let opts = ctx.opts(dry_run, kind, build_from_source, no_snapshot);
-            cmd_install(&ctx, &packages, &opts).await
+            cmd_install(ctx, &packages, &opts).await
         }
         KindCommands::Remove {
             packages,

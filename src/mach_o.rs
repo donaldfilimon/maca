@@ -10,24 +10,32 @@
 //! this module is a no-op (Linux bottles are relocatable tarballs).
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
-use crate::{Error, Result};
+#[cfg(target_os = "macos")]
+use crate::Error;
+use crate::Result;
 
+// The placeholder helpers below are pure string and file logic, kept on every
+// platform so their unit tests run in Linux CI; only macOS calls them.
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const CELLAR_TOKEN: &str = "@@HOMEBREW_CELLAR@@";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const PREFIX_TOKEN: &str = "@@HOMEBREW_PREFIX@@";
 
 /// Walk `cellar` and rewrite Homebrew placeholders in every Mach-O file.
 /// Returns the number of files rewritten.
 pub fn rewrite_placeholders(cellar: &Path, prefix: &Path) -> Result<usize> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (cellar, prefix);
-        return Ok(0);
-    }
     #[cfg(target_os = "macos")]
     {
         rewrite_placeholders_macos(cellar, prefix)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (cellar, prefix);
+        Ok(0)
     }
 }
 
@@ -64,6 +72,7 @@ fn rewrite_placeholders_macos(cellar: &Path, prefix: &Path) -> Result<usize> {
 
 /// Homebrew's Cellar is `<prefix>/Cellar`; maca uses `<prefix>/cellar`.
 /// Bottles reference the Cellar token, so map it to our lowercase cellar.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn cellar_canonical(prefix: &Path) -> PathBuf {
     prefix.join("cellar")
 }
@@ -155,6 +164,7 @@ fn rewrite_one(path: &Path, prefix: &Path, cellar_dir: &Path) -> Result<bool> {
     Ok(changed)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn substitute(old: &str, prefix: &Path, cellar_dir: &Path) -> Option<String> {
     if !old.contains(CELLAR_TOKEN) && !old.contains(PREFIX_TOKEN) {
         return None;
@@ -167,6 +177,7 @@ fn substitute(old: &str, prefix: &Path, cellar_dir: &Path) -> Option<String> {
 /// Detect a Mach-O file by its magic bytes (thin or fat, 32/64-bit).
 /// Mach-O magic is stored in the file's native endianness, so accept both
 /// byte orders for each magic value.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn is_macho(path: &Path) -> bool {
     use std::io::Read;
     let mut f = match std::fs::File::open(path) {

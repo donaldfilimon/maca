@@ -96,6 +96,57 @@ pub struct InstallOutcome {
     pub linked_bins: Vec<std::path::PathBuf>,
 }
 
+/// True when `candidate` is a strictly newer version than `installed`.
+///
+/// Semver strings compare as semver. Anything else (Homebrew revisions such
+/// as `1.8.2_1`, four-part or date versions) is compared component by
+/// component: numeric parts numerically, missing parts as zero, then the
+/// `_N` revision. When the two cannot be ordered reliably (a numeric part
+/// against a word, or equal parts written differently) the answer is
+/// "not newer": an upgrade that cannot prove it moves forward must not run,
+/// because it could just as well be a downgrade.
+pub fn is_newer_version(candidate: &str, installed: &str) -> bool {
+    let c = candidate.trim().trim_start_matches('v');
+    let i = installed.trim().trim_start_matches('v');
+    if let (Ok(a), Ok(b)) = (semver::Version::parse(c), semver::Version::parse(i)) {
+        return a > b;
+    }
+    compare_loose(c, i) == Some(std::cmp::Ordering::Greater)
+}
+
+fn compare_loose(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let split = |s: &str| -> (Vec<String>, u64) {
+        let (main, rev) = match s.rsplit_once('_') {
+            Some((m, r)) if !r.is_empty() && r.bytes().all(|c| c.is_ascii_digit()) => {
+                (m.to_string(), r.parse().unwrap_or(0))
+            }
+            _ => (s.to_string(), 0),
+        };
+        let parts = main
+            .split(['.', '-', '+'])
+            .filter(|p| !p.is_empty())
+            .map(String::from)
+            .collect();
+        (parts, rev)
+    };
+    let (pa, ra) = split(a);
+    let (pb, rb) = split(b);
+    for idx in 0..pa.len().max(pb.len()) {
+        let x = pa.get(idx).map(String::as_str).unwrap_or("0");
+        let y = pb.get(idx).map(String::as_str).unwrap_or("0");
+        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            (Err(_), Err(_)) => x.cmp(y),
+            _ => return None, // number vs word: no reliable order
+        };
+        if ord != Ordering::Equal {
+            return Some(ord);
+        }
+    }
+    Some(ra.cmp(&rb))
+}
+
 /// Resolve which concrete backend handles a request.
 pub fn resolve(kind: BackendKind) -> BackendKind {
     match kind {
@@ -226,10 +277,7 @@ fn read_link_target(link: &std::path::Path) -> std::io::Result<std::path::PathBu
     #[cfg(windows)]
     {
         let _ = link;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "not a symlink on windows",
-        ))
+        Err(std::io::Error::other("not a symlink on windows"))
     }
     #[cfg(not(windows))]
     {
@@ -284,6 +332,29 @@ mod tests {
         assert_eq!(BackendKind::from_str_lossy("WINGET"), BackendKind::Winget);
         assert_eq!(BackendKind::from_str_lossy(""), BackendKind::Auto);
         assert_eq!(BackendKind::Brew.as_str(), "brew");
+    }
+
+    #[test]
+    fn version_ordering_handles_brew_revisions_and_refuses_guesses() {
+        assert!(is_newer_version("1.8.3", "1.8.2"));
+        assert!(!is_newer_version("1.8.2", "1.8.3"));
+        assert!(is_newer_version("1.8.2_1", "1.8.2"));
+        assert!(
+            !is_newer_version("1.8.2", "1.8.2_1"),
+            "must not downgrade a revision"
+        );
+        assert!(is_newer_version("1.2.3.10", "1.2.3.9"));
+        assert!(is_newer_version("2024.10.01", "2024.9.30"));
+        assert!(is_newer_version("v0.2.0", "0.1.0"));
+        assert!(
+            !is_newer_version("1.0", "1.0.0"),
+            "equal versions written differently"
+        );
+        assert!(
+            !is_newer_version("custom", "0.1.0"),
+            "word vs number cannot be ordered"
+        );
+        assert!(!is_newer_version("1.0.0", "1.0.0"));
     }
 
     #[test]

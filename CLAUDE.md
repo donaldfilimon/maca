@@ -16,10 +16,11 @@ cargo test --lib                                     # unit tests only
 cargo test --lib backend::tests::backend_kind_roundtrip   # one unit test: <module>::tests::<name>
 cargo test --test integration_tests test_binary_discovery # one integration test
 RUST_LOG=debug cargo run -- search jq                # tracing goes through RUST_LOG
-./scripts/package-release.sh [target-triple]         # writes target/dist/maca-<triple>.tar.gz + .sha256
+./scripts/package-release.sh [target-triple]         # writes target/dist/maca-<triple>.tar.gz + .sha256 (host triple only)
+./scripts/cross-check.sh                             # clippy -D warnings for Linux + Windows from macOS (needs zig; compile-only)
 ```
 
-CI (`.github/workflows/ci.yml`) runs `./check.sh` then `./scripts/package-release.sh` on Ubuntu and macOS. `.github/workflows/release.yml` runs on a `v*` tag, checks the tag equals the `Cargo.toml` version, and uploads the archives to the GitHub release. Neither workflow has run yet (the repo has never been pushed with them).
+CI (`.github/workflows/ci.yml`) runs `./check.sh` then `./scripts/package-release.sh` on Ubuntu and macOS, plus clippy and `cargo test` on Windows. `.github/workflows/release.yml` runs on a `v*` tag, checks the tag equals the `Cargo.toml` version, and uploads the archives to the GitHub release. Neither workflow has run yet (the repo has never been pushed with them).
 
 ### Test isolation
 
@@ -76,6 +77,8 @@ Naming trap: `lock.rs` is the cross-process prefix mutex; the reproducibility **
 ### Self-update
 
 `selfupdate::pick_asset` matches release assets named exactly `maca-<target-triple>.tar.gz` plus `…tar.gz.sha256`, which is what `scripts/package-release.sh` produces. The asset name carries no version; the release tag does.
+
+Platform-gated code must stay warning-free on every target: macOS-only helpers that unit tests still use get `#[cfg_attr(not(target_os = "macos"), allow(dead_code))]`, and Unix-only test helpers get `#[cfg(unix)]`. Run `./scripts/cross-check.sh` before pushing; `check.sh` on a Mac cannot see these.
 
 ## Scope notes
 

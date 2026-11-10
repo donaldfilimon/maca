@@ -191,11 +191,16 @@ fn test_sync_dry_run() {
 // host, and each test gets its own MACA_HOME.
 // ---------------------------------------------------------------------------
 
+// The e2e helpers serve shell-script packages, so they exist only on Unix.
+#[cfg(unix)]
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::sync::Arc;
 
 /// Serve `routes` (path -> body) on 127.0.0.1 for the life of the test process.
+#[cfg(unix)]
 fn serve(routes: HashMap<String, Vec<u8>>) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -226,6 +231,7 @@ fn serve(routes: HashMap<String, Vec<u8>>) -> String {
 }
 
 /// A tar.gz holding one executable shell script at `<top>/bin/<exe>`.
+#[cfg(unix)]
 fn script_tarball(top: &str, exe: &str, prints: &str) -> Vec<u8> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
@@ -239,16 +245,19 @@ fn script_tarball(top: &str, exe: &str, prints: &str) -> Vec<u8> {
     tar.into_inner().unwrap().finish().unwrap()
 }
 
+#[cfg(unix)]
 fn sha256(bytes: &[u8]) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(bytes))
 }
 
+#[cfg(unix)]
 struct Sandbox {
     bin: PathBuf,
     home: PathBuf,
 }
 
+#[cfg(unix)]
 impl Sandbox {
     fn new(tag: &str) -> Self {
         let home = std::env::temp_dir().join(format!("maca-e2e-{tag}-{}", std::process::id()));
@@ -340,6 +349,7 @@ impl Sandbox {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Sandbox {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.home);

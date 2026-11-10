@@ -344,7 +344,13 @@ impl CustomBackend {
             let _ = std::fs::remove_dir_all(&scratch);
             std::fs::create_dir_all(&scratch)?;
             let source_dir =
-                install::extract_tar_gz_to_cellar("src", &plan.name, &bytes, &scratch)?;
+                match install::extract_tar_gz_to_cellar("src", &plan.name, &bytes, &scratch) {
+                    Ok(dir) => dir,
+                    Err(e) => {
+                        let _ = std::fs::remove_dir_all(&scratch);
+                        return Err(e);
+                    }
+                };
             let cellar = cellar_for(&opts.prefix, &plan.name, &plan.version);
             let built =
                 match source::run_steps(&source_dir, &cellar, &entry.build_steps, opts.jobs.max(1))
@@ -462,21 +468,9 @@ pub fn cellar_for(prefix: &Path, name: &str, version: &str) -> PathBuf {
 }
 
 fn link_all_bins(cellar: &Path, prefix: &Path) -> Result<Vec<PathBuf>> {
-    let bin = cellar.join("bin");
-    if !bin.exists() {
-        return Ok(vec![]);
-    }
-    let mut exes: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&bin)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            if let Some(name) = entry.file_name().to_str() {
-                exes.push(name.to_string());
-            }
-        }
-    }
-    exes.sort();
-    install::link_bins(cellar, &exes, prefix)
+    // An empty list makes link_bins discover everything in bin/ and sbin/,
+    // symlinked executables included.
+    install::link_bins(cellar, &[], prefix)
 }
 
 #[cfg(test)]

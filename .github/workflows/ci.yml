@@ -32,3 +32,26 @@ jobs:
 
       - name: Package release distribution
         run: ./scripts/package-release.sh
+
+  windows:
+    # check.sh ends with macOS/Linux-specific steps, so Windows runs the
+    # lint and the tests directly.
+    name: Lint & Test (windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Tests
+        run: cargo test
