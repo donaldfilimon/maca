@@ -252,6 +252,15 @@ fn copy_bounded(
 /// exactly one regular file named `bin_name` (archive root or one top
 /// directory) is extracted, more than one is ambiguous; at most `max_bytes`
 /// of it are read. `dest` must not exist; on error nothing is left at it.
+/// A zip entry's name for error messages; an undecodable one is not fatal here.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn entry_name<R: std::io::Read + ?Sized>(entry: &zip::read::ZipFile<'_, R>) -> String {
+    entry
+        .name()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "<undecodable name>".to_string())
+}
+
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn extract_zip_binary(
     archive: &[u8],
@@ -268,8 +277,12 @@ pub fn extract_zip_binary(
         let entry = zip
             .by_index_raw(i)
             .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
+        let raw = entry_name(&entry);
+        if crate::install::zip_name_is_unsafe(&raw) {
+            return Err(ArchiveError::UnsafePath(raw));
+        }
         let Some(path) = entry.enclosed_name() else {
-            return Err(ArchiveError::UnsafePath(entry.name().to_string()));
+            return Err(ArchiveError::UnsafePath(raw));
         };
         if entry.is_dir() || !is_binary_path(&path, bin_name) {
             continue;
@@ -277,7 +290,7 @@ pub fn extract_zip_binary(
         // Symlinks (Unix mode bits in the zip) are not regular files.
         if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
             return Err(ArchiveError::NotRegularFile {
-                name: entry.name().to_string(),
+                name: entry_name(&entry),
             });
         }
         if target.replace(i).is_some() {
@@ -288,7 +301,7 @@ pub fn extract_zip_binary(
     let entry = zip
         .by_index(index)
         .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
-    let name = entry.name().to_string();
+    let name = entry_name(&entry);
     if entry.size() > max_bytes {
         return Err(ArchiveError::TooLarge {
             name,
@@ -496,15 +509,36 @@ mod tests {
 
     use std::io::Write;
 
+    /// Build a zip. The writer (zip 9) sanitizes `..` and a leading `/` out of
+    /// entry names, which would make hostile archives impossible to build, so
+    /// such names are written as same-length stand-ins and patched back in the
+    /// finished bytes (local and central headers both carry the name).
     fn zip_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
         let opts = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
+        let mut patches: Vec<(String, String)> = Vec::new();
         for (name, data) in entries {
-            w.start_file(*name, opts).unwrap();
+            let mut stand_in = name.replace("..", "ZZ");
+            if let Some(rest) = stand_in.strip_prefix('/') {
+                stand_in = format!("Z{rest}");
+            }
+            if stand_in != *name {
+                patches.push((stand_in.clone(), name.to_string()));
+            }
+            w.start_file(stand_in, opts).unwrap();
             w.write_all(data).unwrap();
         }
-        w.finish().unwrap().into_inner()
+        let mut bytes = w.finish().unwrap().into_inner();
+        for (from, to) in patches {
+            let (from, to) = (from.as_bytes(), to.as_bytes());
+            let mut at = 0;
+            while let Some(pos) = bytes[at..].windows(from.len()).position(|w| w == from) {
+                bytes[at + pos..at + pos + from.len()].copy_from_slice(to);
+                at += pos + from.len();
+            }
+        }
+        bytes
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -637,7 +671,15 @@ mod tests {
         // The declared 100 bytes pass the header check; the 1 MiB inflate
         // must still be stopped by the bounded read.
         let err = extract_zip_binary(&zip, "maca.exe", &dest, 64 * 1024).unwrap_err();
-        assert!(matches!(err, ArchiveError::TooLarge { .. }), "{err}");
+        // zip 9 also notices the lie itself and reports the archive corrupt;
+        // either way the entry is refused and nothing is written.
+        assert!(
+            matches!(
+                err,
+                ArchiveError::TooLarge { .. } | ArchiveError::Corrupt(_)
+            ),
+            "{err}"
+        );
         assert!(!dest.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }

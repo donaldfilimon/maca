@@ -224,20 +224,19 @@ impl WingetBackend {
         }
         let entries: Vec<Entry> = serde_json::from_slice(&bytes)
             .map_err(|e| Error::Network(format!("decoding winget-pkgs listing: {e}")))?;
-        let mut versions: Vec<String> = entries
+        let mut versions: Vec<(semver::Version, String)> = entries
             .into_iter()
             .filter(|e| e.kind == "dir")
-            .map(|e| e.name)
-            .filter(|v| semver::Version::parse(v).is_ok())
+            .filter_map(|e| semver::Version::parse(&e.name).ok().map(|v| (v, e.name)))
             .collect();
-        versions.sort_by(|a, b| {
-            semver::Version::parse(b)
-                .unwrap()
-                .cmp(&semver::Version::parse(a).unwrap())
-        });
-        let version = versions.into_iter().next().ok_or_else(|| {
-            Error::NotFound(format!("no published versions for winget id '{id}'"))
-        })?;
+        versions.sort_by(|a, b| b.0.cmp(&a.0));
+        let version = versions
+            .into_iter()
+            .next()
+            .map(|(_, name)| name)
+            .ok_or_else(|| {
+                Error::NotFound(format!("no published versions for winget id '{id}'"))
+            })?;
         Ok((id.to_string(), version))
     }
 
@@ -309,7 +308,7 @@ impl WingetBackend {
         let mut homepage = String::new();
         if let Some(url) = Self::locale_url(&resolved_id, &version)
             && let Ok(bytes) = install::download(&url).await
-            && let Ok(locale) = serde_yaml::from_slice::<LocaleManifest>(&bytes)
+            && let Ok(locale) = serde_norway::from_slice::<LocaleManifest>(&bytes)
         {
             description = locale.description.unwrap_or_default();
             homepage = locale.homepage.unwrap_or_default();
@@ -354,7 +353,7 @@ impl WingetBackend {
             )),
             other => other,
         })?;
-        let manifest: InstallerManifest = serde_yaml::from_slice(&yaml_bytes)
+        let manifest: InstallerManifest = serde_norway::from_slice(&yaml_bytes)
             .map_err(|e| Error::Network(format!("decoding winget manifest: {e}")))?;
         let host = host_arch();
         let installer = pick_installer(&manifest.installers, host).ok_or_else(|| {

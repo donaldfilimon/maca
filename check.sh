@@ -24,6 +24,13 @@ cargo clippy --all-targets --all-features -- -D warnings
 echo "== cargo test =="
 cargo test
 
+if command -v cargo-deny >/dev/null 2>&1; then
+    echo "== cargo deny check =="
+    cargo deny check
+else
+    echo "== cargo deny check (skipped: cargo-deny not installed; CI runs it) =="
+fi
+
 echo "== cargo build --release =="
 cargo build --release
 

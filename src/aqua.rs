@@ -178,7 +178,7 @@ struct AquaOverride {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct AquaPartial {
     #[serde(default)]
-    version_constraint: Option<serde_yaml::Value>,
+    version_constraint: Option<serde_norway::Value>,
     #[serde(default)]
     asset: Option<String>,
     #[serde(default)]
@@ -220,7 +220,7 @@ struct AquaPkg {
     #[serde(default)]
     supported_envs: Vec<String>,
     #[serde(default)]
-    version_constraint: Option<serde_yaml::Value>,
+    version_constraint: Option<serde_norway::Value>,
     #[serde(default)]
     version_overrides: Vec<AquaPartial>,
     #[serde(default)]
@@ -284,7 +284,7 @@ pub fn search_index(yaml: &str, query: &str, limit: usize) -> Vec<Package> {
 }
 
 pub fn names_from_index(yaml: &str) -> Vec<String> {
-    let doc: AquaDoc = serde_yaml::from_str(yaml).unwrap_or_default();
+    let doc: AquaDoc = serde_norway::from_str(yaml).unwrap_or_default();
     doc.packages
         .iter()
         .filter_map(|p| p.path.as_deref().and_then(spec_from_index_path))
@@ -446,11 +446,11 @@ fn override_matches(over: &AquaOverride, goos: &str, goarch: &str) -> bool {
     os_ok && arch_ok && (over.goos.is_some() || over.goarch.is_some())
 }
 
-fn constraint_text(value: Option<&serde_yaml::Value>) -> String {
+fn constraint_text(value: Option<&serde_norway::Value>) -> String {
     match value {
         None => "true".into(),
-        Some(serde_yaml::Value::Bool(b)) => b.to_string(),
-        Some(serde_yaml::Value::String(s)) => s.clone(),
+        Some(serde_norway::Value::Bool(b)) => b.to_string(),
+        Some(serde_norway::Value::String(s)) => s.clone(),
         _ => "false".into(),
     }
 }
@@ -668,7 +668,7 @@ fn raw_base() -> String {
 async fn load_package(slash: &str) -> Result<AquaPkg> {
     let url = format!("{}/pkgs/{slash}/registry.yaml", raw_base());
     let text = download_text(&url).await?;
-    let doc: AquaDoc = serde_yaml::from_str(&text)
+    let doc: AquaDoc = serde_norway::from_str(&text)
         .map_err(|e| Error::Config(format!("parse aqua package {slash}: {e}")))?;
     select_package(&doc.packages).cloned()
 }
@@ -1059,7 +1059,7 @@ packages:
           asset: gh_{{trimV .Version}}_checksums.txt
           algorithm: sha256
 "#;
-        let doc: AquaDoc = serde_yaml::from_str(yaml).unwrap();
+        let doc: AquaDoc = serde_norway::from_str(yaml).unwrap();
         let pkg = select_package(&doc.packages).unwrap();
         let resolved = choose_variant(pkg, "v2.40.0", "darwin", "amd64").unwrap();
         assert_eq!(resolved.asset, "gh_2.40.0_macOS_x86_64.tar.gz");
@@ -1100,9 +1100,11 @@ packages:
             kind: "github_release".into(),
             repo_owner: Some("a".into()),
             repo_name: Some("b".into()),
-            version_constraint: Some(serde_yaml::Value::String("false".into())),
+            version_constraint: Some(serde_norway::Value::String("false".into())),
             version_overrides: vec![AquaPartial {
-                version_constraint: Some(serde_yaml::Value::String("semver(\"<= 0.1.0\")".into())),
+                version_constraint: Some(serde_norway::Value::String(
+                    "semver(\"<= 0.1.0\")".into(),
+                )),
                 asset: Some("old.tgz".into()),
                 ..AquaPartial::default()
             }],

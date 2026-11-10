@@ -33,6 +33,34 @@ jobs:
       - name: Package release distribution
         run: ./scripts/package-release.sh
 
+  supply-chain:
+    # Advisories, licenses, banned and unknown sources (see deny.toml).
+    name: Supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+  msrv:
+    # Cargo.toml promises rust-version 1.89 (std::fs::File::lock).
+    name: Builds on the minimum Rust version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89.0
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build with the locked dependency set
+        run: cargo +1.89.0 build --locked
+
   windows:
     # check.sh ends with macOS/Linux-specific steps, so Windows runs the
     # lint and the tests directly.

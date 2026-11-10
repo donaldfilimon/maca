@@ -511,6 +511,14 @@ impl BrewBackend {
     async fn install_cask(&self, token: &str, opts: &InstallOptions) -> Result<InstallOutcome> {
         let data = fetch_cask_json(token).await?;
         let plan = plan_cask(&data)?;
+        if let Some(req) = &opts.version
+            && req.trim() != plan.version
+        {
+            return Err(Error::Unsupported(format!(
+                "brew only publishes its current version; cannot install cask {} at {}",
+                plan.token, req
+            )));
+        }
         if opts.dry_run {
             println!(
                 "[dry-run] would install cask {} {} ({})",
@@ -552,7 +560,7 @@ impl BrewBackend {
             &plan.version,
             "brew",
             cellar.clone(),
-            crate::group::Kind::App,
+            opts.kind,
         ))?;
         Ok(InstallOutcome {
             name: plan.token,

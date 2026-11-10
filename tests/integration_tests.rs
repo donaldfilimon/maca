@@ -805,12 +805,6 @@ fn e2e_cask_zip_install() {
             {"binary": ["tool.sh"], "target": "$HOMEBREW_PREFIX/bin/casktool"}
         ]
     });
-    std::fs::write(
-        std::env::temp_dir().join("cask.json"),
-        cask_json.to_string(),
-    )
-    .unwrap();
-
     // We need a second server for the cask JSON metadata. Since serve() takes one map, and our map above
     // didn't include /cask/casktool.json, let's hack by starting a new `serve` with both.
     let mut routes = HashMap::new();
@@ -829,6 +823,185 @@ fn e2e_cask_zip_install() {
     );
     assert!(success, "install failed:\n{text}");
     assert_eq!(sb.exec("casktool"), "cask-bin");
+}
+
+/// A loopback cask API serving `token` with the given archive and sha256.
+#[cfg(unix)]
+fn cask_api(token: &str, version: &str, zip_bytes: Vec<u8>, sha: &str) -> String {
+    let mut routes = HashMap::new();
+    routes.insert("/tool.zip".to_string(), zip_bytes);
+    let base = serve(routes.clone());
+    // The JSON names the archive URL, so it needs the archive server's origin.
+    let body = serde_json::json!({
+        "token": token,
+        "version": version,
+        "url": format!("{base}/tool.zip"),
+        "sha256": sha,
+        "artifacts": [{"binary": ["tool.sh"], "target": format!("$HOMEBREW_PREFIX/bin/{token}")}]
+    });
+    let mut api = HashMap::new();
+    api.insert(format!("/cask/{token}.json"), body.to_string().into_bytes());
+    format!("{}/cask", serve(api))
+}
+
+#[cfg(unix)]
+fn cask_zip() -> Vec<u8> {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let opts = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+        zip.start_file("tool.sh", opts).unwrap();
+        zip.write_all(b"#!/bin/sh\necho cask-bin\n").unwrap();
+        zip.finish().unwrap();
+    }
+    cursor.into_inner()
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cask_refuses_a_bad_checksum_a_wrong_version_and_leaves_nothing() {
+    let zip = cask_zip();
+    let sb = Sandbox::new("caskbad");
+
+    // A declared checksum that does not match: refused, no keg, no ledger entry.
+    let api = cask_api("badsum", "1.0.0", zip.clone(), &"0".repeat(64));
+    let (ok, text) = sb.run_env(
+        &["install", "cask:badsum", "--backend", "brew"],
+        &[("MACA_CASK_API", &api)],
+    );
+    assert!(!ok, "a checksum mismatch must fail:\n{text}");
+    assert!(!sb.prefix().join("cellar/badsum").exists(), "{text}");
+    assert_eq!(sb.installed_version("badsum"), None);
+
+    // A version other than the catalog's is refused, not silently ignored.
+    let api = cask_api("pinned", "1.0.0", zip.clone(), &sha256(&zip));
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "cask:pinned",
+            "--backend",
+            "brew",
+            "--version",
+            "0.9.0",
+        ],
+        &[("MACA_CASK_API", &api)],
+    );
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains("only publishes its current version"),
+        "{text}"
+    );
+    assert_eq!(sb.installed_version("pinned"), None);
+
+    // The matching version installs and the checksum passes.
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "cask:pinned",
+            "--backend",
+            "brew",
+            "--version",
+            "1.0.0",
+        ],
+        &[("MACA_CASK_API", &api)],
+    );
+    assert!(ok, "{text}");
+    assert_eq!(sb.exec("pinned"), "cask-bin");
+}
+
+/// Versions that only the current catalog entry can serve are refused by
+/// the custom backend, and the registry entry is left untouched.
+#[cfg(unix)]
+#[test]
+fn e2e_custom_refuses_a_version_it_does_not_publish() {
+    let a1 = script_tarball("a", "alpha", "alpha-1");
+    let mut routes = HashMap::new();
+    routes.insert("/a1".to_string(), a1.clone());
+    let base = serve(routes);
+    let sb = Sandbox::new("customver");
+    sb.add("alpha", "1.0.0", &format!("{base}/a1"), &sha256(&a1));
+
+    let text = sb.fails(&[
+        "install",
+        "alpha",
+        "--backend",
+        "custom",
+        "--version",
+        "0.5.0",
+    ]);
+    assert!(
+        text.contains("only publishes its current version"),
+        "{text}"
+    );
+    assert_eq!(sb.installed_version("alpha"), None);
+    assert!(!sb.prefix().join("cellar/alpha").exists());
+
+    sb.ok(&[
+        "install",
+        "alpha",
+        "--backend",
+        "custom",
+        "--version",
+        "1.0.0",
+    ]);
+    assert_eq!(sb.exec("alpha"), "alpha-1");
+}
+
+/// A project file moves the prefix for commands run under it, and an
+/// explicit `--prefix` still wins over it.
+#[cfg(unix)]
+#[test]
+fn e2e_project_file_scopes_installs_and_the_flag_overrides_it() {
+    let a1 = script_tarball("a", "alpha", "alpha-1");
+    let mut routes = HashMap::new();
+    routes.insert("/a1".to_string(), a1.clone());
+    let base = serve(routes);
+    let sb = Sandbox::new("projscope");
+    sb.add("alpha", "1.0.0", &format!("{base}/a1"), &sha256(&a1));
+
+    let proj = sb.home.join("proj");
+    std::fs::create_dir_all(proj.join("deep")).unwrap();
+    std::fs::write(proj.join("maca.toml"), "prefix = \"proj-prefix\"\n").unwrap();
+
+    let out = Command::new(&sb.bin)
+        .args(["install", "alpha", "--backend", "custom"])
+        .current_dir(proj.join("deep"))
+        .env("MACA_HOME", &sb.home)
+        .env_remove("MACA_PREFIX")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(proj.join("proj-prefix/cellar/alpha/1.0.0").is_dir());
+    assert!(!sb.prefix().join("cellar/alpha").exists());
+    let linked = Command::new(proj.join("proj-prefix/bin/alpha"))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&linked.stdout).trim(), "alpha-1");
+
+    // `--prefix` beats the project file: shellenv reports the flag's value.
+    let flag = sb.home.join("flag-prefix");
+    let out = Command::new(&sb.bin)
+        .args([
+            "--prefix",
+            flag.to_str().unwrap(),
+            "shellenv",
+            "--shell",
+            "bash",
+        ])
+        .current_dir(&proj)
+        .env("MACA_HOME", &sb.home)
+        .env_remove("MACA_PREFIX")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("flag-prefix"), "{text}");
+    assert!(!text.contains("proj-prefix"), "{text}");
 }
 
 #[cfg(unix)]

@@ -12,7 +12,22 @@ All notable changes to maca are recorded here. The format follows
 - `MACA_CELLAR` now takes precedence over a project or user `cellar` setting,
   as the documentation always said.
 
+### Security
+- Upgraded `zip` 2.6 to 9.5, which clears four RUSTSEC advisories (symlink and
+  permission handling in extraction), `ratatui` 0.29 to 0.30 (drops the
+  unsound `lru` 0.12), and replaced the unmaintained `serde_yaml` with
+  `serde_norway`. `cargo audit` and `cargo deny check` are clean.
+- Zip extraction now refuses absolute and drive-prefixed entry names itself
+  (the newer `zip` quietly relativises them) and never applies setuid, setgid
+  or sticky bits from an archive.
+
 ### Fixed
+- Casks ignored `--version` and installed the current one; they now refuse a
+  version the catalog does not publish.
+- `rust-toolchain.toml` pinned `nightly`; it is now `stable`, and CI builds on
+  the declared minimum Rust version (1.89).
+- Removed reachable `unwrap`/`expect` panics in the winget version sort and the
+  custom backend install path.
 - Documentation described version pinning as verify-only and per-directory
   prefixes as planned; both now describe what the code does.
 

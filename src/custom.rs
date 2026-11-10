@@ -309,7 +309,7 @@ impl CustomBackend {
         let entry = self
             .registry
             .find(name)
-            .expect("plan succeeded so entry exists");
+            .ok_or_else(|| Error::NotFound(format!("custom package '{name}' not found")))?;
         if let Some(req) = &opts.version
             && req.trim() != entry.version
         {
@@ -318,7 +318,11 @@ impl CustomBackend {
                 name, req
             )));
         }
-        let (_, art) = pick_artifact(entry).expect("plan succeeded");
+        let (_, art) = pick_artifact(entry).ok_or_else(|| {
+            Error::Unsupported(format!(
+                "custom package '{name}' has no artifact for this host"
+            ))
+        })?;
         if opts.dry_run {
             println!(
                 "[dry-run] would install {} {} via {} ({})",

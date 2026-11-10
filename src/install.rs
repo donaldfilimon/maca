@@ -300,6 +300,17 @@ pub fn extract_zip_to_cellar(
     move_into_place(name, &source, &dest)
 }
 
+/// True when a zip entry's raw name is absolute, has a drive prefix, or has a
+/// `..` component. Newer `zip` releases quietly turn a leading `/` into a
+/// relative path instead of refusing it; maca's rule is to refuse.
+pub(crate) fn zip_name_is_unsafe(raw: &str) -> bool {
+    raw.is_empty()
+        || raw.starts_with('/')
+        || raw.starts_with('\\')
+        || raw.as_bytes().get(1) == Some(&b':')
+        || raw.split(['/', '\\']).any(|c| c == "..")
+}
+
 fn unpack_zip(name: &str, bytes: &[u8], dest: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| Error::Other(anyhow::anyhow!("zip for {name}: {e}")))?;
@@ -310,6 +321,12 @@ fn unpack_zip(name: &str, bytes: &[u8], dest: &Path) -> Result<()> {
         let mut file = archive
             .by_index(i)
             .map_err(|e| Error::Other(anyhow::anyhow!("zip for {name}: {e}")))?;
+        let raw = file.name().map(|n| n.into_owned()).unwrap_or_default();
+        if zip_name_is_unsafe(&raw) {
+            return Err(Error::Unsupported(format!(
+                "zip entry {raw:?} in {name} is absolute or escapes the archive"
+            )));
+        }
         let Some(rel) = file.enclosed_name() else {
             return Err(Error::Unsupported(format!(
                 "zip entry in {name} escapes the archive"
@@ -339,7 +356,9 @@ fn unpack_zip(name: &str, bytes: &[u8], dest: &Path) -> Result<()> {
         #[cfg(unix)]
         if let Some(mode) = file.unix_mode() {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode))?;
+            // Permission bits only: a setuid/setgid/sticky bit from an
+            // archive is never honoured.
+            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode & 0o777))?;
         }
     }
     Ok(())
@@ -919,11 +938,20 @@ mod hardening_tests {
         {
             let mut writer = zip::ZipWriter::new(&mut cursor);
             let opts = zip::write::SimpleFileOptions::default();
-            writer.start_file("../evil.txt", opts).unwrap();
+            // The writer sanitizes `..`, so write a stand-in and patch it back.
+            writer.start_file("ZZ/evil.txt", opts).unwrap();
             use std::io::Write;
             writer.write_all(b"nope").unwrap();
             writer.finish().unwrap();
         }
+        let mut raw = cursor.into_inner();
+        let mut at = 0;
+        while let Some(pos) = raw[at..].windows(11).position(|w| w == b"ZZ/evil.txt") {
+            raw[at + pos..at + pos + 11].copy_from_slice(b"../evil.txt");
+            at += pos + 11;
+        }
+        assert!(raw.windows(11).any(|w| w == b"../evil.txt"));
+        let cursor = std::io::Cursor::new(raw);
         let prefix = temp("zip-slip");
         let outside = prefix.join("evil.txt");
         let err = extract_zip_to_cellar(
@@ -935,6 +963,54 @@ mod hardening_tests {
         assert!(err.is_err(), "zip-slip must fail");
         assert!(!outside.exists());
         assert!(!config::cellar_dir(&prefix).join("pkg/1.0.0").exists());
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn zip_names_that_are_absolute_or_climb_are_unsafe() {
+        for bad in [
+            "",
+            "/etc/passwd",
+            "\\evil",
+            "C:/evil",
+            "../evil",
+            "a/../../evil",
+            "a\\..\\evil",
+        ] {
+            assert!(zip_name_is_unsafe(bad), "{bad:?} should be unsafe");
+        }
+        for good in ["a", "a/b.txt", "dir/", "a..b/c", "..hidden/x"] {
+            assert!(!zip_name_is_unsafe(good), "{good:?} should be safe");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_never_honours_setuid_bits() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let opts = zip::write::SimpleFileOptions::default().unix_permissions(0o4755);
+            writer.start_file("pkg/bin/tool", opts).unwrap();
+            use std::io::Write;
+            writer.write_all(b"x").unwrap();
+            writer.finish().unwrap();
+        }
+        let prefix = temp("zip-suid");
+        let dest = extract_zip_to_cellar(
+            "pkg",
+            "1.0.0",
+            &cursor.into_inner(),
+            &config::cellar_dir(&prefix),
+        )
+        .unwrap();
+        let mode = std::fs::metadata(dest.join("bin/tool"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7000, 0, "setuid/setgid/sticky must be dropped");
+        assert_eq!(mode & 0o777, 0o755);
         let _ = std::fs::remove_dir_all(&prefix);
     }
 
