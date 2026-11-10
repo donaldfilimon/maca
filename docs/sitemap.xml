@@ -13,6 +13,12 @@
     <priority>0.3</priority>
   </url>
   <url>
+    <loc>https://donaldfilimon.github.io/maca/#why</loc>
+    <lastmod>2026-11-10</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.8</priority>
+  </url>
+  <url>
     <loc>https://donaldfilimon.github.io/maca/#backends</loc>
     <lastmod>2026-11-10</lastmod>
     <changefreq>monthly</changefreq>

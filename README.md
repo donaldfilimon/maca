@@ -28,6 +28,71 @@ package manager** (or to `gh` or `aqua`) for catalog or install work:
 Install uses the first of custom, brew, then a `owner/repo` or `aqua:` spec,
 then winget. Select a source by name with `--backend github` or `--backend aqua`.
 
+## Why maca
+
+One machine. Several catalogs. One binary. maca installs from Homebrew, winget,
+GitHub Releases, the Aqua registry, and a registry of your own without making
+you install a package manager for each of them first.
+
+|                                             | maca                                 | Homebrew                            | winget         | aqua                    | Nix                                     |
+| ------------------------------------------- | ------------------------------------ | ----------------------------------- | -------------- | ----------------------- | --------------------------------------- |
+| Runs on                                     | macOS and Linux, Windows in progress | macOS (Linux is a separate install) | Windows        | macOS, Linux, Windows   | macOS, Linux                            |
+| Installs without the other tool present     | yes                                  | it is the tool                      | it is the tool | it is the tool          | it is the tool                          |
+| Catalogs from one binary                    | five, and growing                    | one                                 | one            | one                     | one, from source descriptions           |
+| A failed install puts the machine back      | automatic snapshot and rollback      | no                                  | no             | no                      | the store waits for a generation switch |
+| Two installs at once stay consistent        | exclusive prefix lock                | no                                  | no             | no                      | builds are isolated                     |
+| An environment you can hand to someone else | groups, pins, and a lockfile         | `Brewfile`                          | no             | version-pinned registry | fully hermetic                          |
+
+**Five catalogs, zero extra tools.** Homebrew formula JSON, the winget catalog,
+GitHub Releases, the Aqua registry, and a local registry are HTTP APIs maca
+calls itself. Nothing has to be installed first — not `brew`, not `winget`, not
+`gh`, not `aqua`. Each of those tools does one catalog. maca does all five, and
+a sixth is a backend, not a new product.
+
+**Installs that fail undo themselves.** Every mutating command snapshots the
+prefix before it touches anything. If it fails, the kegs, links, and ledger
+entries it created come back out and the previous ones go back in. Homebrew
+keeps old kegs but leaves a failed multi-package install where it stopped.
+winget and aqua install forward and stop. Two maca processes share one exclusive
+prefix lock, so they cannot race the cellar or the ledger.
+
+**Verified before it lands, and nothing of yours gets overwritten.** Every
+artifact that declares a SHA-256 is checked before it is unpacked. On macOS and
+Linux a binary or man page that already belongs to you, or to another package,
+is left alone and reported instead of replaced.
+
+**An environment you can commit.** Groups name a set of packages. Pins hold one
+at the version you installed. `maca.lock.json` records the whole prefix, and
+`maca sync` installs exactly what it names — and rolls back if the version it
+gets is not the one the lock recorded. That is a declared environment today,
+and fetching a specific older artifact (the way Nix and aqua already can) is the
+piece being added on top of it, not a different design.
+
+### On the way
+
+The gaps against the specialists are features in progress, not reasons to pick
+something else.
+
+- **Pinned versions, fetched not just checked.** A lockfile already names a
+  version and refuses a mismatch. Requesting that exact older artifact from the
+  catalog — the Nix and aqua behaviour — is the next step, built on the
+  verification that already exists.
+- **Per-directory versions.** asdf and mise switch language versions per
+  project. maca installs into a prefix today; a directory-scoped prefix on top
+  of the same cellar is the planned shape, so version switching reuses the
+  installs you already have.
+- **The rest of Homebrew.** Bottles and source builds from formula JSON work
+  now. Taps, casks, and services are the remaining Homebrew surface, and each
+  is another catalog call rather than a dependency on Homebrew's Ruby DSL.
+- **Hermetic builds.** Source builds already detect Autotools, CMake, Meson,
+  Make, Cargo, and Python. Sandboxed, reproducible builds in the Nix sense are
+  the longer piece of that same pipeline.
+- **Windows installs, not just Windows plans.** The winget catalog, manifest
+  resolution, checksum verification, and dry-run plans run today. The installer
+  launch path is written and compile-gated to Windows, and is waiting on a
+  Windows host to be exercised — see [Limits](#limits-honest-scope) for exactly
+  what has and has not run.
+
 ## Install
 
 ```sh
