@@ -448,10 +448,8 @@ async fn run(cli: Cli) -> Result<()> {
             all,
             keep_snapshots,
         } => cmd_clean(&ctx, all, keep_snapshots),
-        Commands::Tui => {
-            let _lock = PrefixLock::acquire(&ctx.prefix)?;
-            maca::tui::run(ctx.prefix.clone()).await
-        }
+        // The TUI locks the prefix per action, not for the whole session.
+        Commands::Tui => maca::tui::run(ctx.prefix.clone()).await,
         Commands::SelfUpdate { check, force } => cmd_self_update(check, force).await,
         Commands::Snapshot { action } => cmd_snapshot(&ctx, action),
         Commands::Custom { action } => cmd_custom(&ctx, action),
@@ -563,21 +561,25 @@ async fn cmd_install(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> R
     let _lock = PrefixLock::acquire(&ctx.prefix)?;
     let snapshot = maybe_snapshot(ctx, opts, "before install", &[])?;
     let result = install_many(ctx, packages, opts).await;
-    if let Err(e) = &result {
-        if let Some(s) = &snapshot {
-            match snapshot::restore(&s.id, &ctx.prefix) {
-                Ok(_) => eprintln!(
-                    "maca: install failed ({e}); rolled back to snapshot {}",
-                    s.id
-                ),
-                Err(r) => eprintln!("maca: install failed ({e}); rollback also failed: {r}"),
-            }
+    if let Err(e) = &result
+        && let Some(s) = &snapshot
+    {
+        match snapshot::restore(&s.id, &ctx.prefix) {
+            Ok(_) => eprintln!(
+                "maca: install failed ({e}); rolled back to snapshot {}",
+                s.id
+            ),
+            Err(r) => eprintln!("maca: install failed ({e}); rollback also failed: {r}"),
         }
     }
     match result {
         Ok(upgraded) => {
             if upgraded > 0 {
-                println!("installed {upgraded} package(s)");
+                if opts.dry_run {
+                    println!("[dry-run] would install {upgraded} package(s)");
+                } else {
+                    println!("installed {upgraded} package(s)");
+                }
             }
         }
         Err(e) => return Err(e),
@@ -588,6 +590,12 @@ async fn cmd_install(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> R
 async fn install_many(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> Result<usize> {
     let semaphore = Arc::new(Semaphore::new(ctx.jobs));
     let mut handles = Vec::new();
+    // The same name twice would race itself.
+    let mut seen = std::collections::HashSet::new();
+    let packages: Vec<&String> = packages
+        .iter()
+        .filter(|p| seen.insert(p.to_ascii_lowercase()))
+        .collect();
     for name in packages {
         let ctx_prefix = ctx.prefix.clone();
         let backend = ctx.backend;
@@ -607,15 +615,9 @@ async fn install_many(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> 
                 no_snapshot: true,
                 jobs,
             };
-            match backend {
-                BackendKind::Brew => BrewBackend::new().install(&name, &opts).await,
-                BackendKind::Winget => WingetBackend::new().install(&name, &opts).await,
-                BackendKind::Custom => {
-                    let reg = Registry::load_configured().await?;
-                    CustomBackend::new(reg).install(&name, &opts).await
-                }
-                BackendKind::Auto => backend::install_with_backend("auto", &name, &opts).await,
-            }
+            // One entry point for every install, so its checks (such as
+            // "already installed in another prefix") always run.
+            backend::install_with_backend(backend.as_str(), &name, &opts).await
         }));
     }
     let mut ok = 0usize;
@@ -650,6 +652,9 @@ async fn install_many(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> 
             }
             Err(join) => {
                 eprintln!("error: task panicked: {join}");
+                if first_err.is_none() {
+                    first_err = Some(Error::Other(anyhow::anyhow!("install task failed: {join}")));
+                }
             }
         }
     }
@@ -720,15 +725,15 @@ async fn cmd_upgrade(ctx: &Ctx, only: Vec<String>, no_snapshot: bool) -> Result<
         Some(snapshot::create(&ctx.prefix, "before upgrade", &[])?)
     };
     let result = upgrade_inner(ctx, &only).await;
-    if let Err(e) = &result {
-        if let Some(s) = &snapshot {
-            match snapshot::restore(&s.id, &ctx.prefix) {
-                Ok(_) => eprintln!(
-                    "maca: upgrade failed ({e}); rolled back to snapshot {}",
-                    s.id
-                ),
-                Err(r) => eprintln!("maca: upgrade failed ({e}); rollback also failed: {r}"),
-            }
+    if let Err(e) = &result
+        && let Some(s) = &snapshot
+    {
+        match snapshot::restore(&s.id, &ctx.prefix) {
+            Ok(_) => eprintln!(
+                "maca: upgrade failed ({e}); rolled back to snapshot {}",
+                s.id
+            ),
+            Err(r) => eprintln!("maca: upgrade failed ({e}); rollback also failed: {r}"),
         }
     }
     result
@@ -789,10 +794,9 @@ async fn upgrade_inner(ctx: &Ctx, only: &[String]) -> Result<()> {
                     // is linked and recorded.
                     if out.cellar_path != record.cellar
                         && record.cellar.starts_with(config::cellar_dir(&ctx.prefix))
+                        && let Err(e) = backend::remove_keg(&ctx.prefix, &record.cellar)
                     {
-                        if let Err(e) = backend::remove_keg(&ctx.prefix, &record.cellar) {
-                            eprintln!("warning: could not remove old {}: {e}", record.name);
-                        }
+                        eprintln!("warning: could not remove old {}: {e}", record.name);
                     }
                     upgraded += 1;
                 }
@@ -824,21 +828,8 @@ fn is_newer(candidate: &str, installed: &str) -> bool {
     backend::is_newer_version(candidate, installed)
 }
 
-async fn latest_version(ctx: &Ctx, backend: &str, name: &str) -> Result<Option<String>> {
-    let pkg = match backend {
-        "brew" => BrewBackend::new().info(name).await?,
-        "winget" => WingetBackend::new().info(name).await?,
-        "custom" => {
-            let reg = Registry::load_merged(&ctx.custom_registry_urls).await?;
-            CustomBackend::new(reg).info(name)?
-        }
-        other => {
-            return Err(Error::Unsupported(format!(
-                "unknown backend '{other}' in ledger"
-            )));
-        }
-    };
-    Ok(Some(pkg.version))
+async fn latest_version(_ctx: &Ctx, backend: &str, name: &str) -> Result<Option<String>> {
+    backend::latest_version(backend, name).await.map(Some)
 }
 
 fn cmd_remove(ctx: &Ctx, packages: &[String], no_snapshot: bool) -> Result<()> {
@@ -985,10 +976,11 @@ async fn cmd_doctor(ctx: &Ctx) -> Result<()> {
         if let Ok(entries) = std::fs::read_dir(&bin_dir) {
             for entry in entries.flatten() {
                 let link = entry.path();
-                if let Ok(target) = std::fs::read_link(&link) {
-                    if !target.exists() && !link.exists() {
-                        broken += 1;
-                    }
+                if let Ok(target) = std::fs::read_link(&link)
+                    && !target.exists()
+                    && !link.exists()
+                {
+                    broken += 1;
                 }
             }
         }
@@ -1159,41 +1151,42 @@ fn cmd_clean(ctx: &Ctx, all: bool, keep_snapshots: usize) -> Result<()> {
 
     // 1. Clean brew-index cache if all
     let cache_dir = config::data_dir().join("cache");
-    if cache_dir.exists() && all {
-        if let Ok(entries) = std::fs::read_dir(&cache_dir) {
-            for entry in entries.flatten() {
-                if let Ok(m) = entry.metadata() {
-                    reclaimed += m.len();
-                }
-                let _ = std::fs::remove_file(entry.path());
+    if cache_dir.exists()
+        && all
+        && let Ok(entries) = std::fs::read_dir(&cache_dir)
+    {
+        for entry in entries.flatten() {
+            if let Ok(m) = entry.metadata() {
+                reclaimed += m.len();
             }
-            println!("cleaned catalog cache");
+            let _ = std::fs::remove_file(entry.path());
         }
+        println!("cleaned catalog cache");
     }
 
     // 2. Clean build logs (always; they only matter right after a failure)
     let logs_dir = config::data_dir().join("logs");
-    if logs_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
-            for entry in entries.flatten() {
-                if let Ok(m) = entry.metadata() {
-                    reclaimed += m.len();
-                }
-                let _ = std::fs::remove_file(entry.path());
+    if logs_dir.exists()
+        && let Ok(entries) = std::fs::read_dir(&logs_dir)
+    {
+        for entry in entries.flatten() {
+            if let Ok(m) = entry.metadata() {
+                reclaimed += m.len();
             }
-            println!("cleaned build logs");
+            let _ = std::fs::remove_file(entry.path());
         }
+        println!("cleaned build logs");
     }
 
     // 3. Clean temporary directories in cellar (__tmp, .tmp-*)
     let cellar = config::cellar_dir(&ctx.prefix);
-    if cellar.exists() {
-        if let Ok(entries) = std::fs::read_dir(&cellar) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with("__tmp") || name.starts_with(".tmp-") {
-                    let _ = std::fs::remove_dir_all(entry.path());
-                }
+    if cellar.exists()
+        && let Ok(entries) = std::fs::read_dir(&cellar)
+    {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("__tmp") || name.starts_with(".tmp-") {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
         }
     }
@@ -1219,7 +1212,8 @@ fn cmd_custom(ctx: &Ctx, action: CustomCommands) -> Result<()> {
     // Registry edits are read-modify-write; serialize them with installs.
     let _lock = match action {
         CustomCommands::List => None,
-        _ => Some(PrefixLock::acquire(&ctx.prefix)?),
+        // The registry lives in the shared data dir: other prefixes edit it too.
+        _ => Some((PrefixLock::acquire(&ctx.prefix)?, state::state_lock()?)),
     };
     match action {
         CustomCommands::List => {
@@ -1370,7 +1364,11 @@ async fn cmd_self_update(check: bool, force: bool) -> Result<()> {
 }
 
 fn cmd_snapshot(ctx: &Ctx, action: SnapshotCommands) -> Result<()> {
-    let _lock = PrefixLock::acquire(&ctx.prefix)?;
+    // Listing reads only; everything else changes snapshots or the prefix.
+    let _lock = match action {
+        SnapshotCommands::List => None,
+        _ => Some(PrefixLock::acquire(&ctx.prefix)?),
+    };
     match action {
         SnapshotCommands::Create { note, only } => {
             let m = snapshot::create(&ctx.prefix, &note, &only)?;
@@ -1411,7 +1409,11 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
         | GroupCommands::Delete { .. }
         | GroupCommands::Add { .. }
         | GroupCommands::Remove { .. }
-        | GroupCommands::Export { .. } => Some(PrefixLock::acquire(&ctx.prefix)?),
+        | GroupCommands::Export { .. } => Some((
+            PrefixLock::acquire(&ctx.prefix)?,
+            // Groups live in the shared data dir, so other prefixes edit them too.
+            state::state_lock()?,
+        )),
         _ => None,
     };
     match action {
@@ -1484,8 +1486,10 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
             }
         }
         GroupCommands::Install { name, dry_run } => {
-            let g = Group::load(&name)?;
+            // Read the group only once the lock is held, so an edit made
+            // while this waited is seen.
             let _lock = PrefixLock::acquire(&ctx.prefix)?;
+            let g = Group::load(&name)?;
             let snapshot = if dry_run {
                 None
             } else {
@@ -1567,6 +1571,18 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
             let path = group::lock_path(&ctx.prefix);
             maca::install::atomic_write(&path, serde_json::to_string_pretty(&lock)?.as_bytes())?;
             println!("exported group '{name}' to {}", path.display());
+            let unpinned: Vec<&str> = lock
+                .packages
+                .iter()
+                .filter(|p| p.version == "latest")
+                .map(|p| p.name.as_str())
+                .collect();
+            if !unpinned.is_empty() {
+                eprintln!(
+                    "maca: note: {} have no version in the group and are exported as \"latest\", so `sync` accepts any version of them; `maca lock` records exact installed versions",
+                    unpinned.join(", ")
+                );
+            }
         }
     }
     Ok(())
@@ -1617,17 +1633,29 @@ async fn cmd_sync(ctx: &Ctx, dry_run: bool, prune: bool) -> Result<()> {
 
 async fn sync_inner(ctx: &Ctx, lock: &group::Lockfile, dry_run: bool, prune: bool) -> Result<()> {
     let ledger = state::Ledger::load()?;
+    // The ledger is shared by every prefix; sync only ever looks at, and
+    // prunes, packages installed in this one.
+    let cellar_root = config::cellar_dir(&ctx.prefix);
+    let here: Vec<&state::Record> = ledger
+        .packages
+        .iter()
+        .filter(|r| config::path_under(&r.cellar, &cellar_root))
+        .collect();
+    let installed_here = |name: &str| {
+        here.iter()
+            .find(|r| r.name.eq_ignore_ascii_case(name) && r.cellar.exists())
+    };
     let semaphore = Arc::new(Semaphore::new(ctx.jobs));
     let mut handles = Vec::new();
     let mut ok = 0;
     let mut failed = 0;
     for entry in &lock.packages {
-        // Already at the locked version: nothing to do.
-        if ledger
-            .get(&entry.name)
-            .is_some_and(|r| r.version == entry.version && r.cellar.exists())
+        // Already installed at the locked version (any version, for a
+        // "latest" entry): nothing to do.
+        if let Some(r) = installed_here(&entry.name)
+            && (entry.version == "latest" || r.version == entry.version)
         {
-            println!("{} {} (already installed)", entry.name, entry.version);
+            println!("{} {} (already installed)", r.name, r.version);
             ok += 1;
             continue;
         }
@@ -1652,7 +1680,12 @@ async fn sync_inner(ctx: &Ctx, lock: &group::Lockfile, dry_run: bool, prune: boo
     for handle in handles {
         match handle.await {
             Ok(Ok(out)) => {
-                println!("{} {} ({})", out.name, out.version, out.backend);
+                let verb = if dry_run {
+                    "[dry-run] would install"
+                } else {
+                    "installed"
+                };
+                println!("{verb} {} {} ({})", out.name, out.version, out.backend);
                 ok += 1;
             }
             Ok(Err(e)) => {
@@ -1667,14 +1700,36 @@ async fn sync_inner(ctx: &Ctx, lock: &group::Lockfile, dry_run: bool, prune: boo
     }
 
     // Prune last, and only once everything the lock asks for is in place.
+    // A package stays if the lock names it or a locked package needs it
+    // (directly or through other dependencies), so pruning never breaks a
+    // locked package by removing a library under it.
     if prune && failed == 0 {
-        let lock_names: std::collections::HashSet<String> = lock
+        let ledger = state::Ledger::load()?; // includes what was just installed
+        let mut keep: std::collections::HashSet<String> = lock
             .packages
             .iter()
             .map(|p| p.name.to_ascii_lowercase())
             .collect();
-        for pkg in &ledger.packages {
-            if lock_names.contains(&pkg.name.to_ascii_lowercase()) {
+        let mut queue: Vec<String> = keep.iter().cloned().collect();
+        while let Some(name) = queue.pop() {
+            if let Some(r) = ledger
+                .packages
+                .iter()
+                .find(|r| r.name.eq_ignore_ascii_case(&name))
+            {
+                for dep in &r.depends_on {
+                    if keep.insert(dep.to_ascii_lowercase()) {
+                        queue.push(dep.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        for pkg in ledger
+            .packages
+            .iter()
+            .filter(|r| config::path_under(&r.cellar, &cellar_root))
+        {
+            if keep.contains(&pkg.name.to_ascii_lowercase()) {
                 continue;
             }
             if dry_run {
@@ -1688,7 +1743,12 @@ async fn sync_inner(ctx: &Ctx, lock: &group::Lockfile, dry_run: bool, prune: boo
             }
         }
     }
-    println!("sync complete: {ok} ok, {failed} failed");
+    let label = if dry_run {
+        "sync dry run complete"
+    } else {
+        "sync complete"
+    };
+    println!("{label}: {ok} ok, {failed} failed");
     if failed > 0 {
         return Err(Error::Other(anyhow::anyhow!(
             "sync failed for {failed} package(s)"
@@ -1720,6 +1780,7 @@ async fn cmd_kind(ctx: &Ctx, action: KindCommands, kind: Kind) -> Result<()> {
 
 fn cmd_pin(ctx: &Ctx, package: String, version: Option<String>) -> Result<()> {
     let _lock = PrefixLock::acquire(&ctx.prefix)?;
+    let _state = state::state_lock()?; // pins.json is shared by every prefix
     let ledger = state::Ledger::load()?;
     let record = ledger
         .get(&package)
@@ -1727,13 +1788,13 @@ fn cmd_pin(ctx: &Ctx, package: String, version: Option<String>) -> Result<()> {
         .ok_or_else(|| Error::NotFound(format!("package '{package}' is not installed")))?;
     // A pin holds the installed version. Pinning to some other version would
     // promise something `upgrade` cannot deliver.
-    if let Some(v) = &version {
-        if v != &record.version {
-            return Err(Error::Unsupported(format!(
-                "{} is installed at {}; a pin holds the installed version, so it cannot be pinned to {v}",
-                record.name, record.version
-            )));
-        }
+    if let Some(v) = &version
+        && v != &record.version
+    {
+        return Err(Error::Unsupported(format!(
+            "{} is installed at {}; a pin holds the installed version, so it cannot be pinned to {v}",
+            record.name, record.version
+        )));
     }
     let mut pins = state::load_pins()?;
     pins.insert(record.name.clone(), record.version.clone());
@@ -1744,6 +1805,7 @@ fn cmd_pin(ctx: &Ctx, package: String, version: Option<String>) -> Result<()> {
 
 fn cmd_unpin(ctx: &Ctx, package: String) -> Result<()> {
     let _lock = PrefixLock::acquire(&ctx.prefix)?;
+    let _state = state::state_lock()?; // pins.json is shared by every prefix
     let mut pins = state::load_pins()?;
     let key = pins
         .keys()

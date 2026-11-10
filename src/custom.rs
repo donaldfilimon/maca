@@ -176,10 +176,10 @@ pub fn pick_artifact(entry: &Entry) -> Option<(String, &Artifact)> {
             "x64" | "x86_64" => Some("darwin-x86_64"),
             _ => None,
         };
-        if let Some(alias) = alias {
-            if let Some(a) = entry.artifacts.get(alias) {
-                return Some((alias.to_string(), a));
-            }
+        if let Some(alias) = alias
+            && let Some(a) = entry.artifacts.get(alias)
+        {
+            return Some((alias.to_string(), a));
         }
     }
     // x64/x86_64 spelling interop.
@@ -352,16 +352,21 @@ impl CustomBackend {
                     }
                 };
             let cellar = cellar_for(&opts.prefix, &plan.name, &plan.version);
+            // A same-version reinstall builds over the live keg; a failure
+            // then must not delete what was already installed.
+            let keg_existed = cellar.exists();
             let built =
                 match source::run_steps(&source_dir, &cellar, &entry.build_steps, opts.jobs.max(1))
                 {
                     Ok(b) => b,
                     Err(e) => {
                         // Steps install straight into the keg; a failed build
-                        // must not leave a partial one that looks installed.
-                        let _ = std::fs::remove_dir_all(&cellar);
-                        if let Some(name_dir) = cellar.parent() {
-                            let _ = std::fs::remove_dir(name_dir);
+                        // must not leave a partial new one that looks installed.
+                        if !keg_existed {
+                            let _ = std::fs::remove_dir_all(&cellar);
+                            if let Some(name_dir) = cellar.parent() {
+                                let _ = std::fs::remove_dir(name_dir);
+                            }
                         }
                         let _ = std::fs::remove_dir_all(&scratch);
                         return Err(e);

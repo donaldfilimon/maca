@@ -83,6 +83,71 @@ struct BottleFile {
     sha256: String,
 }
 
+/// Runtime dependencies maca manages for `formula` (those the OS does not
+/// provide).
+fn runtime_deps(formula: &Formula) -> Vec<String> {
+    formula
+        .dependencies
+        .iter()
+        .filter(|dep| {
+            !formula.uses_from_macos.iter().any(|u| {
+                u.as_str()
+                    .map(|s| s.eq_ignore_ascii_case(dep))
+                    .unwrap_or(false)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Everything after a keg exists on disk: the `opt/` link, Mach-O
+/// relocation, `bin/` and `share/` links, and the ledger record.
+fn finish_keg(
+    name: &str,
+    version: &str,
+    keg: &std::path::Path,
+    executables: &[String],
+    depends_on: Vec<String>,
+    opts: &InstallOptions,
+) -> Result<Vec<std::path::PathBuf>> {
+    // Homebrew exposes each keg at `<prefix>/opt/<name>`; bottles reference
+    // deps through that path, so create the same symlink.
+    install::link_opt(name, version, keg, &opts.prefix)?;
+    // Substitute @@HOMEBREW_CELLAR@@ / @@HOMEBREW_PREFIX@@ in Mach-O files.
+    let rewritten = mach_o::rewrite_placeholders(keg, &opts.prefix)?;
+    if rewritten > 0 {
+        tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
+    }
+    let linked = install::link_bins(keg, executables, &opts.prefix)?;
+    let _ = install::link_share(keg, &opts.prefix);
+    let mut record = state::record_with_kind(name, version, "brew", keg.to_path_buf(), opts.kind);
+    record.depends_on = depends_on;
+    state::upsert_record(record)?;
+    Ok(linked)
+}
+
+/// Undo a keg whose install failed after it reached the cellar: remove it
+/// (and links into it) unless it was there before, and point `opt/` and the
+/// `bin/`/`share/` links back at the version the ledger still records, so an
+/// upgrade that fails leaves the old version working.
+fn unwind_failed_keg(prefix: &std::path::Path, name: &str, keg: &std::path::Path, existed: bool) {
+    if !existed {
+        let _ = crate::backend::remove_keg(prefix, keg);
+        if let Some(name_dir) = keg.parent() {
+            let _ = std::fs::remove_dir(name_dir); // only if now empty
+        }
+    }
+    let previous = state::Ledger::load()
+        .ok()
+        .and_then(|l| l.get(name).cloned())
+        .filter(|r| r.cellar != keg && r.cellar.is_dir());
+    if let Some(prev) = previous {
+        let _ = install::link_opt(&prev.name, &prev.version, &prev.cellar, prefix);
+        let _ = install::link_bins(&prev.cellar, &[], prefix);
+        let _ = install::link_share(&prev.cellar, prefix);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BrewBackend;
 
@@ -99,11 +164,9 @@ impl BrewBackend {
             .and_then(|t| t.elapsed().ok())
             .map(|age| age.as_secs() < INDEX_TTL_SECS)
             .unwrap_or(false);
-        if fresh {
-            if let Ok(bytes) = std::fs::read(&cache) {
-                tracing::debug!("brew index cache hit");
-                return Ok(bytes);
-            }
+        if fresh && let Ok(bytes) = std::fs::read(&cache) {
+            tracing::debug!("brew index cache hit");
+            return Ok(bytes);
         }
         let bytes = install::download(FORMULA_INDEX).await?;
         if let Some(parent) = cache.parent() {
@@ -351,12 +414,7 @@ impl BrewBackend {
         let linked = match result {
             Ok(linked) => linked,
             Err(e) => {
-                if !dest_existed {
-                    let _ = std::fs::remove_dir_all(&dest);
-                    if let Some(name_dir) = dest.parent() {
-                        let _ = std::fs::remove_dir(name_dir);
-                    }
-                }
+                unwind_failed_keg(&opts.prefix, &formula.name, &dest, dest_existed);
                 return Err(e);
             }
         };
@@ -392,21 +450,14 @@ impl BrewBackend {
         let version = &formula.versions.stable;
         let built = source::build(system, &source_dir, dest, opts.jobs.max(1))?;
         tracing::info!("{} built via {}", formula.name, built.build_system);
-        install::link_opt(&formula.name, version, dest, &opts.prefix)?;
-        let rewritten = mach_o::rewrite_placeholders(dest, &opts.prefix)?;
-        if rewritten > 0 {
-            tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
-        }
-        let linked = install::link_bins(dest, &formula.executables, &opts.prefix)?;
-        let _ = install::link_share(dest, &opts.prefix);
-        state::upsert_record(state::record_with_kind(
+        finish_keg(
             &formula.name,
             version,
-            "brew",
-            dest.to_path_buf(),
-            opts.kind,
-        ))?;
-        Ok(linked)
+            dest,
+            &formula.executables,
+            runtime_deps(formula),
+            opts,
+        )
     }
 
     fn has_bottle_for_host(&self, formula: &Formula) -> bool {
@@ -451,7 +502,16 @@ impl BrewBackend {
                 // Provided by the OS; not a maca-managed dependency.
                 continue;
             }
-            if ledger.get(dep).is_some() {
+            if let Some(r) = ledger.get(dep) {
+                // A dependency recorded for another prefix is not usable here.
+                if r.cellar.exists()
+                    && !crate::config::path_under(
+                        &r.cellar,
+                        &crate::config::cellar_dir(&opts.prefix),
+                    )
+                {
+                    return Err(state::elsewhere_error(dep, r));
+                }
                 continue;
             }
             tracing::info!("installing dependency {dep} for {normalized}");
@@ -497,32 +557,23 @@ impl BrewBackend {
         let dest = crate::config::cellar_dir(&opts.prefix)
             .join(&plan.name)
             .join(&plan.version);
-        let cellar = match install::extract_bottle(&plan.name, &plan.version, &bytes, &opts.prefix)
-        {
-            Ok(c) => c,
+        let keg_existed = dest.exists();
+        // Extraction is staged, so a failure here leaves nothing at `dest`.
+        let cellar = install::extract_bottle(&plan.name, &plan.version, &bytes, &opts.prefix)?;
+        let linked = match finish_keg(
+            &plan.name,
+            &plan.version,
+            &cellar,
+            &executables,
+            runtime_deps(&formula),
+            opts,
+        ) {
+            Ok(linked) => linked,
             Err(e) => {
-                // Extraction is staged, so a failure leaves nothing at `dest`.
-                let _ = &dest;
+                unwind_failed_keg(&opts.prefix, &plan.name, &cellar, keg_existed);
                 return Err(e);
             }
         };
-        // Homebrew exposes each keg at `<prefix>/opt/<name>`; bottles reference
-        // deps through that path, so create the same symlink.
-        install::link_opt(&plan.name, &plan.version, &cellar, &opts.prefix)?;
-        // Substitute @@HOMEBREW_CELLAR@@ / @@HOMEBREW_PREFIX@@ in Mach-O files.
-        let rewritten = mach_o::rewrite_placeholders(&cellar, &opts.prefix)?;
-        if rewritten > 0 {
-            tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
-        }
-        let linked = install::link_bins(&cellar, &executables, &opts.prefix)?;
-        let _ = install::link_share(&cellar, &opts.prefix);
-        state::upsert_record(state::record_with_kind(
-            &plan.name,
-            &plan.version,
-            "brew",
-            cellar.clone(),
-            opts.kind,
-        ))?;
         Ok(InstallOutcome {
             name: plan.name,
             version: plan.version,

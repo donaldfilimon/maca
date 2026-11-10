@@ -24,6 +24,11 @@ pub struct Record {
     /// How the package is used: app, plugin, cli, library, other.
     #[serde(default = "default_kind")]
     pub kind: crate::group::Kind,
+    /// Names of the maca-managed packages this one needs at run time
+    /// (Homebrew `dependencies`). `sync --prune` keeps them installed while
+    /// a locked package needs them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
 }
 
 fn default_kind() -> crate::group::Kind {
@@ -113,6 +118,7 @@ pub fn record(name: &str, version: &str, backend: &str, cellar: PathBuf) -> Reco
         cellar,
         installed_at: now_rfc3339(),
         kind: crate::group::Kind::App,
+        depends_on: Vec::new(),
     }
 }
 
@@ -122,27 +128,77 @@ pub fn record(name: &str, version: &str, backend: &str, cellar: PathBuf) -> Reco
 /// per-prefix lock alone does not serialize two maca processes that use
 /// different prefixes.
 pub fn with_ledger_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
-    let _guard = LEDGER_LOCK
-        .lock()
-        .map_err(|_| crate::Error::Other(anyhow::anyhow!("ledger lock poisoned")))?;
-    let dir = config::data_dir();
-    std::fs::create_dir_all(&dir)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(dir.join(".ledger.lock"))?;
-    let mut lock = fd_lock::RwLock::new(file);
-    let _write = lock
-        .write()
-        .map_err(|e| crate::Error::Other(anyhow::anyhow!("ledger lock: {e}")))?;
+    let _guard = DataLock::acquire(&LEDGER_LOCK, ".ledger.lock")?;
     f()
+}
+
+/// Lock for a load-modify-save of the other data-dir files shared by every
+/// prefix: `pins.json`, `groups/` and `custom-registry.json`. Lock order is
+/// prefix lock, then state lock, then ledger lock; never the reverse.
+pub fn state_lock() -> Result<DataLock> {
+    DataLock::acquire(&STATE_LOCK, ".state.lock")
+}
+
+/// A data-dir lock: an in-process mutex (orders threads) plus an OS file lock
+/// (orders processes). Released on drop. Neither part is re-entrant.
+pub struct DataLock {
+    _file: std::fs::File,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl DataLock {
+    fn acquire(mutex: &'static std::sync::Mutex<()>, file_name: &str) -> Result<Self> {
+        let guard = mutex
+            .lock()
+            .map_err(|_| crate::Error::Other(anyhow::anyhow!("{file_name} lock poisoned")))?;
+        let dir = config::data_dir();
+        std::fs::create_dir_all(&dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(file_name))?;
+        file.lock()?;
+        Ok(Self {
+            _file: file,
+            _guard: guard,
+        })
+    }
+}
+
+/// The ledger holds one record per package name for the whole data dir, so
+/// a package can be installed in only one prefix per `MACA_HOME`. Returns the
+/// existing record when `name` is installed in a prefix other than the one
+/// whose cellar is `cellar_root`.
+pub fn installed_elsewhere(name: &str, cellar_root: &std::path::Path) -> Result<Option<Record>> {
+    Ok(Ledger::load()?
+        .get(name)
+        .filter(|r| r.cellar.exists() && !config::path_under(&r.cellar, cellar_root))
+        .cloned())
+}
+
+pub fn elsewhere_error(name: &str, existing: &Record) -> crate::Error {
+    crate::Error::Unsupported(format!(
+        "{name} is already installed in another prefix ({}); a data dir records one install per package, so use a separate MACA_HOME for a second prefix",
+        existing.cellar.display()
+    ))
 }
 
 pub fn upsert_record(rec: Record) -> Result<()> {
     with_ledger_lock(|| {
         let mut ledger = Ledger::load()?;
+        // Backstop for every install path: never overwrite a record that
+        // belongs to a keg in another prefix (that would orphan it).
+        if let Some(existing) = ledger.get(&rec.name) {
+            let root_of =
+                |p: &std::path::Path| p.parent().and_then(|n| n.parent()).map(PathBuf::from);
+            if existing.cellar.exists()
+                && root_of(&existing.cellar).is_some_and(|r| !config::path_under(&rec.cellar, &r))
+            {
+                return Err(elsewhere_error(&rec.name, existing));
+            }
+        }
         ledger.upsert(rec);
         ledger.save()
     })
@@ -183,6 +239,7 @@ pub fn is_pinned(name: &str) -> Result<bool> {
 }
 
 static LEDGER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn record_with_kind(
     name: &str,

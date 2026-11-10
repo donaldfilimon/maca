@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Cross-platform package manager for macOS and Linux with native Homebrew and winget catalog APIs plus a custom registry backend"
 license = "MIT"
-rust-version = "1.85"
+rust-version = "1.89"
 homepage = "https://github.com/donaldfilimon/maca"
 repository = "https://github.com/donaldfilimon/maca"
 
@@ -14,7 +14,6 @@ clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 crossterm = "0.28"
 directories = "6"
-fd-lock = "4"
 flate2 = { version = "1", features = ["rust_backend"] }
 hex = "0.4"
 ratatui = "0.29"

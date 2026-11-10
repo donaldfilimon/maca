@@ -114,37 +114,120 @@ pub fn is_newer_version(candidate: &str, installed: &str) -> bool {
     compare_loose(c, i) == Some(std::cmp::Ordering::Greater)
 }
 
+#[derive(Debug, PartialEq)]
+enum Tok {
+    Num(u64),
+    /// A letter run. `pre` when it follows `-` or `~` (`1.0-rc1`): a
+    /// pre-release tag, which sorts before the bare version. Otherwise a
+    /// post-release suffix attached to a number (`3.5a`, `9.6p1`).
+    Word {
+        text: String,
+        pre: bool,
+    },
+}
+
+fn tokens(s: &str) -> Vec<Tok> {
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    let mut last_sep = '.';
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() {
+            let mut n = String::new();
+            while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                n.push(d);
+                chars.next();
+            }
+            out.push(Tok::Num(n.parse().unwrap_or(u64::MAX)));
+            last_sep = '\0';
+        } else if c.is_alphabetic() {
+            let mut w = String::new();
+            while let Some(&d) = chars.peek().filter(|d| d.is_alphabetic()) {
+                w.push(d.to_ascii_lowercase());
+                chars.next();
+            }
+            out.push(Tok::Word {
+                text: w,
+                pre: matches!(last_sep, '-' | '~'),
+            });
+            last_sep = '\0';
+        } else {
+            last_sep = c;
+            chars.next();
+        }
+    }
+    out
+}
+
 fn compare_loose(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     use std::cmp::Ordering;
-    let split = |s: &str| -> (Vec<String>, u64) {
-        let (main, rev) = match s.rsplit_once('_') {
+    let split_rev = |s: &str| -> (String, u64) {
+        match s.rsplit_once('_') {
             Some((m, r)) if !r.is_empty() && r.bytes().all(|c| c.is_ascii_digit()) => {
                 (m.to_string(), r.parse().unwrap_or(0))
             }
             _ => (s.to_string(), 0),
-        };
-        let parts = main
-            .split(['.', '-', '+'])
-            .filter(|p| !p.is_empty())
-            .map(String::from)
-            .collect();
-        (parts, rev)
+        }
     };
-    let (pa, ra) = split(a);
-    let (pb, rb) = split(b);
-    for idx in 0..pa.len().max(pb.len()) {
-        let x = pa.get(idx).map(String::as_str).unwrap_or("0");
-        let y = pb.get(idx).map(String::as_str).unwrap_or("0");
-        let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
-            (Ok(x), Ok(y)) => x.cmp(&y),
-            (Err(_), Err(_)) => x.cmp(y),
-            _ => return None, // number vs word: no reliable order
+    let (ma, ra) = split_rev(a);
+    let (mb, rb) = split_rev(b);
+    let (ta, tb) = (tokens(&ma), tokens(&mb));
+    for i in 0..ta.len().max(tb.len()) {
+        let ord = match (ta.get(i), tb.get(i)) {
+            (Some(Tok::Num(x)), Some(Tok::Num(y))) => x.cmp(y),
+            (Some(Tok::Word { text: x, pre: px }), Some(Tok::Word { text: y, pre: py })) => {
+                // A pre-release tag sorts below a post-release suffix.
+                py.cmp(px).then_with(|| x.cmp(y))
+            }
+            // A missing number counts as 0, so 1.0 == 1.0.0.
+            (Some(Tok::Num(x)), None) => x.cmp(&0),
+            (None, Some(Tok::Num(y))) => 0.cmp(y),
+            // Running out against a word: a pre-release tag is older
+            // (1.0-rc1 < 1.0), a suffix is newer (3.5 < 3.5a).
+            (None, Some(Tok::Word { pre, .. })) => {
+                if *pre {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (Some(Tok::Word { pre, .. }), None) => {
+                if *pre {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            // A number against a pre-release tag: the number is a later
+            // release (1.0.1 > 1.0-rc1). Against a suffix: no reliable order.
+            (Some(Tok::Num(_)), Some(Tok::Word { pre: true, .. })) => Ordering::Greater,
+            (Some(Tok::Word { pre: true, .. }), Some(Tok::Num(_))) => Ordering::Less,
+            _ => return None,
         };
         if ord != Ordering::Equal {
             return Some(ord);
         }
     }
     Some(ra.cmp(&rb))
+}
+
+/// The version the package's catalog offers now. Custom-registry mirrors
+/// are required here (no silent fallback to the local registry), so an
+/// unreachable mirror cannot make an older local entry look current.
+pub async fn latest_version(backend: &str, name: &str) -> Result<String> {
+    let pkg = match backend {
+        "brew" => brew::BrewBackend::new().info(name).await?,
+        "winget" => winget::WingetBackend::new().info(name).await?,
+        "custom" => {
+            let urls = config::Config::load()?.custom_registry_urls;
+            CustomBackend::new(custom::Registry::load_merged(&urls).await?).info(name)?
+        }
+        other => {
+            return Err(crate::Error::Unsupported(format!(
+                "unknown backend '{other}' in ledger"
+            )));
+        }
+    };
+    Ok(pkg.version)
 }
 
 /// Resolve which concrete backend handles a request.
@@ -207,6 +290,9 @@ pub async fn install_with_backend(
     name: &str,
     opts: &InstallOptions,
 ) -> Result<InstallOutcome> {
+    if let Some(existing) = state::installed_elsewhere(name, &config::cellar_dir(&opts.prefix))? {
+        return Err(state::elsewhere_error(name, &existing));
+    }
     let kind = BackendKind::from_str_lossy(backend);
     match kind {
         BackendKind::Brew => brew::BrewBackend::new().install(name, opts).await,
@@ -257,13 +343,36 @@ pub fn remove_with_prefix(prefix: &std::path::Path, name: &str) -> Result<()> {
 /// Delete one keg directory together with the share and bin links that point
 /// into it. Links that point anywhere else are left alone.
 pub fn remove_keg(prefix: &std::path::Path, keg: &std::path::Path) -> Result<()> {
+    // Never delete outside this prefix's cellar, whatever a ledger record or
+    // a caller says.
+    if !config::path_under(keg, &config::cellar_dir(prefix)) {
+        return Err(crate::Error::Unsupported(format!(
+            "{} is not inside {}; refusing to remove it",
+            keg.display(),
+            config::cellar_dir(prefix).display()
+        )));
+    }
     let _ = install::unlink_share(keg, prefix);
     let bin_dir = config::bin_dir(prefix);
+    #[cfg(not(windows))]
     if bin_dir.exists() {
         for entry in std::fs::read_dir(&bin_dir)?.flatten() {
             let link = entry.path();
             if read_link_target(&link).is_ok_and(|t| t.starts_with(keg)) {
                 let _ = std::fs::remove_file(&link);
+            }
+        }
+    }
+    // Windows bin entries are copies: remove those still identical to the
+    // keg's executables.
+    #[cfg(windows)]
+    for sub in ["bin", "sbin"] {
+        if let Ok(entries) = std::fs::read_dir(keg.join(sub)) {
+            for entry in entries.flatten() {
+                let copy = bin_dir.join(entry.file_name());
+                if install::is_copy_of(&copy, &entry.path()) {
+                    let _ = std::fs::remove_file(&copy);
+                }
             }
         }
     }
@@ -273,16 +382,9 @@ pub fn remove_keg(prefix: &std::path::Path, keg: &std::path::Path) -> Result<()>
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn read_link_target(link: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
-    #[cfg(windows)]
-    {
-        let _ = link;
-        Err(std::io::Error::other("not a symlink on windows"))
-    }
-    #[cfg(not(windows))]
-    {
-        std::fs::read_link(link)
-    }
+    std::fs::read_link(link)
 }
 
 /// Upgrade a single installed package. Returns a human-readable outcome.
@@ -298,6 +400,10 @@ pub async fn upgrade_with_prefix(prefix: &std::path::Path, name: &str) -> Result
             record.name, record.version
         ));
     }
+    let latest = latest_version(&record.backend, &record.name).await?;
+    if !is_newer_version(&latest, &record.version) {
+        return Ok(format!("{} {} is up to date", record.name, record.version));
+    }
     let opts = InstallOptions {
         dry_run: false,
         prefix: prefix.to_path_buf(),
@@ -306,8 +412,11 @@ pub async fn upgrade_with_prefix(prefix: &std::path::Path, name: &str) -> Result
     };
     let outcome = install_with_backend(&record.backend, &record.name, &opts).await?;
     // The new keg, its links and its ledger record are in place; reclaim the
-    // previous version's keg unless this was a same-version reinstall.
-    if outcome.cellar_path != record.cellar && record.cellar.starts_with(config::cellar_dir(prefix))
+    // previous version's keg, but only if what got installed really is
+    // newer (the catalog can change between the check and the install).
+    if outcome.cellar_path != record.cellar
+        && is_newer_version(&outcome.version, &record.version)
+        && config::path_under(&record.cellar, &config::cellar_dir(prefix))
     {
         remove_keg(prefix, &record.cellar)?;
     }
@@ -332,6 +441,21 @@ mod tests {
         assert_eq!(BackendKind::from_str_lossy("WINGET"), BackendKind::Winget);
         assert_eq!(BackendKind::from_str_lossy(""), BackendKind::Auto);
         assert_eq!(BackendKind::Brew.as_str(), "brew");
+    }
+
+    #[test]
+    fn version_ordering_handles_suffixes_and_prereleases() {
+        assert!(is_newer_version("3.6", "3.5a"));
+        assert!(is_newer_version("3.5a", "3.5"));
+        assert!(!is_newer_version("3.5", "3.5a"));
+        assert!(is_newer_version("9.7p1", "9.6p1"));
+        assert!(is_newer_version("9.6p2", "9.6p1"));
+        assert!(is_newer_version("1.1.1w", "1.1.1v"));
+        assert!(is_newer_version("1.2.10a", "1.2.9a"));
+        assert!(is_newer_version("1.0", "1.0-rc1"));
+        assert!(!is_newer_version("1.0-rc1", "1.0"));
+        assert!(is_newer_version("1.0.1", "1.0-rc1"));
+        assert!(is_newer_version("2.0-beta2", "2.0-beta1"));
     }
 
     #[test]

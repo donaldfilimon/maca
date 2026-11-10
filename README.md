@@ -92,8 +92,11 @@ maca custom remove hello
   always do. A custom registry entry without `sha256` is installed with a
   loud warning; the hash guards against a corrupted or swapped download, not
   against a registry you should not trust.
-- **Nothing foreign is overwritten**: a `bin/` or `share/` entry that belongs
-  to another package or is a file of your own is left in place and reported.
+- **Nothing foreign is overwritten** (macOS and Linux): a `bin/` or `share/`
+  entry that belongs to another package or is a file of your own is left in
+  place and reported. On Windows these entries are copies, which carry no
+  owner, so an existing one is replaced; uninstall removes only copies that
+  are still identical to the package's files.
 - **Staged extraction and atomic state writes**: a keg appears at its final
   path only after a complete unpack, and the ledger, pins, lockfile and
   snapshot manifests are written through a temp file and a rename.
@@ -169,7 +172,9 @@ expands to the install destination.
 | Groups | `g` install group |
 | Snapshots | `z` restore |
 
-`q` or `Ctrl-C` quits. `1`–`4` switch tabs.
+`q` or `Ctrl-C` quits. `1`–`4` switch tabs. Each action locks the prefix
+only while it runs, so other `maca` commands work while the TUI is open; if
+one is running, the action reports "prefix busy" instead of waiting.
 
 ## Self-update
 
@@ -197,9 +202,15 @@ triple such as `aarch64-apple-darwin`.
   clear message and a log path.
 - **Homebrew dependency resolution** follows the formula `dependencies` list;
   `uses_from_macos` entries are treated as system-provided.
-- **Snapshots cover every installed package.** On APFS they are copy-on-write
-  clones (`cp -c`), so they take no extra space until files change; elsewhere
-  they are full recursive copies, so a snapshot of a large prefix is not free.
+- **Snapshots cover the packages installed in their prefix** (or only the
+  `--only` ones), and restoring one changes nothing outside that scope. On
+  APFS they are copy-on-write clones (`cp -c`), so they take no extra space
+  until files change; elsewhere they are full recursive copies, so a snapshot
+  of a large prefix is not free.
+- **One install per package per data dir.** Several prefixes can share one
+  `MACA_HOME`, but a package can be installed in only one of them; installing
+  it into a second prefix is refused. Use a separate `MACA_HOME` per prefix
+  for fully independent installs.
 - **Version pinning is verify-only.** A lockfile or group version is checked
   after install, not requested from the catalog.
 - **`scripts/package-release.sh` packages the host build only.** Pushing a

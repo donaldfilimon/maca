@@ -274,48 +274,45 @@ impl WingetBackend {
         }
         // Prefer an exact match from the search API (rich metadata).
         let search_url = format!("{}/{}", WINGET_API, urlencoding_lite(id));
-        if let Ok(data) = install::download(&search_url).await {
-            if let Ok(env) = serde_json::from_slice::<ApiEnvelope>(&data) {
-                if let Some(exact) = env
-                    .packages
-                    .iter()
-                    .find(|p| p.id.eq_ignore_ascii_case(id))
+        if let Ok(data) = install::download(&search_url).await
+            && let Ok(env) = serde_json::from_slice::<ApiEnvelope>(&data)
+            && let Some(exact) = env
+                .packages
+                .iter()
+                .find(|p| p.id.eq_ignore_ascii_case(id))
+                .cloned()
+        {
+            let latest = exact.latest.unwrap_or(Latest {
+                name: exact.id.clone(),
+                publisher: String::new(),
+                description: String::new(),
+                homepage: String::new(),
+                tags: vec![],
+                license: String::new(),
+            });
+            return Ok(Package {
+                name: exact.id,
+                version: exact
+                    .versions
+                    .first()
                     .cloned()
-                {
-                    let latest = exact.latest.unwrap_or(Latest {
-                        name: exact.id.clone(),
-                        publisher: String::new(),
-                        description: String::new(),
-                        homepage: String::new(),
-                        tags: vec![],
-                        license: String::new(),
-                    });
-                    return Ok(Package {
-                        name: exact.id,
-                        version: exact
-                            .versions
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "unknown".into()),
-                        description: latest.description,
-                        homepage: latest.homepage,
-                        backend: "winget".into(),
-                        tags: latest.tags,
-                    });
-                }
-            }
+                    .unwrap_or_else(|| "unknown".into()),
+                description: latest.description,
+                homepage: latest.homepage,
+                backend: "winget".into(),
+                tags: latest.tags,
+            });
         }
         // Fall back to winget-pkgs + locale manifest.
         let (resolved_id, version) = Self::resolve_exact(id).await?;
         let mut description = String::new();
         let mut homepage = String::new();
-        if let Some(url) = Self::locale_url(&resolved_id, &version) {
-            if let Ok(bytes) = install::download(&url).await {
-                if let Ok(locale) = serde_yaml::from_slice::<LocaleManifest>(&bytes) {
-                    description = locale.description.unwrap_or_default();
-                    homepage = locale.homepage.unwrap_or_default();
-                }
-            }
+        if let Some(url) = Self::locale_url(&resolved_id, &version)
+            && let Ok(bytes) = install::download(&url).await
+            && let Ok(locale) = serde_yaml::from_slice::<LocaleManifest>(&bytes)
+        {
+            description = locale.description.unwrap_or_default();
+            homepage = locale.homepage.unwrap_or_default();
         }
         Ok(Package {
             name: resolved_id,

@@ -81,64 +81,61 @@ fn cellar_canonical(prefix: &Path) -> PathBuf {
 fn rewrite_one(path: &Path, prefix: &Path, cellar_dir: &Path) -> Result<bool> {
     let mut changed = false;
     // 1. Rewrite the dylib's own install name(s).
-    if let Ok(out) = Command::new("otool").arg("-D").arg(path).output() {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines() {
-                let old = line.trim();
-                if old.is_empty() {
-                    continue;
-                }
-                if let Some(new) = substitute(old, prefix, cellar_dir) {
-                    let status = Command::new("install_name_tool")
-                        .args(["-id", &new])
-                        .arg(path)
-                        .status();
-                    match status {
-                        Ok(s) if s.success() => changed = true,
-                        Ok(s) => {
-                            tracing::warn!(
-                                "install_name_tool -id on {} failed: {s}",
-                                path.display()
-                            );
-                        }
-                        Err(e) => {
-                            return Err(Error::Other(anyhow::anyhow!("install_name_tool: {e}")));
-                        }
+    if let Ok(out) = Command::new("otool").arg("-D").arg(path).output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            let old = line.trim();
+            if old.is_empty() {
+                continue;
+            }
+            if let Some(new) = substitute(old, prefix, cellar_dir) {
+                let status = Command::new("install_name_tool")
+                    .args(["-id", &new])
+                    .arg(path)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => changed = true,
+                    Ok(s) => {
+                        tracing::warn!("install_name_tool -id on {} failed: {s}", path.display());
+                    }
+                    Err(e) => {
+                        return Err(Error::Other(anyhow::anyhow!("install_name_tool: {e}")));
                     }
                 }
             }
         }
     }
     // 2. Rewrite dependent library references.
-    if let Ok(out) = Command::new("otool").arg("-L").arg(path).output() {
-        if out.status.success() {
-            let text = String::from_utf8_lossy(&out.stdout);
-            for line in text.lines().skip(1) {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let old = trimmed.split_whitespace().next().unwrap_or("").to_string();
-                if old.is_empty() {
-                    continue;
-                }
-                if let Some(new) = substitute(&old, prefix, cellar_dir) {
-                    let status = Command::new("install_name_tool")
-                        .args(["-change", &old, &new])
-                        .arg(path)
-                        .status();
-                    match status {
-                        Ok(s) if s.success() => changed = true,
-                        Ok(s) => {
-                            tracing::warn!(
-                                "install_name_tool -change on {} failed: {s}",
-                                path.display()
-                            );
-                        }
-                        Err(e) => {
-                            return Err(Error::Other(anyhow::anyhow!("install_name_tool: {e}")));
-                        }
+    if let Ok(out) = Command::new("otool").arg("-L").arg(path).output()
+        && out.status.success()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines().skip(1) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let old = trimmed.split_whitespace().next().unwrap_or("").to_string();
+            if old.is_empty() {
+                continue;
+            }
+            if let Some(new) = substitute(&old, prefix, cellar_dir) {
+                let status = Command::new("install_name_tool")
+                    .args(["-change", &old, &new])
+                    .arg(path)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => changed = true,
+                    Ok(s) => {
+                        tracing::warn!(
+                            "install_name_tool -change on {} failed: {s}",
+                            path.display()
+                        );
+                    }
+                    Err(e) => {
+                        return Err(Error::Other(anyhow::anyhow!("install_name_tool: {e}")));
                     }
                 }
             }

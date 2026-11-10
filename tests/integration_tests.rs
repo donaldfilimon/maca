@@ -1,57 +1,78 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn maca_bin() -> PathBuf {
     // Cargo builds the binary for integration tests and exports its path.
     PathBuf::from(env!("CARGO_BIN_EXE_maca"))
 }
 
-/// A `maca` command confined to a throwaway data dir and prefix, so the suite
-/// never reads or writes the developer's real `~/.maca`.
-fn maca_cmd(bin: &Path) -> Command {
-    let home = std::env::temp_dir().join(format!("maca-it-home-{}", std::process::id()));
-    std::fs::create_dir_all(&home).unwrap();
-    let mut cmd = Command::new(bin);
-    cmd.env("MACA_HOME", &home).env_remove("MACA_PREFIX");
-    cmd
+/// A throwaway data dir for one test, removed when dropped. Tests run in
+/// parallel, so each gets its own.
+struct TempHome(PathBuf);
+
+impl TempHome {
+    fn new(tag: &str) -> Self {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "maca-it-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    /// A `maca` command confined to this home: it never reads or writes the
+    /// developer's real `~/.maca`, and shell detection is not inherited.
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(maca_bin());
+        cmd.env("MACA_HOME", &self.0)
+            .env_remove("MACA_PREFIX")
+            .env_remove("SHELL");
+        cmd
+    }
+}
+
+impl Drop for TempHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
 fn test_version_and_help() {
-    let bin = maca_bin();
-    if !bin.exists() {
-        return;
-    }
-    let output = maca_cmd(&bin).arg("--version").output().unwrap();
+    let home = TempHome::new("version");
+    let output = home.cmd().arg("--version").output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("maca 0.1.0"));
+    assert!(stdout.contains(&format!("maca {}", env!("CARGO_PKG_VERSION"))));
 
-    let help = maca_cmd(&bin).arg("--help").output().unwrap();
+    let help = home.cmd().arg("--help").output().unwrap();
     assert!(help.status.success());
     let help_out = String::from_utf8_lossy(&help.stdout);
-    assert!(help_out.contains("shellenv"));
-    assert!(help_out.contains("completions"));
-    assert!(help_out.contains("outdated"));
-    assert!(help_out.contains("clean"));
+    for cmd in ["shellenv", "completions", "outdated", "clean"] {
+        assert!(help_out.contains(cmd), "--help lacks {cmd}");
+    }
 }
 
 #[test]
 fn test_shellenv_formats() {
-    let bin = maca_bin();
-    if !bin.exists() {
-        return;
-    }
-    // Test default bash/zsh format
-    let out = maca_cmd(&bin).arg("shellenv").output().unwrap();
+    let home = TempHome::new("shellenv");
+    let out = home
+        .cmd()
+        .args(["shellenv", "--shell", "bash"])
+        .output()
+        .unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("export MACA_PREFIX="));
     assert!(text.contains("export PATH="));
     assert!(text.contains("export MANPATH="));
 
-    // Test fish format
-    let fish_out = maca_cmd(&bin)
+    let fish_out = home
+        .cmd()
         .args(["shellenv", "--shell", "fish"])
         .output()
         .unwrap();
@@ -59,64 +80,53 @@ fn test_shellenv_formats() {
     let fish_text = String::from_utf8_lossy(&fish_out.stdout);
     assert!(fish_text.contains("set -gx MACA_PREFIX"));
     assert!(fish_text.contains("fish_add_path"));
+
+    // Auto-detection follows $SHELL.
+    let auto = home
+        .cmd()
+        .env("SHELL", "/usr/bin/fish")
+        .arg("shellenv")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&auto.stdout).contains("set -gx MACA_PREFIX"));
 }
 
 #[test]
 fn test_completions() {
-    let bin = maca_bin();
-    if !bin.exists() {
-        return;
-    }
+    let home = TempHome::new("completions");
     for shell in ["bash", "zsh", "fish"] {
-        let out = maca_cmd(&bin)
-            .args(["completions", shell])
-            .output()
-            .unwrap();
+        let out = home.cmd().args(["completions", shell]).output().unwrap();
         assert!(out.status.success(), "completions for {shell} failed");
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(!text.trim().is_empty());
         assert!(text.contains("search") || text.contains("install"));
     }
 }
 
 #[test]
-fn test_outdated_command() {
-    let bin = maca_bin();
-    if !bin.exists() {
-        return;
-    }
-    let out = maca_cmd(&bin)
-        .args(["outdated", "--json"])
-        .output()
-        .unwrap();
+fn test_outdated_with_nothing_installed() {
+    let home = TempHome::new("outdated");
+    let out = home.cmd().args(["outdated", "--json"]).output().unwrap();
     assert!(out.status.success());
-    let text = String::from_utf8_lossy(&out.stdout);
-    let val: serde_json::Value = serde_json::from_str(&text).unwrap();
-    assert!(val.is_array());
+    let val: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(val, serde_json::json!([]));
 }
 
 #[test]
 fn test_clean_command() {
-    let bin = maca_bin();
-    if !bin.exists() {
-        return;
-    }
-    let out = maca_cmd(&bin)
+    let home = TempHome::new("clean");
+    let out = home
+        .cmd()
         .args(["clean", "--keep-snapshots", "10"])
         .output()
         .unwrap();
     assert!(out.status.success());
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.contains("clean complete"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("clean complete"));
 }
 
 #[test]
 fn test_doctor_command() {
-    let bin = maca_bin();
-    if !bin.exists() {
-        return;
-    }
-    let out = maca_cmd(&bin).arg("doctor").output().unwrap();
+    let home = TempHome::new("doctor");
+    let out = home.cmd().arg("doctor").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("maca doctor"));
     assert!(text.contains("doctor summary:"));
@@ -124,17 +134,15 @@ fn test_doctor_command() {
 
 #[test]
 fn test_binary_discovery_and_share_linking() {
-    let temp = std::env::temp_dir().join(format!("maca-it-bins-{}", std::process::id()));
-    let prefix = temp.join("prefix");
-    let cellar = temp.join("cellar/demo/1.2.3");
+    let temp = TempHome::new("bins");
+    let prefix = temp.0.join("prefix");
+    let cellar = prefix.join("cellar/demo/1.2.3");
     let bin_dir = cellar.join("bin");
     let sbin_dir = cellar.join("sbin");
     let share_dir = cellar.join("share/man/man1");
-
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(&sbin_dir).unwrap();
     std::fs::create_dir_all(&share_dir).unwrap();
-
     std::fs::write(bin_dir.join("demo_cli"), b"#!/bin/sh\necho ok").unwrap();
     std::fs::write(sbin_dir.join("demo_admin"), b"#!/bin/sh\necho admin").unwrap();
     std::fs::write(share_dir.join("demo.1"), b".TH DEMO 1").unwrap();
@@ -151,17 +159,12 @@ fn test_binary_discovery_and_share_linking() {
     let unlinked = maca::install::unlink_share(&cellar, &prefix).unwrap();
     assert_eq!(unlinked, 1);
     assert!(!prefix.join("share/man/man1/demo.1").exists());
-
-    let _ = std::fs::remove_dir_all(&temp);
 }
 
 #[test]
 fn test_list_command() {
-    let bin = maca_bin();
-    if !bin.exists() {
-        return;
-    }
-    let out = maca_cmd(&bin).arg("list").output().unwrap();
+    let home = TempHome::new("list");
+    let out = home.cmd().arg("list").output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("PINNED") || text.contains("no packages installed"));
@@ -169,21 +172,20 @@ fn test_list_command() {
 
 #[test]
 fn test_sync_dry_run() {
-    let bin = maca_bin();
-    if !bin.exists() {
-        return;
-    }
-    // Lock current state then dry-run sync
-    let lock_out = maca_cmd(&bin).arg("lock").output().unwrap();
-    assert!(lock_out.status.success());
-
-    let sync_out = maca_cmd(&bin)
+    let home = TempHome::new("sync");
+    // Lock the (empty) state, then dry-run a sync with prune.
+    assert!(home.cmd().arg("lock").output().unwrap().status.success());
+    let sync_out = home
+        .cmd()
         .args(["sync", "--dry-run", "--prune"])
         .output()
         .unwrap();
     assert!(sync_out.status.success());
     let text = String::from_utf8_lossy(&sync_out.stdout);
-    assert!(text.contains("sync complete"));
+    assert!(
+        text.contains("sync dry run complete: 0 ok, 0 failed"),
+        "{text}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -470,6 +472,21 @@ fn e2e_pins_upgrade_lock_sync_and_snapshot_restore() {
         &format!("{base}/hello-2.tar.gz"),
         &sha256(&v2),
     );
+    // `outdated` sees the newer version (offline: the registry is local).
+    let out = sb.ok(&["outdated", "--json"]);
+    let json_start = out.find('[').expect("outdated prints a JSON array");
+    let outdated: serde_json::Value = serde_json::Deserializer::from_str(&out[json_start..])
+        .into_iter()
+        .next()
+        .unwrap()
+        .unwrap();
+    let entry = outdated
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["name"] == "hello")
+        .unwrap_or_else(|| panic!("hello missing from outdated: {out}"));
+    assert!(entry.to_string().contains("2.0.0"), "{entry}");
     let text = sb.ok(&["upgrade"]);
     assert!(text.contains("pinned"), "{text}");
     assert_eq!(sb.installed_version("hello").as_deref(), Some("1.0.0"));
@@ -716,4 +733,111 @@ fn e2e_binary_kind_build_steps_and_groups() {
         group.contains("\"single\"") && group.contains("\"built\""),
         "{group}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_prefixes_and_snapshot_scopes_stay_isolated() {
+    let a1 = script_tarball("a", "alpha", "alpha-1");
+    let a2 = script_tarball("a", "alpha", "alpha-2");
+    let b1 = script_tarball("b", "beta", "beta-1");
+    let mut routes = HashMap::new();
+    routes.insert("/a1".to_string(), a1.clone());
+    routes.insert("/a2".to_string(), a2.clone());
+    routes.insert("/b1".to_string(), b1.clone());
+    let base = serve(routes);
+    let sb = Sandbox::new("isolation");
+    let other = sb.home.join("other-prefix");
+    let other_s = other.to_str().unwrap();
+
+    sb.add("alpha", "1.0.0", &format!("{base}/a1"), &sha256(&a1));
+    sb.add("beta", "1.0.0", &format!("{base}/b1"), &sha256(&b1));
+    sb.ok(&["install", "alpha", "beta", "--backend", "custom"]);
+    // A second prefix sharing this data dir holds a different package.
+    sb.add("gamma", "1.0.0", &format!("{base}/b1"), &sha256(&b1));
+    sb.ok(&[
+        "--prefix",
+        other_s,
+        "install",
+        "gamma",
+        "--backend",
+        "custom",
+    ]);
+    let gamma_keg = other.join("cellar/gamma/1.0.0");
+    assert!(gamma_keg.is_dir());
+    // The ledger records one install per name, so the same package cannot
+    // also go into this prefix; that is refused rather than orphaning it.
+    let text = sb.fails(&["install", "gamma", "--backend", "custom", "--no-snapshot"]);
+    assert!(
+        text.contains("already installed in another prefix"),
+        "{text}"
+    );
+    assert!(!sb.prefix().join("cellar/gamma").exists());
+
+    // A foreign symlink in bin/ (not a link into the cellar) must survive
+    // any rollback.
+    let foreign = sb.prefix().join("bin/mytool");
+    std::os::unix::fs::symlink("/usr/bin/true", &foreign).unwrap();
+
+    // An --only snapshot of alpha, then beta is removed and alpha upgraded.
+    sb.ok(&[
+        "snapshot",
+        "create",
+        "--note",
+        "only alpha",
+        "--only",
+        "alpha",
+    ]);
+    let only_id = sb.snapshot_with_reason("only alpha");
+    sb.add("alpha", "2.0.0", &format!("{base}/a2"), &sha256(&a2));
+    sb.ok(&["upgrade", "--package", "alpha"]);
+    assert_eq!(sb.exec("alpha"), "alpha-2");
+    sb.ok(&["remove", "beta", "--no-snapshot"]);
+
+    // Restoring it puts alpha 1.0.0 back and leaves everything else alone:
+    // beta stays removed, gamma in the other prefix is untouched, the
+    // foreign link survives.
+    sb.ok(&["snapshot", "restore", &only_id]);
+    assert_eq!(sb.exec("alpha"), "alpha-1");
+    assert_eq!(sb.installed_version("alpha").as_deref(), Some("1.0.0"));
+    assert!(!sb.prefix().join("cellar/alpha/2.0.0").exists());
+    assert_eq!(sb.installed_version("beta"), None);
+    assert!(!sb.prefix().join("cellar/beta").exists());
+    assert_eq!(sb.installed_version("gamma").as_deref(), Some("1.0.0"));
+    assert!(gamma_keg.is_dir());
+    assert_eq!(
+        std::fs::read_link(&foreign).unwrap(),
+        PathBuf::from("/usr/bin/true")
+    );
+
+    // A failed install in this prefix rolls back without touching the other.
+    sb.add("broken", "1.0.0", &format!("{base}/a1"), &"0".repeat(64));
+    sb.fails(&["install", "broken", "--backend", "custom"]);
+    assert!(gamma_keg.is_dir());
+    assert_eq!(sb.installed_version("gamma").as_deref(), Some("1.0.0"));
+    assert_eq!(
+        std::fs::read_link(&foreign).unwrap(),
+        PathBuf::from("/usr/bin/true")
+    );
+
+    // `lock` here records only this prefix's packages, and sync --prune
+    // prunes nothing in the other prefix.
+    sb.ok(&["lock"]);
+    let lock = std::fs::read_to_string(sb.prefix().join("maca.lock.json")).unwrap();
+    assert!(!lock.contains("gamma"), "{lock}");
+    sb.ok(&["sync", "--prune"]);
+    assert!(gamma_keg.is_dir());
+    assert_eq!(sb.installed_version("gamma").as_deref(), Some("1.0.0"));
+    assert_eq!(sb.exec("alpha"), "alpha-1");
+
+    // Removing a package that lives in another prefix is refused.
+    let text = sb.fails(&["remove", "gamma", "--no-snapshot"]);
+    assert!(text.contains("refusing to remove"), "{text}");
+    assert!(gamma_keg.is_dir());
+
+    // The same name twice in one command installs once (the registry now
+    // serves 2.0.0).
+    sb.ok(&["remove", "alpha", "--no-snapshot"]);
+    sb.ok(&["install", "alpha", "alpha", "--backend", "custom"]);
+    assert_eq!(sb.exec("alpha"), "alpha-2");
 }

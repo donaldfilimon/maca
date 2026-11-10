@@ -179,9 +179,7 @@ pub fn extract_bottle(name: &str, version: &str, bytes: &[u8], prefix: &Path) ->
             "bottle for {name} did not contain {name}/{version} at expected path"
         )));
     }
-    std::fs::rename(&staged, &dest)
-        .map_err(|e| Error::Other(anyhow::anyhow!("moving {name} into place: {e}")))?;
-    Ok(dest)
+    move_into_place(name, &staged, &dest)
 }
 
 /// Extract an arbitrary `.tar.gz` into a fresh `<prefix>/cellar/<name>/<version>/`.
@@ -217,9 +215,35 @@ pub fn extract_tar_gz_to_cellar(
         }
         _ => staging.0.clone(),
     };
-    std::fs::rename(&source, &dest)
-        .map_err(|e| Error::Other(anyhow::anyhow!("moving {name} into place: {e}")))?;
-    Ok(dest)
+    move_into_place(name, &source, &dest)
+}
+
+/// Rename a fully staged keg to its final path. If the rename fails because
+/// another task installing the same keg (two packages sharing a dependency)
+/// got there first, its complete keg is used and this copy is dropped.
+fn move_into_place(name: &str, staged: &Path, dest: &Path) -> Result<PathBuf> {
+    match std::fs::rename(staged, dest) {
+        Ok(()) => Ok(dest.to_path_buf()),
+        Err(_) if dest.is_dir() => Ok(dest.to_path_buf()),
+        Err(e) => Err(Error::Other(anyhow::anyhow!(
+            "moving {name} into place: {e}"
+        ))),
+    }
+}
+
+/// Make `link` a symlink to `target`, tolerating a concurrent task that just
+/// created the same link.
+#[cfg(not(windows))]
+fn symlink_or_same(target: &Path, link: &Path) -> Result<()> {
+    match std::os::unix::fs::symlink(target, link) {
+        Err(e)
+            if e.kind() == std::io::ErrorKind::AlreadyExists
+                && std::fs::read_link(link).is_ok_and(|t| t == target) =>
+        {
+            Ok(())
+        }
+        other => Ok(other?),
+    }
 }
 
 /// Put a symlink at `link` pointing to `target` without destroying anything
@@ -243,13 +267,18 @@ fn place_link(target: &Path, link: &Path, own_root: &Path) -> Result<bool> {
             );
             return Ok(false);
         }
-        std::fs::remove_file(link)?;
+        match std::fs::remove_file(link) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
     }
-    std::os::unix::fs::symlink(target, link)?;
+    symlink_or_same(target, link)?;
     Ok(true)
 }
 
-/// Windows has no unprivileged symlinks, so entries are copies.
+/// Windows has no unprivileged symlinks, so entries are copies. A copy
+/// carries no record of which package made it, so on Windows an existing
+/// entry is replaced; see the README's platform notes.
 #[cfg(windows)]
 fn place_link(target: &Path, link: &Path, _own_root: &Path) -> Result<bool> {
     if link.exists() {
@@ -257,6 +286,18 @@ fn place_link(target: &Path, link: &Path, _own_root: &Path) -> Result<bool> {
     }
     std::fs::copy(target, link)?;
     Ok(true)
+}
+
+/// Windows: true when `copy` is a regular file with the same bytes as
+/// `original`, i.e. the copy maca made of it.
+#[cfg(windows)]
+pub(crate) fn is_copy_of(copy: &Path, original: &Path) -> bool {
+    match (std::fs::metadata(copy), std::fs::metadata(original)) {
+        (Ok(a), Ok(b)) if a.is_file() && b.is_file() && a.len() == b.len() => {
+            matches!((std::fs::read(copy), std::fs::read(original)), (Ok(x), Ok(y)) if x == y)
+        }
+        _ => false,
+    }
 }
 
 /// `cellar/<name>` for a keg at `cellar/<name>/<version>`.
@@ -272,7 +313,7 @@ pub fn link_opt(name: &str, version: &str, cellar: &Path, prefix: &Path) -> Resu
     let opt_dir = prefix.join("opt");
     std::fs::create_dir_all(&opt_dir)?;
     let link = opt_dir.join(name);
-    if link.exists() || link.symlink_metadata().is_ok() {
+    if link.symlink_metadata().is_ok() {
         let _ = std::fs::remove_file(&link);
     }
     // Target is the cellar keg path (not the generic `cellar/<name>/<version>`
@@ -285,7 +326,7 @@ pub fn link_opt(name: &str, version: &str, cellar: &Path, prefix: &Path) -> Resu
     }
     #[cfg(not(windows))]
     {
-        std::os::unix::fs::symlink(cellar, &link)?;
+        symlink_or_same(cellar, &link)?;
     }
     let _ = version;
     Ok(link)
@@ -341,14 +382,12 @@ fn discover_binaries(dir: &Path) -> Vec<String> {
     let mut exes = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_file() || ft.is_symlink() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        if !name.starts_with('.') {
-                            exes.push(name.to_string());
-                        }
-                    }
-                }
+            if let Ok(ft) = entry.file_type()
+                && (ft.is_file() || ft.is_symlink())
+                && let Some(name) = entry.file_name().to_str()
+                && !name.starts_with('.')
+            {
+                exes.push(name.to_string());
             }
         }
     }
@@ -396,7 +435,42 @@ pub fn link_share(cellar: &Path, prefix: &Path) -> Result<Vec<PathBuf>> {
     Ok(linked)
 }
 
+/// Windows: share entries are copies, so remove each `<prefix>/share/<rel>`
+/// that is still an exact copy of `<cellar>/share/<rel>`.
+#[cfg(windows)]
+pub fn unlink_share(cellar: &Path, prefix: &Path) -> Result<usize> {
+    let cellar_share = cellar.join("share");
+    let prefix_share = prefix.join("share");
+    let mut count = 0;
+    let mut stack = vec![cellar_share.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(rel) = path.strip_prefix(&cellar_share) {
+                let dest = prefix_share.join(rel);
+                if is_copy_of(&dest, &path) && std::fs::remove_file(&dest).is_ok() {
+                    count += 1;
+                    let mut parent = dest.parent();
+                    while let Some(p) = parent.filter(|p| *p != prefix_share) {
+                        if std::fs::remove_dir(p).is_err() {
+                            break;
+                        }
+                        parent = p.parent();
+                    }
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
 /// Remove symlinks under `<prefix>/share` that point into `<cellar>`.
+#[cfg(not(windows))]
 pub fn unlink_share(cellar: &Path, prefix: &Path) -> Result<usize> {
     let prefix_share = prefix.join("share");
     if !prefix_share.exists() {
@@ -422,11 +496,11 @@ pub fn unlink_share(cellar: &Path, prefix: &Path) -> Result<usize> {
                 stack.push(path);
                 continue;
             }
-            if let Ok(target) = std::fs::read_link(&path) {
-                if target.starts_with(cellar) {
-                    let _ = std::fs::remove_file(&path);
-                    count += 1;
-                }
+            if let Ok(target) = std::fs::read_link(&path)
+                && target.starts_with(cellar)
+            {
+                let _ = std::fs::remove_file(&path);
+                count += 1;
             }
         }
     }
@@ -484,12 +558,26 @@ mod tests {
 
     #[test]
     fn link_bins_rejects_traversal() {
-        // Path traversal names must be skipped, not linked.
-        assert!(
-            ["../evil", "a/b", ""]
-                .iter()
-                .all(|n| { n.contains('/') || n.contains('\\') || n.is_empty() })
-        );
+        let temp = std::env::temp_dir().join(format!("maca-test-trav-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let prefix = temp.join("prefix");
+        let cellar = config::cellar_dir(&prefix).join("pkg/1.0");
+        std::fs::create_dir_all(cellar.join("bin/a")).unwrap();
+        std::fs::write(cellar.join("bin/real"), b"x").unwrap();
+        std::fs::write(cellar.join("evil"), b"x").unwrap(); // target of ../evil
+        std::fs::write(cellar.join("bin/a/b"), b"x").unwrap();
+        let exes = [
+            "../evil".to_string(),
+            "a/b".into(),
+            String::new(),
+            "real".into(),
+        ];
+        let linked = link_bins(&cellar, &exes, &prefix).unwrap();
+        assert_eq!(linked, vec![config::bin_dir(&prefix).join("real")]);
+        assert!(!config::bin_dir(&prefix).join("evil").exists());
+        assert!(!config::bin_dir(&prefix).join("b").exists());
+        assert!(!prefix.join("evil").exists());
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]

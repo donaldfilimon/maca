@@ -5,8 +5,11 @@
 //! `<data>/groups/<name>.json` and can be installed as a unit or exported as a
 //! lockfile.
 //!
-//! A **lockfile** (`<prefix>/maca.lock.json`) records the exact installed
-//! versions. `maca sync` installs that set, making a machine reproducible.
+//! A **lockfile** (`<prefix>/maca.lock.json`) lists packages with a version,
+//! backend and kind. `maca lock` records the exact installed versions;
+//! `maca group export` writes `latest` for group entries without a version.
+//! `maca sync` installs the set and fails if a package resolves to a version
+//! other than the one locked (`latest` accepts any).
 
 use std::path::PathBuf;
 
@@ -124,10 +127,10 @@ impl Group {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(g) = serde_json::from_str::<Group>(&text) {
-                    out.push(g);
-                }
+            if let Ok(text) = std::fs::read_to_string(&path)
+                && let Ok(g) = serde_json::from_str::<Group>(&text)
+            {
+                out.push(g);
             }
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -168,9 +171,12 @@ pub fn lock_path(prefix: &std::path::Path) -> PathBuf {
 /// Write a lockfile from the current ledger.
 pub fn write_lock(prefix: &std::path::Path) -> Result<Lockfile> {
     let ledger = crate::state::Ledger::load()?;
+    // Only this prefix's packages: the ledger is shared by every prefix.
+    let cellar_root = crate::config::cellar_dir(prefix);
     let packages = ledger
         .packages
         .iter()
+        .filter(|r| crate::config::path_under(&r.cellar, &cellar_root))
         .map(|r| LockEntry {
             name: r.name.clone(),
             version: r.version.clone(),

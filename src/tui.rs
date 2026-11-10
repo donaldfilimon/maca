@@ -242,6 +242,26 @@ async fn event_loop(
             }
             continue;
         }
+        // Mutating keys take the prefix lock for that one action (never for
+        // the whole session), so a TUI left open does not block other maca
+        // commands, and a busy prefix shows up as a status message instead
+        // of a hang.
+        let mutating = matches!(key.code, KeyCode::Char('i' | 'r' | 'u' | 's' | 'g' | 'z'));
+        let _lock = if mutating {
+            match crate::lock::PrefixLock::try_acquire(prefix) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => {
+                    app.status = "prefix busy: another maca command is running".into();
+                    continue;
+                }
+                Err(e) => {
+                    app.status = format!("cannot lock prefix: {e}");
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         match key.code {
             KeyCode::Char('q') => return Ok(()),
             KeyCode::Char('1') => switch_tab(app, Tab::Installed),

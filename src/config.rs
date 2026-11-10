@@ -51,20 +51,20 @@ impl Config {
     }
 
     pub fn prefix(&self) -> PathBuf {
-        if let Ok(env) = std::env::var("MACA_PREFIX") {
-            if !env.trim().is_empty() {
-                return PathBuf::from(env);
-            }
+        if let Ok(env) = std::env::var("MACA_PREFIX")
+            && !env.trim().is_empty()
+        {
+            return PathBuf::from(env);
         }
         self.prefix_with_env(None)
     }
 
     /// Prefix resolution given an explicit `MACA_PREFIX` value (pure, testable).
     pub fn prefix_with_env(&self, env_value: Option<&str>) -> PathBuf {
-        if let Some(env) = env_value {
-            if !env.trim().is_empty() {
-                return PathBuf::from(env);
-            }
+        if let Some(env) = env_value
+            && !env.trim().is_empty()
+        {
+            return PathBuf::from(env);
         }
         if let Some(p) = &self.prefix {
             return p.clone();
@@ -82,10 +82,10 @@ pub fn data_dir() -> PathBuf {
 
 /// Data dir resolution given an explicit `MACA_HOME` value (pure, testable).
 pub fn data_dir_with_env(env_value: Option<&str>) -> PathBuf {
-    if let Some(env) = env_value {
-        if !env.trim().is_empty() {
-            return PathBuf::from(env);
-        }
+    if let Some(env) = env_value
+        && !env.trim().is_empty()
+    {
+        return PathBuf::from(env);
     }
     default_data_dir()
 }
@@ -123,6 +123,36 @@ fn default_data_dir() -> PathBuf {
 /// Default install prefix. Space-free so source build recipes work.
 fn default_prefix() -> PathBuf {
     data_dir().join("prefix")
+}
+
+/// True when `path` lies inside `root`. Compared as written first, then with
+/// both sides resolved, so a prefix reached through a symlink still matches.
+pub fn path_under(path: &std::path::Path, root: &std::path::Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    match (std::fs::canonicalize(root), canonical_lenient(path)) {
+        (Ok(r), Some(p)) => p.starts_with(r),
+        _ => false,
+    }
+}
+
+/// Canonicalize `path`, or, if it no longer exists, its nearest existing
+/// ancestor with the missing tail re-attached.
+fn canonical_lenient(path: &std::path::Path) -> Option<PathBuf> {
+    let mut tail = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(c) = std::fs::canonicalize(cur) {
+            let mut out = c;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        tail.push(cur.file_name()?.to_os_string());
+        cur = cur.parent()?;
+    }
 }
 
 pub fn installed_path() -> PathBuf {

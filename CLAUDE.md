@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`maca` is a Rust 2024 (MSRV 1.85) package manager for macOS and Linux. It installs from three backends — Homebrew bottles/sources, the winget catalog, and a custom JSON registry — by calling their HTTP APIs directly. It never shells out to `brew` or `winget`. One crate, one binary (`src/main.rs`) on top of a library (`src/lib.rs`).
+`maca` is a Rust 2024 (MSRV 1.89, for `std::fs::File::lock`) package manager for macOS and Linux. It installs from three backends — Homebrew bottles/sources, the winget catalog, and a custom JSON registry — by calling their HTTP APIs directly. It never shells out to `brew` or `winget`. One crate, one binary (`src/main.rs`) on top of a library (`src/lib.rs`).
 
 ## Commands
 
@@ -45,7 +45,7 @@ The default data dir is deliberately space-free on macOS (not `~/Library/Applica
 
 ### Backends are structs, not a trait
 
-`BrewBackend`, `WingetBackend` and `CustomBackend` each expose `search` / `info` / `plan` / `install` by convention; there is no shared trait. Dispatch is a `match` on `BackendKind` or on the ledger's backend string, repeated in several places: `backend::install_with_backend`, and in `main.rs` `cmd_search`, `info_one`, `install_many`, `latest_version`. A new backend or a signature change has to be applied at each site.
+`BrewBackend`, `WingetBackend` and `CustomBackend` each expose `search` / `info` / `plan` / `install` by convention; there is no shared trait. Dispatch is a `match` on `BackendKind` or on the ledger's backend string, in `backend::install_with_backend` (every install goes through it, so its checks always run), `backend::latest_version`, and `main.rs` `cmd_search` and `info_one`. A new backend or a signature change has to be applied at each site.
 
 `--backend auto` means custom → brew → winget: `search_all` queries all three concurrently and merges; `auto_install` takes the first backend whose `plan()` succeeds.
 
@@ -68,7 +68,8 @@ Brew bottle install, in order: fetch formula JSON → recurse into `dependencies
 
 Library functions do not take locks or snapshots; the `cmd_*` handlers do:
 
-- `lock::PrefixLock::acquire(&ctx.prefix)` (exclusive `flock` on `<prefix>/.maca.lock`) is taken at the top of each mutating handler and for the whole TUI session. It is not re-entrant — a second acquire in the same process blocks — so never acquire it in code a handler calls.
+- `lock::PrefixLock::acquire(&ctx.prefix)` (exclusive `flock` on `<prefix>/.maca.lock`) is taken at the top of each mutating handler; the TUI takes it with `try_acquire` per action, never for the session. It is not re-entrant — a second acquire in the same process blocks — so never acquire it in code a handler calls.
+- Data-dir files shared by every prefix have their own locks in `state.rs`: `with_ledger_lock` (ledger) and `state_lock()` (pins, groups, custom registry). Order is prefix lock → state lock → ledger lock. The ledger holds one record per package name across all prefixes, so `install_with_backend` and `upsert_record` refuse a package already installed in another prefix; anything that walks the ledger for one prefix (snapshots, `lock`, `sync`, `remove`) must filter with `config::path_under(&r.cellar, &cellar_dir(prefix))`.
 - Mutating handlers (`install`, `remove`, `upgrade`, `sync`, `group install`, and each TUI action in `tui.rs`) take one snapshot per command, then `snapshot::restore` it if the operation fails. `install_many` forces `no_snapshot: true` on each per-package task for that reason. `restore` is a full rollback: it deletes kegs that did not exist at snapshot time (the manifest lists every keg directory present then, so kegs maca never knew about survive), re-clones the snapshotted kegs, sweeps dangling maca links, and writes the ledger last. Handlers must return `Err` for a failed operation or the rollback never fires — `upgrade`, `sync` and `group install` all exit non-zero on a failed package.
 - Multi-package work fans out with `tokio::spawn` bounded by a `Semaphore` of `--jobs`. Ledger writes must go through `state::upsert_record` / `remove_record` (in-process mutex plus a file lock on `<data>/.ledger.lock`, since the ledger is shared across prefixes), not a bare `Ledger::load()`…`save()`.
 

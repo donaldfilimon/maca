@@ -5,64 +5,52 @@
 //! processes cannot race the ledger, the cellar, or the bin links. The lock is
 //! advisory and released when the guard is dropped.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
-use crate::{Error, Result};
+use crate::Result;
 
+/// Exclusive lock on `<prefix>/.maca.lock`, released when dropped (closing the
+/// file releases the OS lock). Not re-entrant: a second acquire in the same
+/// process blocks, so take it once, at the top of a command.
 pub struct PrefixLock {
-    _guard: fd_lock::RwLockWriteGuard<'static, std::fs::File>,
+    _file: File,
 }
 
 impl PrefixLock {
     /// Acquire the exclusive write lock, blocking until it is available.
     pub fn acquire(prefix: &Path) -> Result<Self> {
-        let lock_path = lock_path(prefix);
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
-        // Leak the lock so the returned guard can be 'static for the lifetime
-        // of this CLI process. The OS releases the lock on exit regardless.
-        let boxed: &'static mut fd_lock::RwLock<std::fs::File> =
-            Box::leak(Box::new(fd_lock::RwLock::new(file)));
-        let guard = boxed.write().map_err(|e| {
-            Error::Other(anyhow::anyhow!(
-                "prefix lock on {}: {e}",
-                lock_path.display()
-            ))
-        })?;
-        Ok(Self { _guard: guard })
+        let file = open(prefix)?;
+        file.lock()?;
+        Ok(Self { _file: file })
     }
 
     /// Try to acquire without blocking; `None` if another writer holds it.
     pub fn try_acquire(prefix: &Path) -> Result<Option<Self>> {
-        let lock_path = lock_path(prefix);
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
-        let boxed: &'static mut fd_lock::RwLock<std::fs::File> =
-            Box::leak(Box::new(fd_lock::RwLock::new(file)));
-        match boxed.try_write() {
-            Ok(guard) => Ok(Some(Self { _guard: guard })),
-            Err(_) => Ok(None),
+        let file = open(prefix)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(e)) => Err(e.into()),
         }
     }
 
     pub fn path(prefix: &Path) -> PathBuf {
         lock_path(prefix)
     }
+}
+
+fn open(prefix: &Path) -> Result<File> {
+    let lock_path = lock_path(prefix);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)?)
 }
 
 fn lock_path(prefix: &Path) -> PathBuf {
