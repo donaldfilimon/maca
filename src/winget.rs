@@ -378,6 +378,14 @@ impl WingetBackend {
 
     pub async fn install(&self, name: &str, opts: &InstallOptions) -> Result<InstallOutcome> {
         let plan = self.plan_inner(name).await?;
+        if let Some(req) = &opts.version
+            && req.trim() != plan.version
+        {
+            return Err(Error::Unsupported(format!(
+                "winget only publishes its current version; cannot install {} at {}",
+                plan.name, req
+            )));
+        }
         if opts.dry_run {
             println!(
                 "[dry-run] would install {} {} via {} ({})",

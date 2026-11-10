@@ -510,7 +510,7 @@ impl BrewBackend {
                 name: plan.token,
                 version: plan.version,
                 backend: "brew".into(),
-                cellar_path: crate::config::cellar_dir(&opts.prefix).join(token),
+                cellar_path: opts.keg_root().join(token),
                 linked_bins: vec![],
             });
         }
@@ -523,12 +523,18 @@ impl BrewBackend {
         }
         install::verify_sha256(&plan.token, &bytes, plan.sha256.as_deref())?;
         let cellar = match plan.archive {
-            CaskArchive::Zip => {
-                install::extract_zip_to_cellar(&plan.token, &plan.version, &bytes, &opts.prefix)?
-            }
-            CaskArchive::TarGz => {
-                install::extract_tar_gz_to_cellar(&plan.token, &plan.version, &bytes, &opts.prefix)?
-            }
+            CaskArchive::Zip => install::extract_zip_to_cellar(
+                &plan.token,
+                &plan.version,
+                &bytes,
+                &opts.keg_root(),
+            )?,
+            CaskArchive::TarGz => install::extract_tar_gz_to_cellar(
+                &plan.token,
+                &plan.version,
+                &bytes,
+                &opts.keg_root(),
+            )?,
         };
         let linked = link_cask_binaries(&cellar, &plan.binaries, &opts.prefix)?;
         state::upsert_record(state::record_with_kind(
@@ -556,6 +562,14 @@ impl BrewBackend {
     ) -> Result<InstallOutcome> {
         let normalized = name.trim().to_ascii_lowercase();
         let formula = self.fetch_formula(&normalized).await?;
+        if let Some(req) = &opts.version
+            && req.trim() != formula.versions.stable
+        {
+            return Err(Error::Unsupported(format!(
+                "brew only publishes its current version; cannot install {} at {}",
+                formula.name, req
+            )));
+        }
         let source = formula
             .urls
             .as_ref()
@@ -578,7 +592,8 @@ impl BrewBackend {
                 name: formula.name.clone(),
                 version: formula.versions.stable.clone(),
                 backend: "brew".into(),
-                cellar_path: crate::config::cellar_dir(&opts.prefix)
+                cellar_path: opts
+                    .keg_root()
                     .join(&formula.name)
                     .join(&formula.versions.stable),
                 linked_bins: vec![],
@@ -596,9 +611,7 @@ impl BrewBackend {
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch)?;
         let version = formula.versions.stable.clone();
-        let dest = crate::config::cellar_dir(&opts.prefix)
-            .join(&formula.name)
-            .join(&version);
+        let dest = opts.keg_root().join(&formula.name).join(&version);
         let dest_existed = dest.exists();
         let result = self.build_into(&formula, &bytes, &scratch, &dest, opts);
         // The scratch tree always goes; a keg the build half-wrote goes too,
@@ -677,7 +690,7 @@ impl BrewBackend {
                 name: normalized.clone(),
                 version: String::new(),
                 backend: "brew".into(),
-                cellar_path: crate::config::cellar_dir(&opts.prefix).join(&normalized),
+                cellar_path: opts.keg_root().join(&normalized),
                 linked_bins: vec![],
             });
         }
@@ -697,12 +710,7 @@ impl BrewBackend {
             }
             if let Some(r) = ledger.get(dep) {
                 // A dependency recorded for another prefix is not usable here.
-                if r.cellar.exists()
-                    && !crate::config::path_under(
-                        &r.cellar,
-                        &crate::config::cellar_dir(&opts.prefix),
-                    )
-                {
+                if r.cellar.exists() && !crate::config::path_under(&r.cellar, &opts.keg_root()) {
                     return Err(state::elsewhere_error(dep, r));
                 }
                 continue;
@@ -728,6 +736,14 @@ impl BrewBackend {
             return self.build_from_source(&normalized, opts).await;
         }
         let (plan, executables, expected_sha) = self.plan_inner(&normalized).await?;
+        if let Some(req) = &opts.version
+            && req.trim() != plan.version
+        {
+            return Err(Error::Unsupported(format!(
+                "brew only publishes its current version; cannot install {} at {}",
+                plan.name, req
+            )));
+        }
         if opts.dry_run {
             println!(
                 "[dry-run] would install {} {} via {} (bottle {})",
@@ -737,9 +753,7 @@ impl BrewBackend {
                 name: plan.name.clone(),
                 version: plan.version.clone(),
                 backend: plan.backend.clone(),
-                cellar_path: crate::config::cellar_dir(&opts.prefix)
-                    .join(&plan.name)
-                    .join(&plan.version),
+                cellar_path: opts.keg_root().join(&plan.name).join(&plan.version),
                 linked_bins: vec![],
             });
         }
@@ -747,12 +761,10 @@ impl BrewBackend {
         let token = ghcr_anonymous_token(&plan.name).await?;
         let bytes = install::download_with_bearer(&plan.url, Some(&token)).await?;
         install::verify_sha256(&plan.name, &bytes, Some(&expected_sha))?;
-        let dest = crate::config::cellar_dir(&opts.prefix)
-            .join(&plan.name)
-            .join(&plan.version);
+        let dest = opts.keg_root().join(&plan.name).join(&plan.version);
         let keg_existed = dest.exists();
         // Extraction is staged, so a failure here leaves nothing at `dest`.
-        let cellar = install::extract_bottle(&plan.name, &plan.version, &bytes, &opts.prefix)?;
+        let cellar = install::extract_bottle(&plan.name, &plan.version, &bytes, &opts.keg_root())?;
         let linked = match finish_keg(
             &plan.name,
             &plan.version,

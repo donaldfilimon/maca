@@ -516,7 +516,11 @@ fn e2e_pins_upgrade_lock_sync_and_snapshot_restore() {
     // The lock still pins 1.0.0, which the registry no longer serves: sync
     // must fail loudly and leave the installed state as it was.
     let text = sb.fails(&["sync"]);
-    assert!(text.contains("lock pins 1.0.0"), "{text}");
+    assert!(
+        text.contains("custom only publishes its current version")
+            || text.contains("lock pins 1.0.0"),
+        "{text}"
+    );
     assert_eq!(sb.installed_version("hello").as_deref(), Some("2.0.0"));
     assert_eq!(sb.exec("hello"), "hello-2");
 
@@ -733,7 +737,11 @@ fn e2e_binary_kind_build_steps_and_groups() {
         "9.9.9",
     ]);
     let text = sb.fails(&["group", "install", "dev"]);
-    assert!(text.contains("lock pins 9.9.9"), "{text}");
+    assert!(
+        text.contains("custom only publishes its current version")
+            || text.contains("lock pins 9.9.9"),
+        "{text}"
+    );
     let group = std::fs::read_to_string(sb.home.join("groups/dev.json")).unwrap();
     assert!(
         group.contains("\"single\"") && group.contains("\"built\""),

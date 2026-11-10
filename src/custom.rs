@@ -310,6 +310,14 @@ impl CustomBackend {
             .registry
             .find(name)
             .expect("plan succeeded so entry exists");
+        if let Some(req) = &opts.version
+            && req.trim() != entry.version
+        {
+            return Err(Error::Unsupported(format!(
+                "custom only publishes its current version; cannot install {} at {}",
+                name, req
+            )));
+        }
         let (_, art) = pick_artifact(entry).expect("plan succeeded");
         if opts.dry_run {
             println!(
@@ -320,7 +328,7 @@ impl CustomBackend {
                 name: plan.name.clone(),
                 version: plan.version.clone(),
                 backend: "custom".into(),
-                cellar_path: cellar_for(&opts.prefix, &plan.name, &plan.version),
+                cellar_path: opts.keg_root().join(&plan.name).join(&plan.version),
                 linked_bins: vec![],
             });
         }
@@ -398,7 +406,7 @@ impl CustomBackend {
                     &plan.name,
                     &plan.version,
                     &bytes,
-                    &opts.prefix,
+                    &opts.keg_root(),
                 )?;
                 // Link any `bin/*` files into the prefix bin.
                 let linked = link_all_bins(&cellar, &opts.prefix)?;
@@ -420,7 +428,7 @@ impl CustomBackend {
             }
             ArtifactKind::Binary => {
                 config::ensure_dirs(&opts.prefix)?;
-                let cellar = cellar_for(&opts.prefix, &plan.name, &plan.version);
+                let cellar = opts.keg_root().join(&plan.name).join(&plan.version);
                 std::fs::create_dir_all(&cellar)?;
                 let binary_path = cellar.join(&plan.name);
                 std::fs::write(&binary_path, &bytes)?;

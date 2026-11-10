@@ -84,7 +84,8 @@ impl AquaBackend {
                 "[dry-run] would install {} {} via aqua ({})",
                 prepared.plan.name, prepared.plan.version, prepared.plan.url
             );
-            let cellar_path = crate::config::cellar_dir(&opts.prefix)
+            let cellar_path = opts
+                .keg_root()
                 .join(&prepared.plan.name)
                 .join(&prepared.plan.version);
             return Ok(InstallOutcome {
@@ -108,7 +109,7 @@ impl AquaBackend {
             &prepared.plan.version,
             &bytes,
             sha.as_deref(),
-            &opts.prefix,
+            &opts.keg_root(),
             prepared.kind,
             &prepared.raw_exe,
         )?;

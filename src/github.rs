@@ -131,7 +131,7 @@ impl GithubBackend {
             &planned.plan.version,
             &bytes,
             sha.as_deref(),
-            &opts.prefix,
+            &opts.keg_root(),
             planned.kind,
             &planned.raw_exe,
         )?;
@@ -569,25 +569,31 @@ pub fn commit_artifact(
     version: &str,
     bytes: &[u8],
     expected_sha: Option<&str>,
-    prefix: &Path,
+    cellar_root: &Path,
     kind: ArtifactKind,
     raw_exe: &str,
 ) -> Result<PathBuf> {
     install::verify_sha256(name, bytes, expected_sha)?;
     match kind {
-        ArtifactKind::TarGz => install::extract_tar_gz_to_cellar(name, version, bytes, prefix),
-        ArtifactKind::Zip => install::extract_zip_to_cellar(name, version, bytes, prefix),
-        ArtifactKind::Raw => write_raw(name, version, bytes, raw_exe, prefix),
+        ArtifactKind::TarGz => install::extract_tar_gz_to_cellar(name, version, bytes, cellar_root),
+        ArtifactKind::Zip => install::extract_zip_to_cellar(name, version, bytes, cellar_root),
+        ArtifactKind::Raw => write_raw(name, version, bytes, raw_exe, cellar_root),
     }
 }
 
-fn write_raw(name: &str, version: &str, bytes: &[u8], exe: &str, prefix: &Path) -> Result<PathBuf> {
+fn write_raw(
+    name: &str,
+    version: &str,
+    bytes: &[u8],
+    exe: &str,
+    cellar_root: &Path,
+) -> Result<PathBuf> {
     if !install::valid_component(exe) {
         return Err(Error::Unsupported(format!(
             "binary name {exe:?} is not a valid path component"
         )));
     }
-    let dest = cellar_path(prefix, name, version);
+    let dest = cellar_root.join(name).join(version);
     if dest.exists() {
         return Ok(dest);
     }
@@ -831,7 +837,7 @@ mod tests {
             "1.0.0",
             b"not-a-tarball",
             Some("deadbeef"),
-            &prefix,
+            &prefix.join("cellar"),
             ArtifactKind::TarGz,
             "hello",
         )

@@ -173,10 +173,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 struct Staging(PathBuf);
 
 impl Staging {
-    fn new(prefix: &Path, name: &str, version: &str) -> Result<Self> {
+    fn new(cellar_root: &Path, name: &str, version: &str) -> Result<Self> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let dir = config::cellar_dir(prefix).join(format!(
+        let dir = cellar_root.join(format!(
             ".tmp-{name}-{version}-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
@@ -203,11 +203,15 @@ fn unpack_tar_gz(name: &str, bytes: &[u8], into: &Path) -> Result<()> {
 /// Extract a `.tar.gz` bottle archive into `<prefix>/cellar/<name>/<version>/`.
 /// Returns the cellar path. The keg appears at its final path only after a
 /// complete unpack (staged, then renamed), so an existing keg is always whole.
-pub fn extract_bottle(name: &str, version: &str, bytes: &[u8], prefix: &Path) -> Result<PathBuf> {
+pub fn extract_bottle(
+    name: &str,
+    version: &str,
+    bytes: &[u8],
+    cellar_root: &Path,
+) -> Result<PathBuf> {
     require_component("package name", name)?;
     require_component("version", version)?;
-    config::ensure_dirs(prefix)?;
-    let dest = config::cellar_dir(prefix).join(name).join(version);
+    let dest = cellar_root.join(name).join(version);
     if dest.exists() {
         return Ok(dest);
     }
@@ -215,7 +219,7 @@ pub fn extract_bottle(name: &str, version: &str, bytes: &[u8], prefix: &Path) ->
         std::fs::create_dir_all(parent)?;
     }
     // Bottle layout is `<name>/<version>/...` inside the archive.
-    let staging = Staging::new(prefix, name, version)?;
+    let staging = Staging::new(cellar_root, name, version)?;
     unpack_tar_gz(name, bytes, &staging.0)?;
     let staged = staging.0.join(name).join(version);
     if !staged.is_dir() {
@@ -234,19 +238,18 @@ pub fn extract_tar_gz_to_cellar(
     name: &str,
     version: &str,
     bytes: &[u8],
-    prefix: &Path,
+    cellar_root: &Path,
 ) -> Result<PathBuf> {
     require_component("package name", name)?;
     require_component("version", version)?;
-    config::ensure_dirs(prefix)?;
-    let dest = config::cellar_dir(prefix).join(name).join(version);
+    let dest = cellar_root.join(name).join(version);
     if dest.exists() {
         return Ok(dest);
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let staging = Staging::new(prefix, name, version)?;
+    let staging = Staging::new(cellar_root, name, version)?;
     unpack_tar_gz(name, bytes, &staging.0)?;
     let mut top: Vec<PathBuf> = std::fs::read_dir(&staging.0)?
         .flatten()
@@ -270,19 +273,18 @@ pub fn extract_zip_to_cellar(
     name: &str,
     version: &str,
     bytes: &[u8],
-    prefix: &Path,
+    cellar_root: &Path,
 ) -> Result<PathBuf> {
     require_component("package name", name)?;
     require_component("version", version)?;
-    config::ensure_dirs(prefix)?;
-    let dest = config::cellar_dir(prefix).join(name).join(version);
+    let dest = cellar_root.join(name).join(version);
     if dest.exists() {
         return Ok(dest);
     }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let staging = Staging::new(prefix, name, version)?;
+    let staging = Staging::new(cellar_root, name, version)?;
     unpack_zip(name, bytes, &staging.0)?;
     let mut top: Vec<PathBuf> = std::fs::read_dir(&staging.0)?
         .flatten()
@@ -792,9 +794,15 @@ mod hardening_tests {
     fn extraction_refuses_traversing_names() {
         let prefix = temp("trav");
         let bytes = tar_gz(&[("pkg/bin/tool", b"x")], &[]);
-        assert!(extract_tar_gz_to_cellar("../evil", "1.0", &bytes, &prefix).is_err());
-        assert!(extract_tar_gz_to_cellar("ok", "../../evil", &bytes, &prefix).is_err());
-        assert!(extract_bottle("a/b", "1.0", &bytes, &prefix).is_err());
+        assert!(
+            extract_tar_gz_to_cellar("../evil", "1.0", &bytes, &config::cellar_dir(&prefix))
+                .is_err()
+        );
+        assert!(
+            extract_tar_gz_to_cellar("ok", "../../evil", &bytes, &config::cellar_dir(&prefix))
+                .is_err()
+        );
+        assert!(extract_bottle("a/b", "1.0", &bytes, &config::cellar_dir(&prefix)).is_err());
         assert!(!prefix.parent().unwrap().join("evil").exists());
         let _ = std::fs::remove_dir_all(&prefix);
     }
@@ -813,7 +821,8 @@ mod hardening_tests {
                 ("pkg-1.0/dangling", "nowhere"),
             ],
         );
-        let keg = extract_tar_gz_to_cellar("pkg", "1.0", &bytes, &prefix).unwrap();
+        let keg =
+            extract_tar_gz_to_cellar("pkg", "1.0", &bytes, &config::cellar_dir(&prefix)).unwrap();
         assert!(keg.join("bin/tool").is_file());
         let link = keg.join("lib/libfoo.so");
         assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
@@ -838,11 +847,13 @@ mod hardening_tests {
         // Truncated gzip stream: unpack fails part-way.
         let mut bytes = tar_gz(&[("pkg/bin/tool", &[7u8; 4096])], &[]);
         bytes.truncate(bytes.len() / 2);
-        assert!(extract_tar_gz_to_cellar("pkg", "1.0", &bytes, &prefix).is_err());
+        assert!(
+            extract_tar_gz_to_cellar("pkg", "1.0", &bytes, &config::cellar_dir(&prefix)).is_err()
+        );
         assert!(!config::cellar_dir(&prefix).join("pkg/1.0").exists());
         // A bottle without the expected <name>/<version> layout also leaves nothing.
         let wrong = tar_gz(&[("other/9/bin/x", b"x")], &[]);
-        assert!(extract_bottle("pkg", "1.0", &wrong, &prefix).is_err());
+        assert!(extract_bottle("pkg", "1.0", &wrong, &config::cellar_dir(&prefix)).is_err());
         assert!(!config::cellar_dir(&prefix).join("pkg/1.0").exists());
         let _ = std::fs::remove_dir_all(&prefix);
     }
@@ -915,7 +926,12 @@ mod hardening_tests {
         }
         let prefix = temp("zip-slip");
         let outside = prefix.join("evil.txt");
-        let err = extract_zip_to_cellar("pkg", "1.0.0", &cursor.into_inner(), &prefix);
+        let err = extract_zip_to_cellar(
+            "pkg",
+            "1.0.0",
+            &cursor.into_inner(),
+            &config::cellar_dir(&prefix),
+        );
         assert!(err.is_err(), "zip-slip must fail");
         assert!(!outside.exists());
         assert!(!config::cellar_dir(&prefix).join("pkg/1.0.0").exists());
@@ -934,7 +950,13 @@ mod hardening_tests {
             writer.finish().unwrap();
         }
         let prefix = temp("zip-ok");
-        let dest = extract_zip_to_cellar("pkg", "1.0.0", &cursor.into_inner(), &prefix).unwrap();
+        let dest = extract_zip_to_cellar(
+            "pkg",
+            "1.0.0",
+            &cursor.into_inner(),
+            &config::cellar_dir(&prefix),
+        )
+        .unwrap();
         assert_eq!(std::fs::read(dest.join("bin/hello")).unwrap(), b"hi");
         let _ = std::fs::remove_dir_all(&prefix);
     }

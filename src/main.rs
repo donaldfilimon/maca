@@ -26,6 +26,7 @@
 
 use clap::{CommandFactory, Parser, Subcommand};
 use serde::Serialize;
+use std::path::PathBuf;
 use tokio::sync::Semaphore;
 
 use maca::backend::{self, BackendKind, InstallOptions};
@@ -381,6 +382,9 @@ async fn main() {
 
 struct Ctx {
     prefix: std::path::PathBuf,
+    /// Resolved cellar root. When set, kegs live under this root while bin/opt/share
+    /// links stay under the prefix. Defaults to `<prefix>/cellar`.
+    cellar: std::path::PathBuf,
     backend: BackendKind,
     jobs: usize,
     custom_registry_urls: Vec<String>,
@@ -401,16 +405,43 @@ impl Ctx {
                 .map(BackendKind::from_str_lossy)
                 .unwrap_or(BackendKind::Auto)
         });
-        Ok(Self {
-            // A flag or MACA_PREFIX is explicit and wins. Otherwise a
-            // maca.toml in this directory or one above it scopes the prefix
-            // to the project, and only then does the user config apply.
-            prefix: prefix.unwrap_or_else(|| {
-                std::env::current_dir()
+        // Resolve prefix first (flag or MACA_PREFIX > project maca.toml > config > default).
+        let resolved_prefix = prefix.unwrap_or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|dir| config::project_prefix(&dir))
+                .unwrap_or_else(|| cfg.prefix())
+        });
+        // Cellar resolution: MACA_CELLAR > project or user config `cellar` > <prefix>/cellar.
+        let resolved_cellar = std::env::current_dir()
+            .ok()
+            .and_then(|dir| config::project_cellar(&dir))
+            .map(|c| {
+                if c.is_absolute() {
+                    c
+                } else {
+                    resolved_prefix.join(c)
+                }
+            })
+            .or_else(|| {
+                cfg.cellar.as_ref().map(|c| {
+                    if c.is_absolute() {
+                        c.clone()
+                    } else {
+                        resolved_prefix.join(c)
+                    }
+                })
+            })
+            .or_else(|| {
+                std::env::var("MACA_CELLAR")
                     .ok()
-                    .and_then(|dir| config::project_prefix(&dir))
-                    .unwrap_or_else(|| cfg.prefix())
-            }),
+                    .filter(|s| !s.trim().is_empty())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| config::cellar_dir(&resolved_prefix));
+        Ok(Self {
+            prefix: resolved_prefix,
+            cellar: resolved_cellar,
             backend: resolved_backend,
             jobs: jobs.max(1),
             custom_registry_urls: cfg.custom_registry_urls,
@@ -427,6 +458,7 @@ impl Ctx {
         InstallOptions {
             dry_run,
             prefix: self.prefix.clone(),
+            cellar: Some(self.cellar.clone()),
             kind,
             build_from_source,
             no_snapshot,
@@ -655,6 +687,7 @@ async fn install_many(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> 
         .collect();
     for name in packages {
         let ctx_prefix = ctx.prefix.clone();
+        let ctx_cellar = ctx.cellar.clone();
         let backend = ctx.backend;
         let name = name.clone();
         let sem = semaphore.clone();
@@ -668,6 +701,7 @@ async fn install_many(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> 
             let opts = InstallOptions {
                 dry_run: dry,
                 prefix: ctx_prefix.clone(),
+                cellar: Some(ctx_cellar),
                 kind,
                 build_from_source: bfs,
                 no_snapshot: true,
@@ -808,6 +842,7 @@ impl maca::upgrade::UpgradeEnv for LiveUpgradeEnv<'_> {
         let opts = InstallOptions {
             dry_run: false,
             prefix: self.ctx.prefix.clone(),
+            cellar: Some(self.ctx.cellar.clone()),
             kind: record.kind,
             build_from_source: false,
             no_snapshot: true,
@@ -1620,12 +1655,14 @@ async fn cmd_group(ctx: &Ctx, action: GroupCommands) -> Result<()> {
             for entry in &g.packages {
                 let sem = semaphore.clone();
                 let prefix = ctx.prefix.clone();
+                let cellar = ctx.cellar.clone();
                 let entry = entry.clone();
                 handles.push(tokio::spawn(async move {
                     let _permit = sem.acquire().await.expect("semaphore closed");
                     let opts = InstallOptions {
                         dry_run,
                         prefix,
+                        cellar: Some(cellar),
                         kind: entry.kind,
                         build_from_source: false,
                         no_snapshot: true,
@@ -1790,12 +1827,14 @@ async fn sync_inner(ctx: &Ctx, lock: &group::Lockfile, dry_run: bool, prune: boo
         }
         let sem = semaphore.clone();
         let prefix = ctx.prefix.clone();
+        let cellar = ctx.cellar.clone();
         let entry = entry.clone();
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
             let opts = InstallOptions {
                 dry_run,
                 prefix,
+                cellar: Some(cellar),
                 kind: entry.kind,
                 build_from_source: false,
                 no_snapshot: true,

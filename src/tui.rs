@@ -500,6 +500,7 @@ async fn install_pkg(prefix: &std::path::Path, name: &str, backend: &str, status
     let opts = crate::backend::InstallOptions {
         dry_run: false,
         prefix: prefix.to_path_buf(),
+        cellar: None,
         ..Default::default()
     };
     let result = crate::backend::install_with_backend(backend, name, &opts).await;
@@ -580,6 +581,7 @@ async fn install_group(prefix: &std::path::Path, group: &Group, status: &mut Str
         let opts = crate::backend::InstallOptions {
             dry_run: false,
             prefix: prefix.to_path_buf(),
+            cellar: None,
             kind: entry.kind,
             ..Default::default()
         };

@@ -26,6 +26,10 @@ pub struct Config {
     /// Override install prefix. Empty => default layout.
     #[serde(default)]
     pub prefix: Option<PathBuf>,
+    /// Override the cellar root. If set, kegs live here while bin/opt/share stay
+    /// under the prefix. Empty => use <prefix>/cellar.
+    #[serde(default)]
+    pub cellar: Option<PathBuf>,
     /// Default backend for install/search when `--backend` is omitted.
     #[serde(default)]
     pub default_backend: Option<String>,
@@ -70,6 +74,29 @@ impl Config {
             return p.clone();
         }
         default_prefix()
+    }
+
+    /// Cellar root for kegs.
+    ///
+    /// Resolution: `MACA_CELLAR` > `cellar` field > `<prefix>/cellar`.
+    pub fn cellar(&self, prefix: &std::path::Path) -> PathBuf {
+        self.cellar_with_env(std::env::var("MACA_CELLAR").ok().as_deref(), prefix)
+    }
+
+    /// Cellar resolution given an explicit `MACA_CELLAR` value (pure, testable).
+    pub fn cellar_with_env(&self, env_value: Option<&str>, prefix: &std::path::Path) -> PathBuf {
+        if let Some(env) = env_value
+            && !env.trim().is_empty()
+        {
+            return PathBuf::from(env);
+        }
+        if let Some(c) = &self.cellar {
+            if c.is_absolute() {
+                return c.clone();
+            }
+            return prefix.join(c);
+        }
+        cellar_dir(prefix)
     }
 }
 
@@ -138,12 +165,28 @@ pub fn project_prefix(start: &std::path::Path) -> Option<PathBuf> {
     };
     while let Some(cur) = dir {
         let file = cur.join("maca.toml");
-        if let Some(prefix) = prefix_in_project_file(&file) {
-            return Some(if prefix.is_absolute() {
-                prefix
-            } else {
-                cur.join(prefix)
-            });
+        if let Some(p) = prefix_in_project_file(&file) {
+            return Some(if p.is_absolute() { p } else { cur.join(p) });
+        }
+        dir = cur.parent();
+    }
+    None
+}
+
+/// The nearest `maca.toml` walking up from `start`, if one names a cellar root.
+///
+/// Combined with `project_prefix`, this lets a project share a common
+/// keg location while keeping its own bin/opt/share links under its prefix.
+pub fn project_cellar(start: &std::path::Path) -> Option<PathBuf> {
+    let mut dir = if start.is_dir() {
+        Some(start)
+    } else {
+        start.parent()
+    };
+    while let Some(cur) = dir {
+        let file = cur.join("maca.toml");
+        if let Some(c) = cellar_in_project_file(&file) {
+            return Some(if c.is_absolute() { c } else { cur.join(c) });
         }
         dir = cur.parent();
     }
@@ -154,6 +197,12 @@ fn prefix_in_project_file(path: &std::path::Path) -> Option<PathBuf> {
     let text = std::fs::read_to_string(path).ok()?;
     let cfg: Config = toml::from_str(&text).ok()?;
     cfg.prefix.filter(|p| !p.as_os_str().is_empty())
+}
+
+fn cellar_in_project_file(path: &std::path::Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let cfg: Config = toml::from_str(&text).ok()?;
+    cfg.cellar.filter(|c| !c.as_os_str().is_empty())
 }
 
 /// True when `path` lies inside `root`. Compared as written first, then with

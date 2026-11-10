@@ -70,6 +70,9 @@ pub struct InstallPlan {
 pub struct InstallOptions {
     pub dry_run: bool,
     pub prefix: std::path::PathBuf,
+    /// When set, kegs are stored under this directory instead of the prefix cellar.
+    /// Links (bin, opt, share) and the prefix lock remain under `prefix`.
+    pub cellar: Option<std::path::PathBuf>,
     /// Package kind recorded in the ledger (app, plugin, cli, ...).
     pub kind: crate::group::Kind,
     /// Compile from source instead of using a prebuilt bottle/installer.
@@ -86,11 +89,23 @@ pub struct InstallOptions {
     pub version: Option<String>,
 }
 
+impl InstallOptions {
+    /// The directory under which kegs for this package are stored.
+    /// Resolves `cellar` when set, falling back to `<prefix>/cellar`.
+    pub fn keg_root(&self) -> std::path::PathBuf {
+        match &self.cellar {
+            Some(c) if !c.as_os_str().is_empty() => c.clone(),
+            _ => crate::config::cellar_dir(&self.prefix),
+        }
+    }
+}
+
 impl Default for InstallOptions {
     fn default() -> Self {
         Self {
             dry_run: false,
             prefix: std::path::PathBuf::new(),
+            cellar: None,
             kind: crate::group::Kind::App,
             build_from_source: false,
             no_snapshot: false,
@@ -319,17 +334,15 @@ pub async fn install_with_backend(
     if let Some(existing) = state::installed_elsewhere(name, &config::cellar_dir(&opts.prefix))? {
         return Err(state::elsewhere_error(name, &existing));
     }
+    let kind = BackendKind::from_str_lossy(backend);
     // A requested version under `auto` has nowhere to go: falling through
     // could install a different backend's current version, and the caller
-    // would have no way to tell the request was ignored. A named backend that
-    // cannot fetch an older artifact still installs its current one; the
-    // caller's version check then reports the mismatch.
-    let kind = BackendKind::from_str_lossy(backend);
+    // would have no way to tell the request was ignored.
     if opts.version.is_some() && kind == BackendKind::Auto {
         let version = opts.version.as_deref().unwrap_or_default();
         return Err(crate::Error::Unsupported(format!(
             "installing {name} at version {version} needs an explicit backend; \
-             `--backend auto` cannot tell which catalog should serve it"
+    	         `--backend auto` cannot tell which catalog should serve it"
         )));
     }
     match kind {
@@ -475,6 +488,7 @@ pub async fn apply_planned_upgrade(
     let opts = InstallOptions {
         dry_run: false,
         prefix: prefix.to_path_buf(),
+        cellar: None,
         kind: record.kind,
         ..Default::default()
     };
