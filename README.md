@@ -80,7 +80,15 @@ maca custom remove hello
 ## Safety
 
 - **Exclusive prefix lock** (`<prefix>/.maca.lock`, `flock`/`LockFileEx`) so
-  concurrent maca processes cannot race the ledger or cellar.
+  concurrent maca processes cannot race the ledger or cellar. `upgrade` (CLI
+  and TUI) checks catalog versions **without** the lock, then takes it only to
+  change state and re-validates each planned upgrade against the ledger and
+  pins at that point, so a plan that went stale (another upgrade, a new pin,
+  a removal) is skipped rather than applied. This holds by construction; the
+  CLI orchestration is unit-tested with fakes (lock free during checks, held
+  during apply, stale plans skipped), the TUI path only by a source-ordering
+  test, and no test runs two real processes. Packages recorded under another
+  prefix are reported as skipped, not upgraded.
 - **Concurrent installs** with a bounded job pool (`--jobs`, default 4); ledger
   writes are serialized.
 - **Automatic snapshot** before `install`/`remove`/`upgrade`/`sync`/`group
@@ -173,7 +181,7 @@ expands to the install destination.
 | Snapshots | `z` restore |
 
 `q` or `Ctrl-C` quits. `1`–`4` switch tabs. Each action locks the prefix
-only while it runs, so other `maca` commands work while the TUI is open; if
+only while it runs (an upgrade's version check runs before the lock), so other `maca` commands work while the TUI is open; if
 one is running, the action reports "prefix busy" instead of waiting.
 
 ## Self-update
@@ -188,6 +196,18 @@ Release asset convention: `maca-<target>.tar.gz` plus
 `maca-<target>.tar.gz.sha256`, where `<target>` is a Rust target
 triple such as `aarch64-apple-darwin`.
 
+On Windows the asset is `maca-<target>.zip` (plus `.sha256`) holding
+`maca.exe`. The checksum is verified on the archive before extraction. The
+extractor rejects any entry with an absolute or `..` path, takes only
+`maca.exe` (one regular file at the archive root or one directory down; more
+than one is an error), reads at most 256 MiB of it, and fails with a typed
+error if the binary is missing or the archive is corrupt. The `.tar.gz` path
+follows the same rules. The running
+`maca.exe` is replaced by renaming it to a `maca.bak.<timestamp>` backup and
+renaming the new file into place. The repository's release workflow and
+`package-release.sh` produce only `.tar.gz` archives today, so no Windows
+`.zip` asset exists to download yet.
+
 ## Limits (honest scope)
 
 - **Windows installer execution is implemented but unverified.** No Windows
@@ -197,6 +217,11 @@ triple such as `aarch64-apple-darwin`.
 - **Self-update is implemented but unverified.** No release is published for
   the default repository yet, so the download-and-replace path has not run
   against a real release.
+- **Windows self-update has never run on Windows.** The `.zip` extraction and
+  the rename-based replacement helper are platform-independent code that is
+  unit-tested on macOS only (zip archives built in the tests). The Windows
+  call path that feeds them, and replacing a running `maca.exe`, are
+  compile-checked at most (`scripts/cross-check.sh`), not executed.
 - **Source builds are best-effort.** Autotools, CMake, Meson, Make, Cargo, and
   Python projects are detected; projects with bespoke build systems fail with a
   clear message and a log path.

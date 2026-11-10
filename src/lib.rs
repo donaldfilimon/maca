@@ -16,6 +16,7 @@ pub mod snapshot;
 pub mod source;
 pub mod state;
 pub mod tui;
+pub mod upgrade;
 pub mod winget;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -36,6 +37,8 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    #[error("{0}")]
+    Archive(#[from] selfupdate::ArchiveError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]

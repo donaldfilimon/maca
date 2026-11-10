@@ -243,10 +243,10 @@ async fn event_loop(
             continue;
         }
         // Mutating keys take the prefix lock for that one action (never for
-        // the whole session), so a TUI left open does not block other maca
+        // the whole session; `u` takes it itself, after its network check), so a TUI left open does not block other maca
         // commands, and a busy prefix shows up as a status message instead
         // of a hang.
-        let mutating = matches!(key.code, KeyCode::Char('i' | 'r' | 'u' | 's' | 'g' | 'z'));
+        let mutating = matches!(key.code, KeyCode::Char('i' | 'r' | 's' | 'g' | 'z'));
         let _lock = if mutating {
             match crate::lock::PrefixLock::try_acquire(prefix) {
                 Ok(Some(lock)) => Some(lock),
@@ -377,7 +377,35 @@ fn remove_pkg(prefix: &std::path::Path, name: &str, status: &mut String) {
     };
 }
 
+/// Lock-ordering contract (guarded by `upgrade_takes_the_lock_after_the_check`):
+/// the network check runs first with no lock; the prefix lock is taken only
+/// afterwards, here, and `event_loop` must not take it for `u` (flock is not
+/// re-entrant, so that would always report "prefix busy").
 async fn upgrade_pkg(prefix: &std::path::Path, name: &str, status: &mut String) {
+    // Version check first, with no lock held (it is a network call).
+    let planned = match crate::backend::plan_upgrade(name).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(msg)) => {
+            *status = msg;
+            return;
+        }
+        Err(e) => {
+            *status = format!("upgrade check failed: {e}");
+            return;
+        }
+    };
+    // Lock only around the state change; the plan is re-validated under it.
+    let _lock = match crate::lock::PrefixLock::try_acquire(prefix) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            *status = "prefix busy: another maca command is running".into();
+            return;
+        }
+        Err(e) => {
+            *status = format!("cannot lock prefix: {e}");
+            return;
+        }
+    };
     let snap = match snapshot_before(prefix, "upgrade") {
         Ok(s) => s,
         Err(msg) => {
@@ -385,7 +413,7 @@ async fn upgrade_pkg(prefix: &std::path::Path, name: &str, status: &mut String) 
             return;
         }
     };
-    *status = match crate::backend::upgrade_with_prefix(prefix, name).await {
+    *status = match crate::backend::apply_planned_upgrade(prefix, &planned).await {
         Ok(msg) => msg,
         Err(e) => format!("upgrade failed: {e}; {}", roll_back(prefix, &snap)),
     };
@@ -618,6 +646,21 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(titles.len(), sorted.len());
+    }
+
+    #[test]
+    fn upgrade_takes_the_lock_after_the_check() {
+        // Source-level guard: the TUI has no test seam for the network check.
+        let src = include_str!("tui.rs");
+        let body = &src[src.find("async fn upgrade_pkg(").unwrap()..];
+        let body = &body[..body.find("\nfn ").unwrap_or(body.len())];
+        let check = body.find("plan_upgrade(").unwrap();
+        let lock = body.find("try_acquire(").unwrap();
+        let apply = body.find("apply_planned_upgrade(").unwrap();
+        assert!(check < lock && lock < apply);
+        let mutating = src.find("let mutating = matches!").unwrap();
+        let line = &src[mutating..][..src[mutating..].find(';').unwrap()];
+        assert!(!line.contains("'u'"), "event_loop must not lock for `u`");
     }
 
     #[test]

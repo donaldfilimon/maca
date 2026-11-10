@@ -5,7 +5,8 @@
 //! maca-<target>.tar.gz      (contains the `maca` binary)
 //! maca-<target>.tar.gz.sha256
 //! ```
-//! where `<target>` is a Rust target triple such as `aarch64-apple-darwin`.
+//! (`maca-<target>.zip` containing `maca.exe` on Windows) where `<target>` is
+//! a Rust target triple such as `aarch64-apple-darwin`.
 //! The asset name carries no version; the release tag does.
 //!
 //! The current binary is backed up next to itself as `maca.bak.<timestamp>`
@@ -155,59 +156,230 @@ pub async fn run(repo: &str, current_version: &str, force: bool) -> Result<Strin
     Ok(tag)
 }
 
-/// Extract the `maca` binary from a `.tar.gz` or `.zip` archive into a temp path.
+/// Upper bound on the bytes read for the extracted binary (a zip/gzip bomb
+/// guard). The release binary is a few MiB; this leaves a wide margin.
+const MAX_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Typed failures of archive extraction.
+#[derive(Debug, thiserror::Error)]
+pub enum ArchiveError {
+    #[error("update archive is corrupt or unreadable: {0}")]
+    Corrupt(String),
+    #[error("update archive did not contain a `{0}` binary")]
+    MissingBinary(String),
+    #[error("update archive contains more than one `{0}` (at the root or one directory down)")]
+    Ambiguous(String),
+    #[error("update archive entry has an unsafe path (absolute or `..`): {0:?}")]
+    UnsafePath(String),
+    #[error("update archive entry `{name}` is not a regular file")]
+    NotRegularFile { name: String },
+    #[error("update archive entry `{name}` exceeds the {limit}-byte limit")]
+    TooLarge { name: String, limit: u64 },
+    #[error("writing the extracted binary: {0}")]
+    Io(String),
+}
+
+/// True if `path` is absolute or climbs out with `..`.
+fn path_is_unsafe(path: &Path) -> bool {
+    use std::path::Component;
+    path.components().any(|c| {
+        matches!(
+            c,
+            Component::RootDir | Component::Prefix(_) | Component::ParentDir
+        )
+    })
+}
+
+/// True if `path` is exactly `bin_name`, at the archive root or one top
+/// directory down (`./` is ignored). Deeper copies (docs/examples/maca) are
+/// not the binary.
+fn is_binary_path(path: &Path, bin_name: &str) -> bool {
+    use std::path::Component;
+    let parts: Vec<_> = path
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect();
+    matches!(parts.len(), 1 | 2)
+        && parts
+            .last()
+            .is_some_and(|c| matches!(c, Component::Normal(n) if *n == bin_name))
+}
+
+/// Create the staging file. `create_new` refuses an existing file or a
+/// symlink planted at the path, so nothing is written through a link.
+fn create_staging(dest: &Path) -> std::result::Result<std::fs::File, ArchiveError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .map_err(|e| ArchiveError::Io(e.to_string()))
+}
+
+/// Copy at most `max_bytes` from `entry` into a new file at `dest`. The size
+/// the archive declares can lie, so the read itself is bounded. On any error
+/// after the file was created it is removed again.
+fn copy_bounded(
+    entry: impl std::io::Read,
+    name: &str,
+    dest: &Path,
+    max_bytes: u64,
+) -> std::result::Result<(), ArchiveError> {
+    let mut out = create_staging(dest)?;
+    let result = (|| {
+        let mut limited = std::io::Read::take(entry, max_bytes + 1);
+        // A CRC or inflate failure surfaces here as an io error.
+        let copied = std::io::copy(&mut limited, &mut out)
+            .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
+        if copied > max_bytes {
+            return Err(ArchiveError::TooLarge {
+                name: name.to_string(),
+                limit: max_bytes,
+            });
+        }
+        out.sync_all().map_err(|e| ArchiveError::Io(e.to_string()))
+    })();
+    if result.is_err() {
+        drop(out);
+        let _ = std::fs::remove_file(dest);
+    }
+    result
+}
+
+/// Extract `bin_name` from a `.zip` archive into a new file at `dest`.
+///
+/// Platform-independent (unit-tested on every host). Every entry's name must
+/// be enclosed (no absolute path, no `..`) or the whole archive is rejected;
+/// exactly one regular file named `bin_name` (archive root or one top
+/// directory) is extracted, more than one is ambiguous; at most `max_bytes`
+/// of it are read. `dest` must not exist; on error nothing is left at it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn extract_zip_binary(
+    archive: &[u8],
+    bin_name: &str,
+    dest: &Path,
+    max_bytes: u64,
+) -> std::result::Result<(), ArchiveError> {
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))
+        .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
+    // Validate every entry name first so a hostile archive is rejected even
+    // if its bad entry comes after the binary.
+    let mut target: Option<usize> = None;
+    for i in 0..zip.len() {
+        let entry = zip
+            .by_index_raw(i)
+            .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
+        let Some(path) = entry.enclosed_name() else {
+            return Err(ArchiveError::UnsafePath(entry.name().to_string()));
+        };
+        if entry.is_dir() || !is_binary_path(&path, bin_name) {
+            continue;
+        }
+        // Symlinks (Unix mode bits in the zip) are not regular files.
+        if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
+            return Err(ArchiveError::NotRegularFile {
+                name: entry.name().to_string(),
+            });
+        }
+        if target.replace(i).is_some() {
+            return Err(ArchiveError::Ambiguous(bin_name.to_string()));
+        }
+    }
+    let index = target.ok_or_else(|| ArchiveError::MissingBinary(bin_name.to_string()))?;
+    let entry = zip
+        .by_index(index)
+        .map_err(|e| ArchiveError::Corrupt(e.to_string()))?;
+    let name = entry.name().to_string();
+    if entry.size() > max_bytes {
+        return Err(ArchiveError::TooLarge {
+            name,
+            limit: max_bytes,
+        });
+    }
+    copy_bounded(entry, &name, dest, max_bytes)
+}
+
+/// Extract `bin_name` from a `.tar.gz` archive into a new file at `dest`,
+/// with the same rules as [`extract_zip_binary`]: no absolute or `..` entry
+/// anywhere, exactly one regular-file match (symlinks and other special
+/// entries are refused), bounded read, `dest` created with `create_new`.
+/// Platform-independent so it is unit-tested on every host.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn extract_tar_gz_binary(
+    archive: &[u8],
+    bin_name: &str,
+    dest: &Path,
+    max_bytes: u64,
+) -> std::result::Result<(), ArchiveError> {
+    let corrupt = |e: std::io::Error| ArchiveError::Corrupt(e.to_string());
+    let open = || tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    // Pass 1: validate every path and find the single match.
+    let mut matches = 0usize;
+    for entry in open().entries().map_err(corrupt)? {
+        let entry = entry.map_err(corrupt)?;
+        let path = entry.path().map_err(corrupt)?.to_path_buf();
+        if path_is_unsafe(&path) {
+            return Err(ArchiveError::UnsafePath(path.display().to_string()));
+        }
+        if entry.header().entry_type().is_dir() || !is_binary_path(&path, bin_name) {
+            continue;
+        }
+        if !entry.header().entry_type().is_file() {
+            return Err(ArchiveError::NotRegularFile {
+                name: path.display().to_string(),
+            });
+        }
+        matches += 1;
+    }
+    match matches {
+        0 => return Err(ArchiveError::MissingBinary(bin_name.to_string())),
+        1 => {}
+        _ => return Err(ArchiveError::Ambiguous(bin_name.to_string())),
+    }
+    // Pass 2: extract it.
+    for entry in open().entries().map_err(corrupt)? {
+        let entry = entry.map_err(corrupt)?;
+        let path = entry.path().map_err(corrupt)?.to_path_buf();
+        if entry.header().entry_type().is_file() && is_binary_path(&path, bin_name) {
+            if entry.size() > max_bytes {
+                return Err(ArchiveError::TooLarge {
+                    name: path.display().to_string(),
+                    limit: max_bytes,
+                });
+            }
+            return copy_bounded(entry, &path.display().to_string(), dest, max_bytes);
+        }
+    }
+    Err(ArchiveError::MissingBinary(bin_name.to_string()))
+}
+
+/// Extract the `maca` binary (`maca.exe` on Windows) from the release archive
+/// (`.tar.gz`, or `.zip` on Windows) into a temp path.
 fn extract_binary(archive: &[u8], exe: &Path) -> Result<PathBuf> {
     // Staged next to the running binary so the final rename never crosses a
-    // filesystem boundary.
+    // filesystem boundary. The name is unpredictable and the file is created
+    // with `create_new`, so a planted file or symlink makes this fail instead
+    // of being written through.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let tmp = exe
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!(".maca-update-{}", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+        .join(format!(".maca-update-{}-{nanos:x}", std::process::id()));
     #[cfg(target_os = "windows")]
     {
-        // Windows releases would be .zip, which the current deps cannot
-        // unpack, so self-update is not available there.
-        let _ = (archive, exe, tmp);
-        Err(Error::Unsupported(
-            "self-update is not supported on Windows yet (no .zip extraction)".into(),
-        ))
+        extract_zip_binary(archive, "maca.exe", &tmp, MAX_BINARY_BYTES)?;
+        Ok(tmp)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let gz = flate2::read::GzDecoder::new(archive);
-        let mut tar = tar::Archive::new(gz);
-        let mut found = false;
-        for entry in tar
-            .entries()
-            .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
-        {
-            let mut entry = entry.map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
-            let path = entry
-                .path()
-                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?
-                .to_path_buf();
-            // Accept the binary at the archive root or inside a single top dir.
-            if path.file_name().and_then(|s| s.to_str()) != Some("maca") {
-                continue;
-            }
-            entry
-                .unpack(&tmp)
-                .map_err(|e| Error::Other(anyhow::anyhow!(e)))?;
-            found = true;
-            break;
+        extract_tar_gz_binary(archive, "maca", &tmp, MAX_BINARY_BYTES)?;
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
         }
-        if !found {
-            return Err(Error::Other(anyhow::anyhow!(
-                "update archive did not contain a `maca` binary"
-            )));
-        }
-        #[cfg(not(windows))]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-        }
-        let _ = exe;
         Ok(tmp)
     }
 }
@@ -235,10 +407,23 @@ fn replace_with_backup(exe: &Path, new_binary: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        // Windows cannot replace a running binary; copy the backup and write
-        // the new bytes in place.
-        std::fs::copy(exe, &backup)?;
-        std::fs::copy(new_binary, exe)?;
+        swap_in_by_rename(exe, new_binary, &backup)?;
+    }
+    Ok(())
+}
+
+/// Replace `exe` with `new_binary` by renaming, which Windows allows even for
+/// a running executable (writing to or deleting it is what it refuses): the
+/// running binary is renamed to `backup`, then the new one takes its name. If
+/// the second rename fails the original is moved back. Platform-independent
+/// so it is unit-tested on every host; Windows is its only caller.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn swap_in_by_rename(exe: &Path, new_binary: &Path, backup: &Path) -> Result<()> {
+    std::fs::rename(exe, backup)?;
+    if let Err(e) = std::fs::rename(new_binary, exe) {
+        // Put the original back so a failed update leaves a working binary.
+        let _ = std::fs::rename(backup, exe);
+        return Err(e.into());
     }
     Ok(())
 }
@@ -304,5 +489,284 @@ mod tests {
         };
         assert_eq!(repo_from_env(&cfg2, None), "config/repo");
         assert_eq!(repo_from_env(&cfg2, Some("env/repo")), "env/repo");
+    }
+
+    // ---- zip extraction (platform-independent; run on the host, never on
+    // Windows as of writing) ----
+
+    use std::io::Write;
+
+    fn zip_with(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, data) in entries {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(data).unwrap();
+        }
+        w.finish().unwrap().into_inner()
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("maca-zip-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn zip_extracts_binary_at_root_and_in_top_dir() {
+        let dir = scratch("ok");
+        for (tag, name) in [("root", "maca.exe"), ("nested", "maca-x86_64/maca.exe")] {
+            let zip = zip_with(&[("README.txt", b"hi"), (name, b"MZ-binary-bytes")]);
+            let dest = dir.join(tag);
+            extract_zip_binary(&zip, "maca.exe", &dest, 1024).unwrap();
+            assert_eq!(std::fs::read(&dest).unwrap(), b"MZ-binary-bytes");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zip_without_the_binary_is_a_typed_error() {
+        let dir = scratch("missing");
+        let dest = dir.join("out");
+        let zip = zip_with(&[("README.txt", b"hi"), ("maca", b"wrong platform name")]);
+        let err = extract_zip_binary(&zip, "maca.exe", &dest, 1024).unwrap_err();
+        assert!(matches!(err, ArchiveError::MissingBinary(ref n) if n == "maca.exe"));
+        assert!(!dest.exists());
+        // It converts into the crate error with its message intact.
+        let e: Error = ArchiveError::MissingBinary("maca.exe".into()).into();
+        assert!(matches!(e, Error::Archive(ArchiveError::MissingBinary(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zip_with_traversal_or_absolute_entry_is_rejected() {
+        let dir = scratch("traversal");
+        let dest = dir.join("out");
+        for bad in ["../maca.exe", "a/../../maca.exe", "/abs/maca.exe"] {
+            let zip = zip_with(&[(bad, b"evil")]);
+            let err = extract_zip_binary(&zip, "maca.exe", &dest, 1024).unwrap_err();
+            assert!(matches!(err, ArchiveError::UnsafePath(_)), "{bad}: {err}");
+            assert!(!dest.exists());
+        }
+        // A bad entry after a good binary still rejects the archive.
+        let zip = zip_with(&[("maca.exe", b"ok"), ("../evil.txt", b"x")]);
+        let err = extract_zip_binary(&zip, "maca.exe", &dest, 1024).unwrap_err();
+        assert!(matches!(err, ArchiveError::UnsafePath(_)));
+        assert!(!dest.exists());
+        assert!(!dir.parent().unwrap().join("evil.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_zip_entry_is_refused_and_leaves_nothing() {
+        let dir = scratch("big");
+        let dest = dir.join("out");
+        // 1 MiB of zeros deflates to ~1 KiB: the zip-bomb shape.
+        let zip = zip_with(&[("maca.exe", &vec![0u8; 1024 * 1024])]);
+        assert!(zip.len() < 8 * 1024);
+        let err = extract_zip_binary(&zip, "maca.exe", &dest, 64 * 1024).unwrap_err();
+        assert!(matches!(err, ArchiveError::TooLarge { limit, .. } if limit == 64 * 1024));
+        assert!(!dest.exists());
+        // Exactly at the limit is fine.
+        let zip = zip_with(&[("maca.exe", &vec![1u8; 4096])]);
+        extract_zip_binary(&zip, "maca.exe", &dest, 4096).unwrap();
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 4096);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_zip_is_a_typed_error() {
+        let dir = scratch("corrupt");
+        let dest = dir.join("out");
+        let err = extract_zip_binary(b"definitely not a zip", "maca.exe", &dest, 1024).unwrap_err();
+        assert!(matches!(err, ArchiveError::Corrupt(_)));
+        let mut zip = zip_with(&[("maca.exe", &vec![7u8; 2048])]);
+        zip.truncate(zip.len() / 2);
+        let err = extract_zip_binary(&zip, "maca.exe", &dest, 4096).unwrap_err();
+        assert!(matches!(err, ArchiveError::Corrupt(_)));
+        // Flip a byte inside the compressed data of a full archive.
+        let mut zip = zip_with(&[("maca.exe", b"some reasonably long binary payload")]);
+        zip[40] ^= 0xff;
+        let res = extract_zip_binary(&zip, "maca.exe", &dest, 4096);
+        assert!(res.is_err());
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zip_ignores_deep_copies_and_rejects_ambiguity() {
+        let dir = scratch("depth");
+        let dest = dir.join("out");
+        // A deeper sample listed first is not the binary.
+        let zip = zip_with(&[
+            ("docs/examples/maca.exe", b"fixture"),
+            ("maca.exe", b"real"),
+        ]);
+        extract_zip_binary(&zip, "maca.exe", &dest, 1024).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"real");
+        std::fs::remove_file(&dest).unwrap();
+        // Only a deep copy: missing.
+        let zip = zip_with(&[("a/b/maca.exe", b"deep")]);
+        let err = extract_zip_binary(&zip, "maca.exe", &dest, 1024).unwrap_err();
+        assert!(matches!(err, ArchiveError::MissingBinary(_)));
+        // Two candidates at allowed depths: ambiguous, nothing written.
+        let zip = zip_with(&[("maca.exe", b"one"), ("top/maca.exe", b"two")]);
+        let err = extract_zip_binary(&zip, "maca.exe", &dest, 1024).unwrap_err();
+        assert!(matches!(err, ArchiveError::Ambiguous(_)));
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zip_with_a_lying_size_header_is_bounded_by_the_read() {
+        let dir = scratch("lie");
+        let dest = dir.join("out");
+        let mut zip = zip_with(&[("maca.exe", &vec![0u8; 1024 * 1024])]);
+        let patch = |zip: &mut Vec<u8>, sig: &[u8; 4], off: usize| {
+            let at = zip.windows(4).position(|w| w == sig).unwrap() + off;
+            zip[at..at + 4].copy_from_slice(&100u32.to_le_bytes());
+        };
+        // Declared uncompressed size: local header +22, central directory +24.
+        patch(&mut zip, b"PK\x03\x04", 22);
+        patch(&mut zip, b"PK\x01\x02", 24);
+        let mut z = zip::ZipArchive::new(std::io::Cursor::new(&zip)).unwrap();
+        assert_eq!(z.by_index(0).unwrap().size(), 100, "header patch applied");
+        drop(z);
+        // The declared 100 bytes pass the header check; the 1 MiB inflate
+        // must still be stopped by the bounded read.
+        let err = extract_zip_binary(&zip, "maca.exe", &dest, 64 * 1024).unwrap_err();
+        assert!(matches!(err, ArchiveError::TooLarge { .. }), "{err}");
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staging_file_is_never_written_through_an_existing_path() {
+        let dir = scratch("create-new");
+        let dest = dir.join("out");
+        std::fs::write(&dest, b"planted").unwrap();
+        let zip = zip_with(&[("maca.exe", b"new")]);
+        let err = extract_zip_binary(&zip, "maca.exe", &dest, 1024).unwrap_err();
+        assert!(matches!(err, ArchiveError::Io(_)));
+        // The planted file is untouched (and not deleted by the cleanup).
+        assert_eq!(std::fs::read(&dest).unwrap(), b"planted");
+        #[cfg(unix)]
+        {
+            let target = dir.join("victim");
+            std::fs::write(&target, b"victim").unwrap();
+            let link = dir.join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(extract_zip_binary(&zip, "maca.exe", &link, 1024).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), b"victim");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tar_gz(entries: &[(&str, tar::EntryType, &[u8])]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (name, ty, data) in entries {
+            let mut h = tar::Header::new_gnu();
+            // Write the name raw so `..` and absolute paths can be tested.
+            h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            h.set_entry_type(*ty);
+            h.set_size(if ty.is_file() { data.len() as u64 } else { 0 });
+            h.set_mode(0o644);
+            if ty.is_symlink() {
+                h.set_link_name("/etc/hosts").unwrap();
+            }
+            h.set_cksum();
+            b.append(&h, if ty.is_file() { *data } else { &b""[..] })
+                .unwrap();
+        }
+        let tar = b.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    #[test]
+    fn tar_extracts_regular_binary_and_refuses_hostile_entries() {
+        use tar::EntryType::{Regular, Symlink};
+        let dir = scratch("tar");
+        let dest = dir.join("out");
+        let f = |e: &[(&str, tar::EntryType, &[u8])], max| {
+            let r = extract_tar_gz_binary(&tar_gz(e), "maca", &dest, max);
+            let ok = r.is_ok();
+            if !ok {
+                assert!(!dest.exists(), "nothing left behind on error");
+            }
+            r.map(|()| std::fs::read(&dest).unwrap_or_default())
+                .inspect(|_| {
+                    let _ = std::fs::remove_file(&dest);
+                })
+        };
+        assert_eq!(
+            f(
+                &[
+                    ("maca-x/maca", Regular, b"bin"),
+                    ("maca-x/README", Regular, b"r")
+                ],
+                1024
+            )
+            .unwrap(),
+            b"bin"
+        );
+        assert_eq!(f(&[("./maca", Regular, b"bin")], 1024).unwrap(), b"bin");
+        assert!(matches!(
+            f(&[("maca", Symlink, b"")], 1024),
+            Err(ArchiveError::NotRegularFile { .. })
+        ));
+        assert!(matches!(
+            f(
+                &[("maca", Regular, b"bin"), ("../evil", Regular, b"x")],
+                1024
+            ),
+            Err(ArchiveError::UnsafePath(_))
+        ));
+        assert!(matches!(
+            f(&[("/abs/maca", Regular, b"bin")], 1024),
+            Err(ArchiveError::UnsafePath(_))
+        ));
+        assert!(matches!(
+            f(&[("docs/ex/maca", Regular, b"x")], 1024),
+            Err(ArchiveError::MissingBinary(_))
+        ));
+        assert!(matches!(
+            f(&[("maca", Regular, b"1"), ("t/maca", Regular, b"2")], 1024),
+            Err(ArchiveError::Ambiguous(_))
+        ));
+        assert!(matches!(
+            f(&[("maca", Regular, &[0u8; 4096])], 64),
+            Err(ArchiveError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            extract_tar_gz_binary(b"not gzip", "maca", &dest, 64),
+            Err(ArchiveError::Corrupt(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_swap_replaces_and_restores_on_failure() {
+        let dir = scratch("swap");
+        let exe = dir.join("maca.exe");
+        let new = dir.join("new");
+        let backup = dir.join("maca.bak.1");
+        std::fs::write(&exe, b"old").unwrap();
+        std::fs::write(&new, b"new").unwrap();
+        swap_in_by_rename(&exe, &new, &backup).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        assert_eq!(std::fs::read(&backup).unwrap(), b"old");
+        assert!(!new.exists());
+
+        // Failure of the second rename puts the original back.
+        let exe2 = dir.join("maca2.exe");
+        std::fs::write(&exe2, b"keep").unwrap();
+        let err = swap_in_by_rename(&exe2, &dir.join("missing"), &dir.join("maca2.bak"));
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(&exe2).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

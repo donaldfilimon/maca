@@ -717,111 +717,65 @@ fn cmd_list(kind: Option<Kind>, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_upgrade(ctx: &Ctx, only: Vec<String>, no_snapshot: bool) -> Result<()> {
-    let _lock = PrefixLock::acquire(&ctx.prefix)?;
-    let snapshot = if no_snapshot {
-        None
-    } else {
-        Some(snapshot::create(&ctx.prefix, "before upgrade", &[])?)
-    };
-    let result = upgrade_inner(ctx, &only).await;
-    if let Err(e) = &result
-        && let Some(s) = &snapshot
-    {
-        match snapshot::restore(&s.id, &ctx.prefix) {
-            Ok(_) => eprintln!(
-                "maca: upgrade failed ({e}); rolled back to snapshot {}",
-                s.id
-            ),
-            Err(r) => eprintln!("maca: upgrade failed ({e}); rollback also failed: {r}"),
-        }
-    }
-    result
+/// Real environment for [`maca::upgrade::run`]: the shared ledger and pins,
+/// the live catalogs, and snapshots of this prefix.
+struct LiveUpgradeEnv<'a> {
+    ctx: &'a Ctx,
+    no_snapshot: bool,
 }
 
-async fn upgrade_inner(ctx: &Ctx, only: &[String]) -> Result<()> {
-    let ledger = state::Ledger::load()?;
-    if ledger.packages.is_empty() {
-        println!("no packages installed");
-        return Ok(());
+impl maca::upgrade::UpgradeEnv for LiveUpgradeEnv<'_> {
+    fn ledger(&self) -> Result<state::Ledger> {
+        state::Ledger::load()
     }
-    let only_set: std::collections::HashSet<String> =
-        only.iter().map(|s| s.to_ascii_lowercase()).collect();
-    let mut upgraded = 0usize;
-    let mut current = 0usize;
-    let mut failed = 0usize;
-    // A corrupt pins file must stop the upgrade, not release every pin.
-    let pins = state::load_pins()?;
-    let mut unchecked = 0usize;
-    for record in &ledger.packages {
-        if !only_set.is_empty() && !only_set.contains(&record.name.to_ascii_lowercase()) {
-            continue;
+    fn pins(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        state::load_pins()
+    }
+    async fn latest(&self, record: &state::Record) -> Result<String> {
+        backend::latest_version(&record.backend, &record.name).await
+    }
+    fn snapshot(&self) -> Result<Option<String>> {
+        if self.no_snapshot {
+            return Ok(None);
         }
-        if pins.keys().any(|k| k.eq_ignore_ascii_case(&record.name)) {
-            println!("{} {} is pinned; skipping", record.name, record.version);
-            current += 1;
-            continue;
-        }
-        let latest = match latest_version(ctx, &record.backend, &record.name).await {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("warning: could not check {}: {e}", record.name);
-                unchecked += 1;
-                continue;
-            }
+        Ok(Some(
+            snapshot::create(&self.ctx.prefix, "before upgrade", &[])?.id,
+        ))
+    }
+    fn restore(&self, snapshot_id: &str) -> Result<()> {
+        snapshot::restore(snapshot_id, &self.ctx.prefix).map(|_| ())
+    }
+    async fn apply(&self, record: &state::Record) -> Result<()> {
+        let opts = InstallOptions {
+            dry_run: false,
+            prefix: self.ctx.prefix.clone(),
+            kind: record.kind,
+            build_from_source: false,
+            no_snapshot: true,
+            jobs: self.ctx.jobs,
         };
-        let Some(latest) = latest else {
-            println!("{} {} is up to date", record.name, record.version);
-            current += 1;
-            continue;
-        };
-        if is_newer(&latest, &record.version) {
-            println!(
-                "upgrading {} {} -> {} ({})",
-                record.name, record.version, latest, record.backend
-            );
-            let opts = InstallOptions {
-                dry_run: false,
-                prefix: ctx.prefix.clone(),
-                kind: record.kind,
-                build_from_source: false,
-                no_snapshot: true,
-                jobs: ctx.jobs,
-            };
-            match backend::install_with_backend(&record.backend, &record.name, &opts).await {
-                Ok(out) => {
-                    // Reclaim the previous version's keg now that the new one
-                    // is linked and recorded.
-                    if out.cellar_path != record.cellar
-                        && record.cellar.starts_with(config::cellar_dir(&ctx.prefix))
-                        && let Err(e) = backend::remove_keg(&ctx.prefix, &record.cellar)
-                    {
-                        eprintln!("warning: could not remove old {}: {e}", record.name);
-                    }
-                    upgraded += 1;
-                }
-                Err(e) => {
-                    eprintln!("error: upgrade of {} failed: {e}", record.name);
-                    failed += 1;
-                }
-            }
-        } else {
-            println!("{} {} is up to date", record.name, record.version);
-            current += 1;
+        let out = backend::install_with_backend(&record.backend, &record.name, &opts).await?;
+        // Reclaim the previous version's keg now that the new one is linked
+        // and recorded.
+        if out.cellar_path != record.cellar
+            && record
+                .cellar
+                .starts_with(config::cellar_dir(&self.ctx.prefix))
+            && let Err(e) = backend::remove_keg(&self.ctx.prefix, &record.cellar)
+        {
+            eprintln!("warning: could not remove old {}: {e}", record.name);
         }
+        Ok(())
     }
-    println!(
-        "upgrade complete: {upgraded} upgraded, {current} current, {failed} failed, {unchecked} could not be checked"
-    );
-    // A failed install fails the command (and triggers the rollback in
-    // `cmd_upgrade`). A version check that could not be made does not: it
-    // changed nothing.
-    if failed > 0 {
-        return Err(Error::Other(anyhow::anyhow!(
-            "{failed} package(s) failed to upgrade"
-        )));
-    }
-    Ok(())
+}
+
+/// Version checks run with no lock held; the prefix lock is taken only around
+/// the state change, after re-validating the plan (see `maca::upgrade`).
+async fn cmd_upgrade(ctx: &Ctx, only: Vec<String>, no_snapshot: bool) -> Result<()> {
+    let env = LiveUpgradeEnv { ctx, no_snapshot };
+    maca::upgrade::run(&env, &ctx.prefix, &only)
+        .await
+        .map(|_| ())
 }
 
 fn is_newer(candidate: &str, installed: &str) -> bool {

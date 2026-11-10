@@ -387,23 +387,46 @@ fn read_link_target(link: &std::path::Path) -> std::io::Result<std::path::PathBu
     std::fs::read_link(link)
 }
 
-/// Upgrade a single installed package. Returns a human-readable outcome.
-pub async fn upgrade_with_prefix(prefix: &std::path::Path, name: &str) -> Result<String> {
+/// Check phase of a single-package upgrade: network only, takes no lock.
+/// `Ok(Err(message))` is a finished outcome (pinned, up to date); `Ok(Ok(plan))`
+/// must be passed to [`apply_planned_upgrade`] with the prefix lock held.
+pub async fn plan_upgrade(
+    name: &str,
+) -> Result<std::result::Result<crate::upgrade::Planned, String>> {
     let ledger = state::Ledger::load()?;
     let record = ledger
         .get(name)
         .cloned()
         .ok_or_else(|| crate::Error::NotFound(format!("package '{name}' is not installed")))?;
     if state::is_pinned(&record.name)? {
-        return Ok(format!(
+        return Ok(Err(format!(
             "{} {} is pinned; skipping",
             record.name, record.version
-        ));
+        )));
     }
     let latest = latest_version(&record.backend, &record.name).await?;
     if !is_newer_version(&latest, &record.version) {
-        return Ok(format!("{} {} is up to date", record.name, record.version));
+        return Ok(Err(format!(
+            "{} {} is up to date",
+            record.name, record.version
+        )));
     }
+    Ok(Ok(crate::upgrade::Planned { record, latest }))
+}
+
+/// Apply a plan from [`plan_upgrade`]. The caller holds the prefix lock; the
+/// plan is re-validated against the ledger and pins as they are now.
+pub async fn apply_planned_upgrade(
+    prefix: &std::path::Path,
+    planned: &crate::upgrade::Planned,
+) -> Result<String> {
+    let record =
+        match crate::upgrade::revalidate(planned, &state::Ledger::load()?, &state::load_pins()?) {
+            Ok(r) => r,
+            Err(why) => {
+                return Ok(format!("{} not upgraded: {why}", planned.record.name));
+            }
+        };
     let opts = InstallOptions {
         dry_run: false,
         prefix: prefix.to_path_buf(),
