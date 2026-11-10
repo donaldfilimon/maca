@@ -5,7 +5,6 @@ edition = "2024"
 description = "Cross-platform package manager for macOS and Linux with native Homebrew and winget catalog APIs plus a custom registry backend"
 license = "MIT"
 rust-version = "1.89"
-homepage = "https://github.com/donaldfilimon/maca"
 repository = "https://github.com/donaldfilimon/maca"
 
 [dependencies]

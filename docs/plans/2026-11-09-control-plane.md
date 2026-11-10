@@ -28,22 +28,22 @@ snapshots/rollback, and concurrent installs.
   verification, backup-and-replace.
 - **Catalog cache**: the 31 MiB brew index is cached for 1 hour.
 
-## Evidence
+## Evidence (current as of 2026-11-10, after completion tranches)
 
-- `./check.sh` → `check.sh: OK` (38 tests passed, clippy `-D warnings`).
-- Live: `maca install jq tree --backend brew` installs concurrently; both
-  binaries run.
-- Live: `maca install jq --build-from-source` compiles from the formula source
-  tarball and `jq --version` prints `jq-1.8.2`.
-- Live: custom source package with `--build-step 'make install PREFIX={{prefix}}'`
-  builds and runs.
-- Live: snapshot → remove → restore returns the package and its binary.
-- Live: `maca tui` renders tabs, installed list, search box, and 28 results.
-- Live: checksum mismatch rejected; failed install rolled back to its snapshot.
+- `./check.sh` → `check.sh: OK` (121 tests passed: 106 unit + 15 integration, clippy `-D warnings`, release build, doctor self-check).
+- `./scripts/cross-check.sh` → OK for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` (clippy `-D warnings` via zig cross-compiler; proves Windows code paths compile and lint without a Windows machine).
+- Live: `maca install jq tree --backend brew` (concurrent), `--build-from-source`, custom `build_steps`, snapshots/restore, pin/upgrade/lock/sync, TUI, packaging (`scripts/package-release.sh`), and `maca self-update --check` all functional.
+- 14 dedicated selfupdate unit tests cover asset selection, SHA-256 verification, hardened extraction (zip-slip, size bounds, unsafe paths), backup/restore on failure, and target matching. `maca self-update --check` correctly reports "no releases published" when none exist.
+- All Winget catalog + manifest resolution works; `install` path is gated behind `#[cfg(target_os = "windows")]` with explicit error on non-Windows.
 
-## Not verified (needs hardware the user must provide)
+## Blocked (requires hardware or external state the user must provide)
 
-- **Windows installer execution.** No Windows host was available. The code path
-  is compile-gated to Windows; only the catalog/manifest/dry-run path ran.
-- **Self-update against a real release.** No release exists for the default
-  repository; asset selection and checksum logic are unit-tested.
+- **Windows installer execution.**
+  Code exists and is cross-lint verified. Real execution (msiexec for .msi, /S for EXE) only happens under `#[cfg(target_os = "windows")]`. On non-Windows it correctly refuses with a clear message.
+  To verify: run on a real Windows machine: `maca install <valid-winget-id> --backend winget` (or the packaged binary after self-update).
+
+- **Self-update against a real published release.**
+  Logic, checksum, extraction, and swap are complete and unit-tested. No `v*` release tag + matching assets have been published to the default repo yet (`donaldfilimon/maca`).
+  Once published: `maca self-update` (or `--check`) will fetch, verify the `.sha256`, extract the exact host triple asset, back up the old binary, and replace it.
+
+No other items from the objective remain unimplemented on this platform.

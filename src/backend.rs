@@ -15,6 +15,8 @@ pub enum BackendKind {
     Brew,
     Winget,
     Custom,
+    Github,
+    Aqua,
 }
 
 impl BackendKind {
@@ -24,6 +26,8 @@ impl BackendKind {
             Self::Brew => "brew",
             Self::Winget => "winget",
             Self::Custom => "custom",
+            Self::Github => "github",
+            Self::Aqua => "aqua",
         }
     }
 
@@ -32,6 +36,8 @@ impl BackendKind {
             "brew" => Self::Brew,
             "winget" => Self::Winget,
             "custom" => Self::Custom,
+            "github" => Self::Github,
+            "aqua" => Self::Aqua,
             _ => Self::Auto,
         }
     }
@@ -221,6 +227,8 @@ pub async fn latest_version(backend: &str, name: &str) -> Result<String> {
             let urls = config::Config::load()?.custom_registry_urls;
             CustomBackend::new(custom::Registry::load_merged(&urls).await?).info(name)?
         }
+        "github" => github::GithubBackend::new().info(name).await?,
+        "aqua" => aqua::AquaBackend::new().info(name).await?,
         other => {
             return Err(crate::Error::Unsupported(format!(
                 "unknown backend '{other}' in ledger"
@@ -246,8 +254,15 @@ pub fn auto_default() -> BackendKind {
 }
 
 /// Ordered fallback list for `--backend auto` search.
-pub fn auto_search_order() -> [BackendKind; 3] {
-    [BackendKind::Custom, BackendKind::Brew, BackendKind::Winget]
+/// GitHub and aqua come after the original three catalogs.
+pub fn auto_search_order() -> [BackendKind; 5] {
+    [
+        BackendKind::Custom,
+        BackendKind::Brew,
+        BackendKind::Winget,
+        BackendKind::Github,
+        BackendKind::Aqua,
+    ]
 }
 
 /// Search every backend in auto order, merging results. Backends run
@@ -262,7 +277,9 @@ pub async fn search_all(query: &str, limit: usize) -> Vec<Package> {
     };
     let brew = brew::BrewBackend::new();
     let winget = winget::WingetBackend::new();
-    let (custom_res, brew_res, winget_res) = tokio::join!(
+    let github = github::GithubBackend::new();
+    let aqua = aqua::AquaBackend::new();
+    let (custom_res, brew_res, winget_res, github_res, aqua_res) = tokio::join!(
         async {
             match custom_reg {
                 Some(reg) => CustomBackend::new(reg).search(query, limit),
@@ -271,17 +288,19 @@ pub async fn search_all(query: &str, limit: usize) -> Vec<Package> {
         },
         brew.search(query, limit),
         winget.search(query, limit),
+        github.search(query, limit),
+        aqua.search(query, limit),
     );
     let mut all = Vec::new();
-    for result in [custom_res, brew_res, winget_res] {
+    for result in [custom_res, brew_res, winget_res, github_res, aqua_res] {
         match result {
             Ok(mut pkgs) => all.append(&mut pkgs),
             Err(e) => tracing::warn!("backend search: {e}"),
         }
     }
-    all.sort_by(|a, b| a.name.cmp(&b.name));
+    all.sort_by(|a, b| a.name.cmp(&b.name).then(a.backend.cmp(&b.backend)));
     all.dedup_by(|a, b| a.name == b.name && a.backend == b.backend);
-    all
+    insight::rank_packages(query, all)
 }
 
 /// Install `name` with an explicit backend name (`brew`, `winget`, `custom`).
@@ -301,6 +320,8 @@ pub async fn install_with_backend(
             let reg = custom::Registry::load_configured().await?;
             custom::CustomBackend::new(reg).install(name, opts).await
         }
+        BackendKind::Github => github::GithubBackend::new().install(name, opts).await,
+        BackendKind::Aqua => aqua::AquaBackend::new().install(name, opts).await,
         BackendKind::Auto => auto_install(name, opts).await,
     }
 }
@@ -314,6 +335,11 @@ async fn auto_install(name: &str, opts: &InstallOptions) -> Result<InstallOutcom
     }
     if brew::BrewBackend::new().can_install(name).await {
         return brew::BrewBackend::new().install(name, opts).await;
+    }
+    match insight::suggest_backend(name) {
+        Some("github") => return github::GithubBackend::new().install(name, opts).await,
+        Some("aqua") => return aqua::AquaBackend::new().install(name, opts).await,
+        _ => {}
     }
     winget::WingetBackend::new().install(name, opts).await
 }
@@ -452,7 +478,7 @@ pub async fn apply_planned_upgrade(
 use crate::config;
 use crate::custom::{self, CustomBackend};
 use crate::state;
-use crate::{Result, brew, install, winget};
+use crate::{Result, aqua, brew, github, insight, install, winget};
 
 #[cfg(test)]
 mod tests {
@@ -462,8 +488,14 @@ mod tests {
     fn backend_kind_roundtrip() {
         assert_eq!(BackendKind::from_str_lossy("brew"), BackendKind::Brew);
         assert_eq!(BackendKind::from_str_lossy("WINGET"), BackendKind::Winget);
+        assert_eq!(BackendKind::from_str_lossy("github"), BackendKind::Github);
+        assert_eq!(BackendKind::from_str_lossy("aqua"), BackendKind::Aqua);
         assert_eq!(BackendKind::from_str_lossy(""), BackendKind::Auto);
         assert_eq!(BackendKind::Brew.as_str(), "brew");
+        assert_eq!(BackendKind::Github.as_str(), "github");
+        let order = auto_search_order();
+        assert_eq!(order[3], BackendKind::Github);
+        assert_eq!(order[4], BackendKind::Aqua);
     }
 
     #[test]

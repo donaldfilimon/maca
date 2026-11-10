@@ -1,17 +1,24 @@
 //! Interactive terminal UI (`maca tui`).
 //!
 //! Tabs: **Installed**, **Search**, **Groups**, **Snapshots**.
+//! The body is a list plus a detail pane. `?` opens help. Remove and snapshot
+//! restore ask for confirmation; while that overlay or the help overlay is
+//! open, `q` does not quit.
 //!
 //! Keys:
 //! - `1`..`4` switch tab, `q` / `Ctrl-C` quit
 //! - `j` / `k` or arrows move the selection
 //! - `/` focus search, `Enter` run search, `Esc` clear
 //! - `i` install the selected search result
-//! - `r` remove the selected installed package
+//! - `r` remove the selected installed package (confirms first)
 //! - `u` upgrade the selected installed package
 //! - `s` snapshot the prefix
 //! - `g` install the selected group
+//! - `f` cycle the installed kind filter
+//! - `p` pin or unpin the selected installed package
+//! - `z` restore the selected snapshot (confirms first)
 
+use std::collections::BTreeMap;
 use std::io;
 use std::time::Duration;
 
@@ -54,6 +61,24 @@ impl Tab {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overlay {
+    None,
+    Help,
+    ConfirmRemove(usize),
+    ConfirmRestore(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindFilter {
+    All,
+    App,
+    Plugin,
+    Cli,
+    Library,
+    Other,
+}
+
 struct App {
     tab: Tab,
     installed: Vec<state::Record>,
@@ -67,6 +92,9 @@ struct App {
     snapshot_state: ListState,
     status: String,
     input_mode: bool,
+    overlay: Overlay,
+    kind_filter: KindFilter,
+    pins: BTreeMap<String, String>,
     rx: mpsc::UnboundedReceiver<Vec<Package>>,
     tx: mpsc::UnboundedSender<Vec<Package>>,
 }
@@ -87,6 +115,9 @@ impl App {
             snapshot_state: ListState::default(),
             status: "ready".into(),
             input_mode: false,
+            overlay: Overlay::None,
+            kind_filter: KindFilter::All,
+            pins: BTreeMap::new(),
             rx,
             tx,
         };
@@ -99,12 +130,24 @@ impl App {
         self.installed = ledger.packages;
         self.groups = Group::list().unwrap_or_default();
         self.snapshots = snapshot::list().unwrap_or_default();
+        match state::load_pins() {
+            Ok(pins) => self.pins = pins,
+            Err(e) => self.status = format!("pins unreadable: {e}"),
+        }
         self.clamp_selection();
+    }
+
+    fn visible_installed(&self) -> Vec<state::Record> {
+        self.installed
+            .iter()
+            .filter(|r| kind_allowed(self.kind_filter, r.kind))
+            .cloned()
+            .collect()
     }
 
     fn clamp_selection(&mut self) {
         let len = match self.tab {
-            Tab::Installed => self.installed.len(),
+            Tab::Installed => self.visible_installed().len(),
             Tab::Search => self.search_results.len(),
             Tab::Groups => self.groups.len(),
             Tab::Snapshots => self.snapshots.len(),
@@ -132,7 +175,7 @@ impl App {
     fn selected_installed(&self) -> Option<state::Record> {
         self.installed_state
             .selected()
-            .and_then(|i| self.installed.get(i).cloned())
+            .and_then(|i| self.visible_installed().get(i).cloned())
     }
 
     fn selected_group(&self) -> Option<Group> {
@@ -141,15 +184,9 @@ impl App {
             .and_then(|i| self.groups.get(i).cloned())
     }
 
-    fn selected_snapshot(&self) -> Option<snapshot::SnapshotManifest> {
-        self.snapshot_state
-            .selected()
-            .and_then(|i| self.snapshots.get(i).cloned())
-    }
-
     fn move_selection(&mut self, delta: isize) {
         let len = match self.tab {
-            Tab::Installed => self.installed.len(),
+            Tab::Installed => self.visible_installed().len(),
             Tab::Search => self.search_results.len(),
             Tab::Groups => self.groups.len(),
             Tab::Snapshots => self.snapshots.len(),
@@ -175,6 +212,7 @@ impl App {
         tracing::info!("TUI search started: {query}");
         tokio::spawn(async move {
             let results = crate::backend::search_all(&query, 25).await;
+            let results = crate::insight::rank_packages(&query, results);
             tracing::info!("TUI search finished: {} results", results.len());
             let _ = tx.send(results);
         });
@@ -225,6 +263,25 @@ async fn event_loop(
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(());
         }
+        if overlay_consumes_quit(app.overlay) {
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Char('n') | KeyCode::Esc => {
+                    app.overlay = Overlay::None;
+                }
+                KeyCode::Char('y') => {
+                    confirm_yes(app, prefix).await;
+                }
+                KeyCode::Char('?') => {
+                    app.overlay = if app.overlay == Overlay::Help {
+                        Overlay::None
+                    } else {
+                        Overlay::Help
+                    };
+                }
+                _ => {}
+            }
+            continue;
+        }
         if app.input_mode {
             match key.code {
                 KeyCode::Enter => {
@@ -243,10 +300,10 @@ async fn event_loop(
             continue;
         }
         // Mutating keys take the prefix lock for that one action (never for
-        // the whole session; `u` takes it itself, after its network check), so a TUI left open does not block other maca
-        // commands, and a busy prefix shows up as a status message instead
-        // of a hang.
-        let mutating = matches!(key.code, KeyCode::Char('i' | 'r' | 's' | 'g' | 'z'));
+        // the whole session; `u` takes it itself, after its network check).
+        // Remove and restore only lock when the confirmation is accepted.
+        // A TUI left open does not block other maca commands.
+        let mutating = matches!(key.code, KeyCode::Char('i' | 's' | 'g'));
         let _lock = if mutating {
             match crate::lock::PrefixLock::try_acquire(prefix) {
                 Ok(Some(lock)) => Some(lock),
@@ -264,6 +321,7 @@ async fn event_loop(
         };
         match key.code {
             KeyCode::Char('q') => return Ok(()),
+            KeyCode::Char('?') => app.overlay = Overlay::Help,
             KeyCode::Char('1') => switch_tab(app, Tab::Installed),
             KeyCode::Char('2') => switch_tab(app, Tab::Search),
             KeyCode::Char('3') => switch_tab(app, Tab::Groups),
@@ -282,9 +340,25 @@ async fn event_loop(
                 }
             }
             KeyCode::Char('r') => {
+                if app.tab == Tab::Installed
+                    && let Some(i) = app.installed_state.selected()
+                    && app.visible_installed().get(i).is_some()
+                {
+                    app.overlay = Overlay::ConfirmRemove(i);
+                }
+            }
+            KeyCode::Char('f') if app.tab == Tab::Installed => {
+                app.kind_filter = cycle_kind_filter(app.kind_filter);
+                app.clamp_selection();
+                app.status = format!("kind filter: {}", kind_filter_label(app.kind_filter));
+            }
+            KeyCode::Char('p') => {
                 if let Some(rec) = app.selected_installed() {
-                    remove_pkg(prefix, &rec.name, &mut app.status);
-                    app.reload();
+                    let name = rec.name.clone();
+                    let version = rec.version.clone();
+                    if let Some(_lock) = try_prefix_lock(app, prefix) {
+                        toggle_pin_on_disk(app, &name, &version);
+                    }
                 }
             }
             KeyCode::Char('u') => {
@@ -307,12 +381,11 @@ async fn event_loop(
                 }
             }
             KeyCode::Char('z') => {
-                if let Some(snap) = app.selected_snapshot() {
-                    match snapshot::restore(&snap.id, prefix) {
-                        Ok(_) => app.status = format!("restored {}", snap.id),
-                        Err(e) => app.status = format!("restore failed: {e}"),
-                    }
-                    app.reload();
+                if app.tab == Tab::Snapshots
+                    && let Some(i) = app.snapshot_state.selected()
+                    && app.snapshots.get(i).is_some()
+                {
+                    app.overlay = Overlay::ConfirmRestore(i);
                 }
             }
             _ => {}
@@ -325,8 +398,81 @@ fn switch_tab(app: &mut App, tab: Tab) {
     app.clamp_selection();
 }
 
-/// Snapshot the prefix before a TUI action, as the CLI commands do. The TUI
-/// already holds the prefix lock for its whole session.
+fn try_prefix_lock(app: &mut App, prefix: &std::path::Path) -> Option<crate::lock::PrefixLock> {
+    match crate::lock::PrefixLock::try_acquire(prefix) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            app.status = "prefix busy: another maca command is running".into();
+            None
+        }
+        Err(e) => {
+            app.status = format!("cannot lock prefix: {e}");
+            None
+        }
+    }
+}
+
+async fn confirm_yes(app: &mut App, prefix: &std::path::Path) {
+    let overlay = app.overlay;
+    app.overlay = Overlay::None;
+    let Some(_lock) = try_prefix_lock(app, prefix) else {
+        return;
+    };
+    match overlay {
+        Overlay::ConfirmRemove(i) => {
+            if let Some(rec) = app.visible_installed().get(i).cloned() {
+                remove_pkg(prefix, &rec.name, &mut app.status);
+                app.reload();
+            }
+        }
+        Overlay::ConfirmRestore(i) => {
+            if let Some(id) = app.snapshots.get(i).map(|s| s.id.clone()) {
+                restore_snap(prefix, &id, &mut app.status);
+                app.reload();
+            }
+        }
+        Overlay::Help | Overlay::None => {}
+    }
+}
+
+fn toggle_pin_on_disk(app: &mut App, name: &str, version: &str) {
+    let Ok(_state) = state::state_lock() else {
+        app.status = "cannot lock pin file".into();
+        return;
+    };
+    let pins = match state::load_pins() {
+        Ok(pins) => pins,
+        Err(e) => {
+            app.status = format!("pins unreadable: {e}");
+            return;
+        }
+    };
+    let (next, message) = toggle_pin(&pins, name, version);
+    match state::save_pins(&next) {
+        Ok(()) => {
+            app.pins = next;
+            app.status = message;
+        }
+        Err(e) => app.status = format!("pin failed: {e}"),
+    }
+}
+
+fn restore_snap(prefix: &std::path::Path, id: &str, status: &mut String) {
+    let snap = match snapshot_before(prefix, "restore") {
+        Ok(s) => s,
+        Err(msg) => {
+            *status = msg;
+            return;
+        }
+    };
+    *status = match snapshot::restore(id, prefix) {
+        Ok(_) => format!("restored {id} (snapshot {})", snap.id),
+        Err(e) => format!("restore failed: {e}; {}", roll_back(prefix, &snap)),
+    };
+}
+
+/// Snapshot the prefix before a TUI action, as the CLI commands do. The caller
+/// holds the prefix lock for this action only.
 fn snapshot_before(
     prefix: &std::path::Path,
     what: &str,
@@ -478,29 +624,35 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         );
     f.render_widget(tabs, chunks[0]);
 
+    let (list_area, detail_area) = list_and_detail(chunks[1]);
     match app.tab {
-        Tab::Installed => draw_installed(f, app, chunks[1]),
-        Tab::Search => draw_search(f, app, chunks[1]),
-        Tab::Groups => draw_groups(f, app, chunks[1]),
-        Tab::Snapshots => draw_snapshots(f, app, chunks[1]),
+        Tab::Installed => draw_installed(f, app, list_area),
+        Tab::Search => draw_search(f, app, list_area),
+        Tab::Groups => draw_groups(f, app, list_area),
+        Tab::Snapshots => draw_snapshots(f, app, list_area),
     }
+    draw_detail(f, app, detail_area);
 
     let help = match app.tab {
-        Tab::Installed => "j/k move · u upgrade · r remove · s snapshot · / search · q quit",
-        Tab::Search => "/ edit query · Enter search · i install · j/k move · q quit",
-        Tab::Groups => "↑/↓ move · g install group · q quit",
-        Tab::Snapshots => "↑/↓ move · z restore · q quit",
+        Tab::Installed => "j/k move · f kind · p pin · u upgrade · r remove · s snapshot · ? help",
+        Tab::Search => "/ edit query · Enter search · i install · j/k move · ? help",
+        Tab::Groups => "↑/↓ move · g install group · ? help",
+        Tab::Snapshots => "↑/↓ move · z restore · ? help",
     };
     let status = Paragraph::new(Line::from(vec![
         Span::styled(
             format!(" {}", app.status),
-            Style::default().fg(Color::Green),
+            Style::default().fg(status_color(&app.status)),
         ),
         Span::raw("  ·  "),
         Span::styled(help, Style::default().fg(Color::DarkGray)),
     ]))
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(status, chunks[2]);
+
+    if app.overlay != Overlay::None {
+        draw_overlay(f, app);
+    }
 
     if app.input_mode {
         let popup = centered_rect(60, 3, f.area());
@@ -512,6 +664,134 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         );
         f.render_widget(input, popup);
     }
+}
+
+fn list_and_detail(area: Rect) -> (Rect, Rect) {
+    if area.width >= 60 {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area);
+        (chunks[0], chunks[1])
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(area);
+        (chunks[0], chunks[1])
+    }
+}
+
+fn status_color(status: &str) -> Color {
+    let lower = status.to_ascii_lowercase();
+    if lower.contains("fail")
+        || lower.contains("rollback")
+        || lower.contains("unreadable")
+        || lower.contains("busy")
+    {
+        Color::Red
+    } else if lower.contains("searching") {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn draw_detail(f: &mut ratatui::Frame, app: &App, area: Rect) {
+    let body = match app.tab {
+        Tab::Installed => app.selected_installed().map(|r| {
+            let pinned = app.pins.keys().any(|k| k.eq_ignore_ascii_case(&r.name));
+            format!(
+                "{}\nversion {}\nbackend {}\nkind {}\npinned {}\n{}",
+                r.name,
+                r.version,
+                r.backend,
+                r.kind.as_str(),
+                if pinned { "yes" } else { "no" },
+                r.cellar.display()
+            )
+        }),
+        Tab::Search => app.selected_search().map(|p| {
+            format!(
+                "{}\nversion {}\nbackend {}\n{}\n{}",
+                p.name, p.version, p.backend, p.homepage, p.description
+            )
+        }),
+        Tab::Groups => app.selected_group().map(|g| {
+            let members: Vec<String> = g
+                .packages
+                .iter()
+                .map(|e| match &e.version {
+                    Some(v) => format!("{} {v}", e.name),
+                    None => e.name.clone(),
+                })
+                .collect();
+            format!(
+                "{}\n{}\n{}",
+                g.name,
+                g.description,
+                if members.is_empty() {
+                    "no members".into()
+                } else {
+                    members.join("\n")
+                }
+            )
+        }),
+        Tab::Snapshots => app.snapshot_state.selected().map(|i| {
+            let snap = &app.snapshots[i];
+            let mut text = format!(
+                "{}\n{}\n{} packages",
+                snap.id,
+                snap.reason,
+                snap.packages.len()
+            );
+            if let Some(older) = app.snapshots.get(i + 1) {
+                text.push('\n');
+                text.push_str(&snapshot_change_summary(older, snap));
+            }
+            text
+        }),
+    };
+    let paragraph = Paragraph::new(body.unwrap_or_else(|| "nothing selected".into()))
+        .block(Block::default().borders(Borders::ALL).title(" detail "));
+    f.render_widget(paragraph, area);
+}
+
+fn draw_overlay(f: &mut ratatui::Frame, app: &App) {
+    let (title, body) = match app.overlay {
+        Overlay::Help => (
+            " help (q or ? closes) ",
+            "1-4 tabs   j/k move   q quit\n/ search   i install   u upgrade\nr remove (confirm y/n)   z restore (confirm y/n)\nf kind filter   p pin toggle   s snapshot   g group install\nwhile this overlay is open, q does not quit"
+                .to_string(),
+        ),
+        Overlay::ConfirmRemove(i) => {
+            let name = app
+                .visible_installed()
+                .get(i)
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| "package".into());
+            (
+                " confirm remove ",
+                format!("remove {name}?\ny removes it   n, Esc, or q cancels"),
+            )
+        }
+        Overlay::ConfirmRestore(i) => {
+            let id = app
+                .snapshots
+                .get(i)
+                .map(|s| s.id.as_str())
+                .unwrap_or("snapshot");
+            (
+                " confirm restore ",
+                format!("restore {id}?\ny restores it   n, Esc, or q cancels"),
+            )
+        }
+        Overlay::None => return,
+    };
+    let popup = centered_rect(70, 10, f.area());
+    f.render_widget(Clear, popup);
+    let paragraph = Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(paragraph, popup);
 }
 
 fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
@@ -534,8 +814,8 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn draw_installed(f: &mut ratatui::Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
-        .installed
+    let visible = app.visible_installed();
+    let items: Vec<ListItem> = visible
         .iter()
         .map(|r| {
             ListItem::new(Line::from(vec![
@@ -551,7 +831,10 @@ fn draw_installed(f: &mut ratatui::Frame, app: &App, area: Rect) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" installed "))
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " installed ({}) ",
+            kind_filter_label(app.kind_filter)
+        )))
         .highlight_style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
@@ -635,6 +918,110 @@ pub fn kind_label(kind: Kind) -> &'static str {
     kind.as_str()
 }
 
+/// `q` closes help and confirmation instead of quitting the TUI.
+pub fn overlay_consumes_quit(overlay: Overlay) -> bool {
+    !matches!(overlay, Overlay::None)
+}
+
+pub fn cycle_kind_filter(filter: KindFilter) -> KindFilter {
+    match filter {
+        KindFilter::All => KindFilter::App,
+        KindFilter::App => KindFilter::Plugin,
+        KindFilter::Plugin => KindFilter::Cli,
+        KindFilter::Cli => KindFilter::Library,
+        KindFilter::Library => KindFilter::Other,
+        KindFilter::Other => KindFilter::All,
+    }
+}
+
+pub fn kind_filter_label(filter: KindFilter) -> &'static str {
+    match filter {
+        KindFilter::All => "all",
+        KindFilter::App => "app",
+        KindFilter::Plugin => "plugin",
+        KindFilter::Cli => "cli",
+        KindFilter::Library => "library",
+        KindFilter::Other => "other",
+    }
+}
+
+pub fn kind_allowed(filter: KindFilter, kind: Kind) -> bool {
+    match filter {
+        KindFilter::All => true,
+        KindFilter::App => kind == Kind::App,
+        KindFilter::Plugin => kind == Kind::Plugin,
+        KindFilter::Cli => kind == Kind::Cli,
+        KindFilter::Library => kind == Kind::Library,
+        KindFilter::Other => kind == Kind::Other,
+    }
+}
+
+/// Keep packages whose name or description contains `query`, then rank them.
+pub fn filter_search(query: &str, packages: &[Package]) -> Vec<Package> {
+    let q = query.trim().to_ascii_lowercase();
+    let matched: Vec<Package> = if q.is_empty() {
+        packages.to_vec()
+    } else {
+        packages
+            .iter()
+            .filter(|p| {
+                p.name.to_ascii_lowercase().contains(&q)
+                    || p.description.to_ascii_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect()
+    };
+    crate::insight::rank_packages(query, matched)
+}
+
+/// Insert a pin, or remove it when the name is already pinned (case-insensitive).
+pub fn toggle_pin(
+    pins: &BTreeMap<String, String>,
+    name: &str,
+    version: &str,
+) -> (BTreeMap<String, String>, String) {
+    let mut next = pins.clone();
+    if let Some(key) = next.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned() {
+        next.remove(&key);
+        (next, format!("unpinned {name}"))
+    } else {
+        next.insert(name.to_string(), version.to_string());
+        (next, format!("pinned {name} at {version}"))
+    }
+}
+
+/// Added, removed, and version-changed packages between two snapshots.
+pub fn snapshot_change_summary(
+    older: &snapshot::SnapshotManifest,
+    newer: &snapshot::SnapshotManifest,
+) -> String {
+    let delta = crate::insight::diff_snapshots(older, newer);
+    format!(
+        "since {}: added {} removed {} changed {}",
+        older.id,
+        list_or_none(&delta.added),
+        list_or_none(&delta.removed),
+        if delta.changed.is_empty() {
+            "none".into()
+        } else {
+            delta
+                .changed
+                .iter()
+                .map(|c| format!("{} {}->{}", c.name, c.from, c.to))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    )
+}
+
+fn list_or_none(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,5 +1054,103 @@ mod tests {
     fn kind_label_matches_kind() {
         assert_eq!(kind_label(Kind::Cli), "cli");
         assert_eq!(kind_label(Kind::App), "app");
+    }
+
+    #[test]
+    fn kind_filter_cycles_and_hides_other_kinds() {
+        let mut filter = KindFilter::All;
+        filter = cycle_kind_filter(filter);
+        assert_eq!(filter, KindFilter::App);
+        assert!(kind_allowed(filter, Kind::App));
+        assert!(!kind_allowed(filter, Kind::Cli));
+        for _ in 0..5 {
+            filter = cycle_kind_filter(filter);
+        }
+        assert_eq!(filter, KindFilter::All);
+        assert!(kind_allowed(filter, Kind::Library));
+    }
+
+    #[test]
+    fn search_preview_ranks_exact_name_first() {
+        let packages = vec![
+            Package {
+                name: "other".into(),
+                version: "1".into(),
+                description: "a jq clone".into(),
+                homepage: String::new(),
+                backend: "custom".into(),
+                tags: vec![],
+            },
+            Package {
+                name: "jq".into(),
+                version: "1".into(),
+                description: "command".into(),
+                homepage: String::new(),
+                backend: "brew".into(),
+                tags: vec![],
+            },
+            Package {
+                name: "jq-front".into(),
+                version: "1".into(),
+                description: "prefix".into(),
+                homepage: String::new(),
+                backend: "aqua".into(),
+                tags: vec![],
+            },
+        ];
+        let shown = filter_search("jq", &packages);
+        let names: Vec<_> = shown.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["jq", "jq-front", "other"]);
+    }
+
+    #[test]
+    fn pin_toggle_inserts_then_removes_ignoring_case() {
+        let pins = BTreeMap::new();
+        let (pins, message) = toggle_pin(&pins, "jq", "1.7");
+        assert_eq!(message, "pinned jq at 1.7");
+        assert_eq!(pins.get("jq").map(String::as_str), Some("1.7"));
+        let (pins, message) = toggle_pin(&pins, "JQ", "1.8");
+        assert_eq!(message, "unpinned JQ");
+        assert!(pins.is_empty());
+    }
+
+    #[test]
+    fn help_and_confirm_consume_quit() {
+        assert!(!overlay_consumes_quit(Overlay::None));
+        assert!(overlay_consumes_quit(Overlay::Help));
+        assert!(overlay_consumes_quit(Overlay::ConfirmRemove(0)));
+        assert!(overlay_consumes_quit(Overlay::ConfirmRestore(1)));
+    }
+
+    #[test]
+    fn snapshot_detail_uses_shipped_diff() {
+        let older = snapshot::SnapshotManifest {
+            id: "old".into(),
+            created_at: String::new(),
+            reason: String::new(),
+            prefix: std::path::PathBuf::from("/prefix"),
+            packages: vec![snapshot::SnapshotPackage {
+                name: "jq".into(),
+                version: "1.7".into(),
+                backend: "brew".into(),
+                cellar: std::path::PathBuf::from("/cellar/jq"),
+            }],
+            bin_links: vec![],
+            ledger: serde_json::json!({}),
+            kegs: None,
+            selected: None,
+        };
+        let mut newer = older.clone();
+        newer.id = "new".into();
+        newer.packages[0].version = "1.8".into();
+        newer.packages.push(snapshot::SnapshotPackage {
+            name: "rg".into(),
+            version: "14".into(),
+            backend: "github".into(),
+            cellar: std::path::PathBuf::from("/cellar/rg"),
+        });
+        let text = snapshot_change_summary(&older, &newer);
+        assert!(text.contains("jq 1.7->1.8"), "{text}");
+        assert!(text.contains("rg"), "{text}");
     }
 }

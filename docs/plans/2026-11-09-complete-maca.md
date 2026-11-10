@@ -19,12 +19,13 @@ Elevate `maca` to a complete, autonomous, production-ready package manager: envi
 
 ## Evidence
 
-- `./check.sh` → `check.sh: OK` (50 tests passed: 41 unit + 9 integration tests, clippy `-D warnings`, release build).
-- Live: `maca shellenv` outputs valid export commands for sh/bash and fish.
-- Live: `maca completions zsh` emits functional completion script.
-- Live: `maca doctor` diagnoses prefix writability, tools, and endpoints with summary report.
-- Live: `maca snapshot prune --keep 2` pruned older snapshots down to the 2 latest.
-- Live: `maca clean` runs and reports reclaimed bytes.
-- Live: `maca info jq` displays installed version, kind, cellar path, and pin status.
-- Live: `maca list` displays `PINNED` column; `maca pin jq` pins version and updates status.
-- Live: `scripts/package-release.sh` generated `maca-aarch64-apple-darwin.tar.gz` and `.sha256`.
+- `./check.sh` → `check.sh: OK` (121 tests passed: 106 unit + 15 integration tests, clippy `-D warnings`, release build).
+- Live: `maca shellenv` outputs valid export commands for sh/bash, fish, and csh.
+- Live: `maca completions` emits functional scripts for bash, zsh, fish, elvish, powershell.
+- Live: `maca doctor` diagnoses prefix, PATH, toolchain, catalog endpoints, symlinks with structured summary.
+- Live: `maca snapshot prune --keep 2`, `maca clean`, `maca outdated --json`, `maca sync --prune` all functional.
+- Live: `maca list` shows PINNED column; `maca pin`/`unpin` and `maca info` reflect pinned state.
+- `scripts/package-release.sh` produced `maca-<triple>.tar.gz` + `.sha256` matching self-update expectations.
+- `.github/workflows/ci.yml` runs check.sh + packaging on macOS/Linux and clippy+test on Windows.
+- `.github/workflows/release.yml` packages and uploads on `v*` tags (tag/version gate included).
+- Integration tests cover shellenv, completions, doctor, binary discovery, share linking, pin/upgrade/lock/sync/restore, snapshot isolation, clean, and more.

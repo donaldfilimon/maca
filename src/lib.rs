@@ -3,11 +3,14 @@
 // No `brew`/`winget` subprocesses are required for search/catalog; installs
 // download and verify artifacts directly.
 
+pub mod aqua;
 pub mod backend;
 pub mod brew;
 pub mod config;
 pub mod custom;
+pub mod github;
 pub mod group;
+pub mod insight;
 pub mod install;
 pub mod lock;
 pub mod mach_o;

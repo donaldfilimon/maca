@@ -42,7 +42,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Debug, Parser)]
-#[command(name = "maca", version = maca::VERSION, about, long_about = None)]
+#[command(
+    name = "maca",
+    version = maca::VERSION,
+    about = "Cross-platform package manager. Sources: brew, winget, custom, github, aqua.",
+    long_about = None
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -208,6 +213,17 @@ enum Commands {
     Unpin { package: String },
     /// Show which installed packages depend on a package.
     Why { package: String },
+    /// List installed packages nothing else depends on.
+    Leaves,
+    /// Report pins whose installed version differs, or that are not installed.
+    Drift,
+    /// Report group members that are missing or at the wrong version.
+    Gaps {
+        /// Group name.
+        group: String,
+    },
+    /// Report binaries claimed by more than one installed package.
+    Conflicts,
 }
 
 #[derive(Debug, Subcommand)]
@@ -266,6 +282,13 @@ enum SnapshotCommands {
         #[arg(long, default_value_t = 5)]
         keep: usize,
     },
+    /// Show packages added, removed, or changed between two snapshots.
+    Diff {
+        /// Older snapshot id.
+        older: String,
+        /// Newer snapshot id.
+        newer: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -285,7 +308,7 @@ enum GroupCommands {
     Add {
         name: String,
         package: String,
-        /// Backend name: auto, brew, winget, or custom.
+        /// Backend name: auto, brew, winget, custom, github, or aqua.
         #[arg(long = "backend", value_name = "BACKEND", default_value = "auto")]
         backend_name: String,
         #[arg(long)]
@@ -462,6 +485,10 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Pin { package, version } => cmd_pin(&ctx, package, version),
         Commands::Unpin { package } => cmd_unpin(&ctx, package),
         Commands::Why { package } => cmd_why(&ctx, &package).await,
+        Commands::Leaves => cmd_leaves(&ctx),
+        Commands::Drift => cmd_drift(&ctx),
+        Commands::Gaps { group } => cmd_gaps(&ctx, &group),
+        Commands::Conflicts => cmd_conflicts(&ctx),
     }
 }
 
@@ -476,9 +503,16 @@ async fn cmd_search(ctx: &Ctx, query: &str, limit: usize, json: bool) -> Result<
                 let reg = Registry::load_merged(&ctx.custom_registry_urls).await?;
                 CustomBackend::new(reg).search(query, limit)?
             }
+            BackendKind::Github => {
+                maca::github::GithubBackend::new()
+                    .search(query, limit)
+                    .await?
+            }
+            BackendKind::Aqua => maca::aqua::AquaBackend::new().search(query, limit).await?,
             BackendKind::Auto => unreachable!(),
         }
     };
+    let all = maca::insight::rank_packages(query, all);
     if json {
         println!("{}", serde_json::to_string_pretty(&all)?);
         return Ok(());
@@ -537,6 +571,8 @@ async fn info_one(ctx: &Ctx, package: &str) -> Result<maca::backend::Package> {
             let reg = Registry::load_merged(&ctx.custom_registry_urls).await?;
             CustomBackend::new(reg).info(package)
         }
+        BackendKind::Github => maca::github::GithubBackend::new().info(package).await,
+        BackendKind::Aqua => maca::aqua::AquaBackend::new().info(package).await,
         BackendKind::Auto => {
             let reg = Registry::load_merged(&ctx.custom_registry_urls).await?;
             let custom = CustomBackend::new(reg);
@@ -547,9 +583,13 @@ async fn info_one(ctx: &Ctx, package: &str) -> Result<maca::backend::Package> {
                 Ok(p) => Ok(p),
                 Err(brew_err) => match WingetBackend::new().info(package).await {
                     Ok(p) => Ok(p),
-                    Err(winget_err) => Err(Error::NotFound(format!(
-                        "'{package}' not found in any backend (custom: no match, brew: {brew_err}, winget: {winget_err})"
-                    ))),
+                    Err(winget_err) => match maca::insight::suggest_backend(package) {
+                        Some("github") => maca::github::GithubBackend::new().info(package).await,
+                        Some("aqua") => maca::aqua::AquaBackend::new().info(package).await,
+                        _ => Err(Error::NotFound(format!(
+                            "'{package}' not found in any backend (custom: no match, brew: {brew_err}, winget: {winget_err})"
+                        ))),
+                    },
                 },
             }
         }
@@ -1319,8 +1359,8 @@ async fn cmd_self_update(check: bool, force: bool) -> Result<()> {
 
 fn cmd_snapshot(ctx: &Ctx, action: SnapshotCommands) -> Result<()> {
     // Listing reads only; everything else changes snapshots or the prefix.
-    let _lock = match action {
-        SnapshotCommands::List => None,
+    let _lock = match &action {
+        SnapshotCommands::List | SnapshotCommands::Diff { .. } => None,
         _ => Some(PrefixLock::acquire(&ctx.prefix)?),
     };
     match action {
@@ -1351,6 +1391,112 @@ fn cmd_snapshot(ctx: &Ctx, action: SnapshotCommands) -> Result<()> {
             let pruned = snapshot::prune(keep)?;
             println!("pruned {pruned} snapshot(s) (keeping {keep} latest)");
         }
+        SnapshotCommands::Diff { older, newer } => {
+            let older_m = snapshot::get(&older)?;
+            let newer_m = snapshot::get(&newer)?;
+            let delta = maca::insight::diff_snapshots(&older_m, &newer_m);
+            println!("added: {}", display_names(&delta.added));
+            println!("removed: {}", display_names(&delta.removed));
+            if delta.changed.is_empty() {
+                println!("changed: none");
+            } else {
+                println!("changed:");
+                for change in &delta.changed {
+                    println!("  {} {} -> {}", change.name, change.from, change.to);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn display_names(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn prefix_records(prefix: &std::path::Path) -> Result<Vec<state::Record>> {
+    let root = config::cellar_dir(prefix);
+    Ok(state::Ledger::load()?
+        .packages
+        .into_iter()
+        .filter(|r| config::path_under(&r.cellar, &root))
+        .collect())
+}
+
+fn cmd_leaves(ctx: &Ctx) -> Result<()> {
+    let records = prefix_records(&ctx.prefix)?;
+    let installed: Vec<String> = records.iter().map(|r| r.name.clone()).collect();
+    let edges: Vec<(String, String)> = records
+        .iter()
+        .flat_map(|r| r.depends_on.iter().map(|dep| (r.name.clone(), dep.clone())))
+        .collect();
+    let leaves = maca::insight::leaves(&installed, &edges);
+    if leaves.is_empty() {
+        println!("no leaves");
+    } else {
+        for name in leaves {
+            println!("{name}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_drift(ctx: &Ctx) -> Result<()> {
+    let records = prefix_records(&ctx.prefix)?;
+    let pins = state::load_pins()?;
+    let drift = maca::insight::pin_drift(&records, &pins);
+    if drift.is_empty() {
+        println!("no pin drift");
+        return Ok(());
+    }
+    for item in drift {
+        match item.installed {
+            Some(version) => println!("{} pinned {} installed {version}", item.name, item.pinned),
+            None => println!("{} pinned {} is not installed", item.name, item.pinned),
+        }
+    }
+    Ok(())
+}
+
+fn cmd_gaps(ctx: &Ctx, group: &str) -> Result<()> {
+    let group = Group::load(group)?;
+    let records = prefix_records(&ctx.prefix)?;
+    let gaps = maca::insight::group_gaps(&group, &records);
+    if gaps.is_empty() {
+        println!("group {} has no gaps", group.name);
+        return Ok(());
+    }
+    for gap in gaps {
+        match (gap.wanted, gap.installed) {
+            (Some(wanted), Some(installed)) => {
+                println!("{} wanted {wanted} installed {installed}", gap.package);
+            }
+            (_, None) => println!("{} is missing", gap.package),
+            (None, Some(installed)) => {
+                println!("{} installed {installed}", gap.package);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_conflicts(ctx: &Ctx) -> Result<()> {
+    let records = prefix_records(&ctx.prefix)?;
+    let conflicts = maca::insight::bin_conflicts(&ctx.prefix, &records)?;
+    if conflicts.is_empty() {
+        println!("no binary conflicts");
+        return Ok(());
+    }
+    for conflict in conflicts {
+        println!(
+            "{} claimed by {}",
+            conflict.bin_name,
+            conflict.packages.join(", ")
+        );
     }
     Ok(())
 }

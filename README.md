@@ -2,17 +2,20 @@
 
 Cross-platform package manager for **macOS** and **Linux**, written in **Rust 2024**.
 
-maca installs packages from three sources **without shelling out to the native
-package manager** for catalog or install work:
+maca installs packages from five sources **without shelling out to the native
+package manager** (or to `gh` or `aqua`) for catalog or install work:
 
-| Backend | Catalog | Installs |
-| --- | --- | --- |
-| `brew` | Homebrew formula JSON API (`formulae.brew.sh`) | Bottles (OCI blobs from GHCR) **or source builds** |
-| `winget` | `api.winget.run` search + `microsoft/winget-pkgs` manifests | Windows installers (MSI/EXE) on Windows; dry-run plans everywhere |
-| `custom` | Local JSON registry + optional HTTP mirrors | `tar.gz`, single binaries, or source trees with build steps |
+| Backend  | Catalog                                                                 | Installs                                                                                                   |
+| -------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `brew`   | Homebrew formula JSON API (`formulae.brew.sh`)                          | Bottles (OCI blobs from GHCR) **or source builds**                                                         |
+| `winget` | `api.winget.run` search + `microsoft/winget-pkgs` manifests             | Windows installers (MSI/EXE) on Windows; dry-run plans everywhere                                          |
+| `custom` | Local JSON registry + optional HTTP mirrors                             | `tar.gz`, single binaries, or source trees with build steps                                                |
+| `github` | GitHub Releases API (`owner/repo` or `owner--repo`)                     | Host-matching `.tar.gz`, `.zip`, or a raw binary. `MACA_GITHUB_API` overrides the API origin               |
+| `aqua`   | aqua standard registry (`name/name`, `name--name`, or `aqua:name/name`) | `github_release` assets and concrete `http` URLs. `MACA_AQUA_INDEX` and `MACA_AQUA_RAW` override the index |
 
-`--backend auto` (the default) searches custom → brew → winget and lets the
-first backend that can resolve a plan handle the install.
+`--backend auto` (the default) searches custom → brew → winget → github → aqua.
+Install uses the first of custom, brew, then a `owner/repo` or `aqua:` spec,
+then winget. Select a source by name with `--backend github` or `--backend aqua`.
 
 ## Install
 
@@ -47,6 +50,10 @@ maca outdated --json
 maca upgrade                       # honours pins
 maca remove jq
 maca why oniguruma                 # reverse dependencies
+maca leaves                        # installed packages nothing else depends on
+maca drift                         # pins that differ from the installed version
+maca gaps dev                      # group members missing or at the wrong version
+maca conflicts                     # two packages claiming the same binary
 
 maca group create dev
 maca group add dev jq --backend brew --kind cli
@@ -61,6 +68,7 @@ maca unpin jq
 
 maca snapshot create --note "before upgrade"
 maca snapshot list
+maca snapshot diff <older> <newer> # added, removed, and version changes
 maca snapshot restore <id>
 maca snapshot delete <id>
 maca snapshot prune --keep 5       # keep N latest snapshots
@@ -92,7 +100,7 @@ maca custom remove hello
 - **Concurrent installs** with a bounded job pool (`--jobs`, default 4); ledger
   writes are serialized.
 - **Automatic snapshot** before `install`/`remove`/`upgrade`/`sync`/`group
-  install` and before each TUI action (disable
+install` and before each TUI action (disable
   with `--no-snapshot` where offered). A failed operation rolls the prefix back
   automatically: kegs, links and ledger entries created after the snapshot are
   removed, and the snapshotted ones are put back.
@@ -171,18 +179,23 @@ expands to the install destination.
 
 ## TUI
 
-`maca tui` opens a full-screen interface with four tabs:
+`maca tui` opens a full-screen interface with four tabs. The screen is a list
+plus a detail pane. `?` opens a help overlay.
 
-| Tab | Keys |
-| --- | --- |
-| Installed | `j`/`k` move · `u` upgrade · `r` remove · `s` snapshot |
-| Search | `/` edit query · `Enter` search · `i` install |
-| Groups | `g` install group |
-| Snapshots | `z` restore |
+| Tab       | Keys                                                                                      |
+| --------- | ----------------------------------------------------------------------------------------- |
+| Installed | `j`/`k` move · `f` kind filter · `p` pin toggle · `u` upgrade · `r` remove · `s` snapshot |
+| Search    | `/` edit query · `Enter` search · `i` install                                             |
+| Groups    | `g` install group                                                                         |
+| Snapshots | `z` restore                                                                               |
 
-`q` or `Ctrl-C` quits. `1`–`4` switch tabs. Each action locks the prefix
-only while it runs (an upgrade's version check runs before the lock), so other `maca` commands work while the TUI is open; if
-one is running, the action reports "prefix busy" instead of waiting.
+`q` or `Ctrl-C` quits. `1`–`4` switch tabs. Remove and snapshot restore ask
+for confirmation (`y` to proceed, `n`, `Esc`, or `q` to cancel). While the
+help or confirm overlay is open, `q` does not quit. Each mutating action
+locks the prefix only while it runs (an upgrade's version check runs before
+the lock; a pin toggle does not take a snapshot), so other `maca` commands
+work while the TUI is open. If one is running, the action reports "prefix
+busy" instead of waiting.
 
 ## Self-update
 

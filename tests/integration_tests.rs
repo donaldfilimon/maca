@@ -277,12 +277,18 @@ impl Sandbox {
 
     /// Run maca in the sandbox; returns (success, stdout + stderr).
     fn run(&self, args: &[&str]) -> (bool, String) {
-        let out = Command::new(&self.bin)
-            .args(args)
+        self.run_env(args, &[])
+    }
+
+    fn run_env(&self, args: &[&str], extra: &[(&str, &str)]) -> (bool, String) {
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(args)
             .env("MACA_HOME", &self.home)
-            .env_remove("MACA_PREFIX")
-            .output()
-            .unwrap();
+            .env_remove("MACA_PREFIX");
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().unwrap();
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -840,4 +846,67 @@ fn e2e_prefixes_and_snapshot_scopes_stay_isolated() {
     sb.ok(&["remove", "alpha", "--no-snapshot"]);
     sb.ok(&["install", "alpha", "alpha", "--backend", "custom"]);
     assert_eq!(sb.exec("alpha"), "alpha-2");
+}
+
+/// Dry-run a GitHub release against a loopback API. The printed URL is the
+/// host asset from the fixture, not a reimplementation of the picker.
+#[cfg(unix)]
+#[test]
+fn e2e_github_dry_run_prints_host_asset() {
+    let asset = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "hello-1.2.3-aarch64-apple-darwin.tar.gz"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "hello-1.2.3-x86_64-apple-darwin.tar.gz"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "hello-1.2.3-aarch64-unknown-linux-gnu.tar.gz"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "hello-1.2.3-x86_64-unknown-linux-gnu.tar.gz"
+    } else if cfg!(target_os = "windows") {
+        "hello-1.2.3-x86_64-pc-windows-msvc.zip"
+    } else {
+        panic!("this target has no fixture asset");
+    };
+    let names = [
+        "hello-1.2.3-aarch64-apple-darwin.tar.gz",
+        "hello-1.2.3-x86_64-apple-darwin.tar.gz",
+        "hello-1.2.3-aarch64-unknown-linux-gnu.tar.gz",
+        "hello-1.2.3-x86_64-unknown-linux-gnu.tar.gz",
+        "hello-1.2.3-x86_64-pc-windows-msvc.zip",
+        "checksums.txt",
+    ];
+    let assets: Vec<serde_json::Value> = names
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "browser_download_url": format!("https://example.test/{name}"),
+            })
+        })
+        .collect();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "tag_name": "v1.2.3",
+        "assets": assets,
+    }))
+    .unwrap();
+    let mut routes = HashMap::new();
+    routes.insert("/repos/acme/hello/releases/latest".into(), body);
+    let base = serve(routes);
+    let sb = Sandbox::new("github-plan");
+    let (ok, text) = sb.run_env(
+        &[
+            "install",
+            "acme/hello",
+            "--backend",
+            "github",
+            "--dry-run",
+            "--no-snapshot",
+        ],
+        &[("MACA_GITHUB_API", base.as_str())],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("1.2.3"), "{text}");
+    assert!(
+        text.contains(&format!("https://example.test/{asset}")),
+        "{text}"
+    );
 }

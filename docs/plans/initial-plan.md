@@ -39,8 +39,16 @@ without requiring the native package manager binaries for catalog operations.
 - Live: winget `--dry-run` resolves `Microsoft.VisualStudioCode 1.143.1` with
   the correct arm64 installer URL.
 
-## Not done / next
+## Completed (subsequent tranches)
 
-- Source builds for formulae without bottles.
-- Windows installer execution is implemented but unverified on a Windows host.
-- No rollback/snapshot, no concurrent-install locking, no repo publishing.
+All items below were delivered in later work:
+
+- Source builds (`--build-from-source` + custom `build_steps`).
+- Snapshots + rollback before/after mutating commands.
+- Concurrent installs with prefix lock + `--jobs`.
+- Packaging + CI automation (`scripts/package-release.sh`, `.github/workflows/{ci,release}.yml`).
+
+## Blocked (requires hardware / external state the user must provide)
+
+- **Windows installer execution**: The code path exists and is compile/lint-verified via `scripts/cross-check.sh` for `x86_64-pc-windows-msvc`. Execution (msiexec / EXE) only runs under `#[cfg(target_os = "windows")]`. Verified command on a Windows host: `maca install <winget-pkg> --backend winget`.
+- No real GitHub release has been published yet for `donaldfilimon/maca`, so end-to-end `maca self-update` cannot be exercised against a live release. Logic, asset selection, checksum verification, extraction hardening, and backup/restore are fully unit-tested (14 selfupdate tests).

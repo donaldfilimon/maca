@@ -32,6 +32,50 @@ pub fn verify_sha256(name: &str, bytes: &[u8], expected: Option<&str>) -> Result
     }
 }
 
+/// Digest for `asset` from a checksum file.
+///
+/// Accepts `hex  filename`, `hex *filename`, or a file whose only line is the hex.
+pub fn sha256_from_sums(text: &str, asset: &str) -> Option<String> {
+    let want = std::path::Path::new(asset)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(asset);
+    let mut lone = None;
+    let mut lines = 0usize;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        lines += 1;
+        let mut parts = line.split_whitespace();
+        let Some(hex) = parts.next() else {
+            continue;
+        };
+        if !is_sha256_hex(hex) {
+            continue;
+        }
+        match parts.next() {
+            Some(name) => {
+                let name = name.trim_start_matches('*');
+                let base = std::path::Path::new(name)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(name);
+                if base == want || name == asset {
+                    return Some(hex.to_ascii_lowercase());
+                }
+            }
+            None => lone = Some(hex.to_ascii_lowercase()),
+        }
+    }
+    if lines == 1 { lone } else { None }
+}
+
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 /// Download a URL into memory (artifacts are typically < 200 MiB).
 pub async fn download(url: &str) -> Result<Vec<u8>> {
     download_with_bearer(url, None).await
@@ -216,6 +260,87 @@ pub fn extract_tar_gz_to_cellar(
         _ => staging.0.clone(),
     };
     move_into_place(name, &source, &dest)
+}
+
+/// Extract a `.zip` into a fresh `<prefix>/cellar/<name>/<version>/`.
+/// A single leading directory is stripped, matching [`extract_tar_gz_to_cellar`].
+/// Entries that escape the archive (`..`, absolute paths) are refused and
+/// nothing is published.
+pub fn extract_zip_to_cellar(
+    name: &str,
+    version: &str,
+    bytes: &[u8],
+    prefix: &Path,
+) -> Result<PathBuf> {
+    require_component("package name", name)?;
+    require_component("version", version)?;
+    config::ensure_dirs(prefix)?;
+    let dest = config::cellar_dir(prefix).join(name).join(version);
+    if dest.exists() {
+        return Ok(dest);
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let staging = Staging::new(prefix, name, version)?;
+    unpack_zip(name, bytes, &staging.0)?;
+    let mut top: Vec<PathBuf> = std::fs::read_dir(&staging.0)?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    let source = match (top.pop(), top.is_empty()) {
+        (Some(only), true) if only.is_dir() && !only.is_symlink() => only,
+        (None, _) => {
+            return Err(Error::Other(anyhow::anyhow!("zip for {name} is empty")));
+        }
+        _ => staging.0.clone(),
+    };
+    move_into_place(name, &source, &dest)
+}
+
+fn unpack_zip(name: &str, bytes: &[u8], dest: &Path) -> Result<()> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| Error::Other(anyhow::anyhow!("zip for {name}: {e}")))?;
+    if archive.is_empty() {
+        return Err(Error::Other(anyhow::anyhow!("zip for {name} is empty")));
+    }
+    for i in 0..archive.len() {
+        let mut file = archive
+            .by_index(i)
+            .map_err(|e| Error::Other(anyhow::anyhow!("zip for {name}: {e}")))?;
+        let Some(rel) = file.enclosed_name() else {
+            return Err(Error::Unsupported(format!(
+                "zip entry in {name} escapes the archive"
+            )));
+        };
+        if rel.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::RootDir
+            )
+        }) {
+            return Err(Error::Unsupported(format!(
+                "zip entry {} escapes the archive",
+                rel.display()
+            )));
+        }
+        let out = dest.join(&rel);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out)?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut writer = std::fs::File::create(&out)?;
+        std::io::copy(&mut file, &mut writer)?;
+        #[cfg(unix)]
+        if let Some(mode) = file.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&out, std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    Ok(())
 }
 
 /// Rename a fully staged keg to its final path. If the rename fails because
@@ -775,5 +900,42 @@ mod hardening_tests {
             verify_sha256("x", b"abc", Some("00")),
             Err(Error::Checksum { .. })
         ));
+    }
+
+    #[test]
+    fn zip_slip_leaves_nothing_outside_the_archive() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let opts = zip::write::SimpleFileOptions::default();
+            writer.start_file("../evil.txt", opts).unwrap();
+            use std::io::Write;
+            writer.write_all(b"nope").unwrap();
+            writer.finish().unwrap();
+        }
+        let prefix = temp("zip-slip");
+        let outside = prefix.join("evil.txt");
+        let err = extract_zip_to_cellar("pkg", "1.0.0", &cursor.into_inner(), &prefix);
+        assert!(err.is_err(), "zip-slip must fail");
+        assert!(!outside.exists());
+        assert!(!config::cellar_dir(&prefix).join("pkg/1.0.0").exists());
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[test]
+    fn zip_extracts_and_strips_one_leading_directory() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let opts = zip::write::SimpleFileOptions::default();
+            writer.start_file("hello-1.0.0/bin/hello", opts).unwrap();
+            use std::io::Write;
+            writer.write_all(b"hi").unwrap();
+            writer.finish().unwrap();
+        }
+        let prefix = temp("zip-ok");
+        let dest = extract_zip_to_cellar("pkg", "1.0.0", &cursor.into_inner(), &prefix).unwrap();
+        assert_eq!(std::fs::read(dest.join("bin/hello")).unwrap(), b"hi");
+        let _ = std::fs::remove_dir_all(&prefix);
     }
 }
