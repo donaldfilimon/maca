@@ -1,5 +1,9 @@
 # maca
 
+[![CI](https://github.com/donaldfilimon/maca/workflows/CI/badge.svg)](https://github.com/donaldfilimon/maca/actions)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Rust](https://img.shields.io/badge/rust-1.89%2B-orange?logo=rust)](https://www.rust-lang.org/)
+
 Cross-platform package manager for **macOS** and **Linux**, written in **Rust 2024**.
 
 maca installs packages from five sources **without shelling out to the native
@@ -264,3 +268,18 @@ renaming the new file into place. The repository's release workflow and
 
 Runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, a
 release build, and `maca doctor`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, testing, and
+how to contribute.
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
+## Code of Conduct
+
+See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE).
