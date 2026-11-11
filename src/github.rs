@@ -135,6 +135,11 @@ impl GithubBackend {
                 planned.plan.name, planned.plan.url
             );
         }
+        let keg_existed = opts
+            .keg_root()
+            .join(&planned.plan.name)
+            .join(&planned.plan.version)
+            .exists();
         let cellar = commit_artifact(
             &planned.plan.name,
             &planned.plan.version,
@@ -159,7 +164,13 @@ impl GithubBackend {
                     bins = install::link_root_executables(&cellar, &opts.prefix)?;
                 }
                 if bins.is_empty() {
-                    let _ = std::fs::remove_dir_all(&cellar);
+                    // Only clean up a keg this call created.
+                    if !keg_existed {
+                        let _ = std::fs::remove_dir_all(&cellar);
+                        if let Some(parent) = cellar.parent() {
+                            let _ = std::fs::remove_dir(parent);
+                        }
+                    }
                     return Err(Error::Unsupported(format!(
                         "github archive for {} contains no executables at the root or in bin/",
                         planned.plan.name

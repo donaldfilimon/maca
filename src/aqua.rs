@@ -1230,7 +1230,12 @@ packages:
             resolve_file_target(&dir, "flat", "top/flat").unwrap(),
             dir.join("flat")
         );
-        assert!(resolve_file_target(&dir, "gh", "top/nothing").is_ok());
+        // `src` names a missing file, so this resolves only through the
+        // `bin/<name>` fallback; with no fallback it is an error (next line).
+        assert_eq!(
+            resolve_file_target(&dir, "gh", "top/nothing").unwrap(),
+            dir.join("bin/gh")
+        );
         assert!(resolve_file_target(&dir, "zzz", "top/zzz").is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }

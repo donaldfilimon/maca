@@ -20,7 +20,7 @@ RUST_LOG=debug cargo run -- search jq                # tracing goes through RUST
 ./scripts/cross-check.sh                             # clippy -D warnings for Linux + Windows from macOS (needs zig; compile-only)
 ```
 
-CI (`.github/workflows/ci.yml`) has four jobs: `./check.sh` then `./scripts/package-release.sh` on Ubuntu and macOS; `cargo deny check` against `deny.toml` (advisories, licence allow-list, unknown sources); an MSRV build, `cargo +1.89.0 build --locked`; and clippy plus `cargo test` on Windows. `.github/workflows/release.yml` runs on a `v*` tag, checks the tag equals the `Cargo.toml` version, and uploads the archives to the GitHub release. No CI or release run has been observed: when checked on 2026-11-10 local `main` was 11 commits ahead of `origin/main`, and the `supply-chain` and `msrv` jobs exist only in the unpushed commits.
+CI (`.github/workflows/ci.yml`) has four jobs: `./check.sh` then `./scripts/package-release.sh` on Ubuntu and macOS; `cargo deny check` against `deny.toml` (advisories, licence allow-list, unknown sources); an MSRV build, `cargo +1.89.0 build --locked`; and clippy plus `cargo test` on Windows. `.github/workflows/release.yml` runs on a `v*` tag, runs `./check.sh` first, checks the tag equals the `Cargo.toml` version, uploads the archives to the GitHub release, and marks hyphenated tags (such as `v0.1.0-alpha.1`) as prereleases. No CI or release run has been observed: the repository had not been pushed with these workflows when last checked.
 
 `Cargo.lock` is tracked because the MSRV job builds with `--locked`, but a global gitignore rule (`**/*.lock`) still matches it: changes to it show up in `git status` as usual, and re-adding it after a removal needs `git add -f Cargo.lock`. Commit the lockfile together with any dependency change, or `--locked` fails. A new dependency also has to pass the licence allow-list in `deny.toml`; `check.sh` skips that step silently when `cargo-deny` is not installed.
 
@@ -54,8 +54,6 @@ The default data dir is deliberately space-free on macOS (not `~/Library/Applica
 - **Search**: `search_all` queries custom, brew, winget, github and aqua concurrently and merges; `insight::rank_packages` orders the result.
 - **Install** (`backend::auto_install`): custom if its `plan()` succeeds, then brew if `can_install` (a host bottle or a stable source URL), then GitHub or Aqua only when the spec's shape says so (`insight::suggest_backend`: `owner/repo` is GitHub, `aqua:…` is Aqua), and otherwise winget as the unconditional fallback. A plain name never reaches GitHub or Aqua under `auto`. `--version` with `auto` is refused in `install_with_backend`; a version needs an explicit backend.
 - **Info** (`info_one` in `main.rs`): custom, then brew, then winget, then the same shape-based GitHub/Aqua choice.
-
-The comment on `backend::auto_default` describes an older order; go by `auto_install`.
 
 `insight.rs` is local reasoning only (search ranking, backend suggestion, leaves, pin drift, group gaps, bin conflicts, snapshot diffs): it makes no catalog calls and takes records the caller already loaded.
 

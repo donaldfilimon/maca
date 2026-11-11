@@ -6,6 +6,9 @@ All notable changes to maca are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- A GitHub archive with no linkable executables no longer deletes a keg that existed before the install, and the empty package directory is cleaned up when the keg was created by that install.
+
 ## [0.1.0-alpha.1] - 2026-11-10
 
 First tagged release, published as an alpha pre-release.

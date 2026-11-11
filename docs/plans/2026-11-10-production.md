@@ -17,7 +17,7 @@ stay listed as open until verified.
 ## Decisions (from the user)
 
 - **Scope:** everything, Phases 1-5, including the new backend features.
-- **Release:** push `main` and tag `v0.1.0` once all checks pass.
+- **Release:** push `main` and tag `v0.1.0-alpha.1` (superseded the plain `v0.1.0`) once all checks pass.
 
 ## Where things stand (as of 2026-11-10 at plan time; current baseline is 124 unit and 22 integration tests)
 
@@ -73,7 +73,7 @@ In this order, smallest and most testable first. Each gets unit and e2e tests (l
    - macOS x86_64 and Linux aarch64 targets
    - an aggregate `SHA256SUMS` file
 3. Add an install script (`curl | sh`) that downloads the release archive and verifies its checksum.
-4. Tag `v0.1.0` (the workflow checks the tag equals the `Cargo.toml` version). Then run `maca self-update --check` and `maca self-update` against the published release on this Mac, and record the evidence in a plan file.
+4. Tag `v0.1.0-alpha.1` (the workflow checks the tag equals the `Cargo.toml` version). Then run `maca self-update --check` and `maca self-update` against the published release on this Mac, and record the evidence in a plan file.
 
 ### Phase 5: Verification on hardware we don't have
 - Add a `windows-latest` CI job that runs a real winget package install and the `.zip` self-update against the published release. Until it has run and passed, the docs keep saying "unverified".
