@@ -1,13 +1,25 @@
 # maca: production-readiness plan (2026-11-10)
 
-Status: **proposed**, awaiting go-ahead. Nothing below has been done yet.
+Status: **in progress** (alpha 0.1.0 release cleanup, 2026-11-10).
+
+**Delivered:** Phase 1 (CHANGELOG.md, deny.toml, `/skills/` in .gitignore,
+`docs/plans/2026-11-10-versions-casks.md`); Phase 2 item 1 (deny.toml, a
+cargo-deny step in check.sh and a cargo-deny job in ci.yml) and item 4 (cask,
+version and project-prefix tests); Phase 3 item 1 (named versions on brew,
+winget and custom).
+
+**Still open:** Phase 3 items 2-4 (dmg/pkg casks, taps, hermetic builds),
+Phase 4 (push, release.yml extensions, install script, tag and self-update
+evidence) and Phase 5. Phase 2 items 2-3 (cross-check, unwrap review) and the
+Phase 1 README/CLAUDE.md/AGENTS.md reconciliation are not confirmed here and
+stay listed as open until verified.
 
 ## Decisions (from the user)
 
 - **Scope:** everything, Phases 1-5, including the new backend features.
 - **Release:** push `main` and tag `v0.1.0` once all checks pass.
 
-## Where things stand (verified 2026-11-10)
+## Where things stand (as of 2026-11-10 at plan time; current baseline is 124 unit and 22 integration tests)
 
 - `./check.sh` passes: 113 unit tests, 16 integration tests, clippy `-D warnings`, release build, doctor.
 - `main` is 7 commits ahead of `origin/main` (unpushed). `skills/` is untracked and is tooling, not project code.

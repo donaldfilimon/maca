@@ -2,16 +2,13 @@
 
 ## Supported versions
 
-Only the latest commit on the `main` branch is actively supported for security updates.
+The latest tagged release (currently the 0.1.0 alpha line) and the tip of `main` receive security fixes. Older tags do not.
 
 ## Reporting a vulnerability
 
 If you discover a security vulnerability in maca, please **do not open a public issue**.
 
-Instead, send a private report to the maintainer via one of:
-
-- GitHub private security advisory (preferred when available): use the "Report a vulnerability" button on the Security tab of the repository.
-- Email: see the address listed in the repository or Cargo.toml if present.
+Instead, send a private report through a GitHub private security advisory: use "Report a vulnerability" on the Security tab of the repository.
 
 Please include as much detail as possible:
 - Description of the issue

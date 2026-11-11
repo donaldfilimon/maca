@@ -661,8 +661,9 @@
                             <span class="font-mono">maca sync</span> fails and
                             rolls back if the version it gets is not the one the
                             lock recorded. GitHub Releases and Aqua fetch that
-                            exact release; Homebrew and winget only publish
-                            their current version and refuse the request.
+                            exact release; Homebrew resolves versioned
+                            formulae, winget older manifests, and a custom
+                            entry its earlier registrations.
                         </p>
                     </div>
                 </div>
@@ -780,13 +781,16 @@
                     <ul class="space-y-2 text-sm text-slate-400">
                         <li>
                             <span class="text-slate-200"
-                                >Pinned versions, fetched.</span
+                                >Pinned versions, fetched where the catalog can serve them.</span
                             >
-                            GitHub Releases and Aqua fetch the release a lock or
-                            <span class="font-mono">--version</span> names.
-                            Homebrew and winget publish only their current
-                            version and refuse, so the wrong one is never
-                            installed quietly.
+                            GitHub Releases and Aqua name a tag, Homebrew
+                            resolves versioned formulae such as python@3.12,
+                            winget resolves older manifests, and a custom entry
+                            keeps its earlier registrations. A request a
+                            catalog cannot serve is refused, never rounded to a
+                            nearby version, so the wrong one is never installed
+                            quietly. The lock or
+                            <span class="font-mono">--version</span> names it.
                         </li>
                         <li>
                             <span class="text-slate-200"

@@ -19,6 +19,8 @@ Elevate `maca` to a complete, autonomous, production-ready package manager: envi
 
 ## Evidence
 
+Counts here are as of this tranche; later tranches add tests and backends.
+
 - `./check.sh` → `check.sh: OK` (121 tests passed: 106 unit + 15 integration tests, clippy `-D warnings`, release build).
 - Live: `maca shellenv` outputs valid export commands for sh/bash, fish, and csh.
 - Live: `maca completions` emits functional scripts for bash, zsh, fish, elvish, powershell.

@@ -7,14 +7,16 @@ Thank you for your interest in contributing to maca!
 ```sh
 git clone https://github.com/donaldfilimon/maca.git
 cd maca
-./check.sh                 # fmt --check, clippy -D warnings, test, release build, doctor
+./check.sh                 # fmt --check, clippy -D warnings, test, cargo deny (if installed), release build, doctor
 cargo build --release
 eval "$(./target/release/maca shellenv)"
 ```
 
 ## Development workflow
 
-- Run `./check.sh` before every push or PR. It enforces formatting, linting, tests, a release build, and `maca doctor`.
+- Run `./check.sh` before every push or PR. It enforces formatting, linting, tests, a release build, and `maca doctor`. It also runs `cargo deny check` when cargo-deny is installed (`cargo install cargo-deny`); CI always runs it.
+- CI also builds on Rust 1.89.0, the declared minimum (MSRV), so avoid newer std APIs.
+- Run `./scripts/cross-check.sh` (clippy `-D warnings` for Linux and Windows, needs zig) before pushing platform-gated changes.
 - Use `RUST_LOG=debug cargo run -- <command>` for tracing during development.
 - Prefer small, focused changes.
 - Add or update tests when changing behavior (especially anything that touches the ledger, prefix lock, snapshots, or backends).

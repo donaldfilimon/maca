@@ -1,5 +1,7 @@
 # maca initial plan (2026-11-09)
 
+Historical initial plan; the shipped backend set is five (brew, winget, custom, github, aqua) as described in CLAUDE.md.
+
 ## Goal
 
 A cross-platform (macOS + Linux) package manager in Rust 2024 that installs

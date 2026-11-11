@@ -2,6 +2,8 @@ name: Release
 
 # Pushing a tag like v0.2.0 builds maca on each runner and attaches
 # maca-<target>.tar.gz plus its .sha256 to the GitHub release for that tag.
+# The tag must equal v<Cargo.toml version>. A tag with a hyphen, such as
+# v0.1.0-alpha.1, is published as a GitHub prerelease.
 # These are the assets `maca self-update` looks for.
 on:
   push:
@@ -27,6 +29,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
@@ -40,6 +44,9 @@ jobs:
             exit 1
           fi
 
+      - name: Run verification gate
+        run: ./check.sh
+
       - name: Package release archive
         run: ./scripts/package-release.sh
 
@@ -48,7 +55,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          flags=""
+          case "$GITHUB_REF_NAME" in *-*) flags="--prerelease";; esac
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes $flags \
             || gh release view "$GITHUB_REF_NAME" >/dev/null
           gh release upload "$GITHUB_REF_NAME" target/dist/maca-*.tar.gz target/dist/maca-*.tar.gz.sha256 --clobber

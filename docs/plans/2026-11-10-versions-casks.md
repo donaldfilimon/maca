@@ -9,9 +9,12 @@ prefixes, and isolate source builds from the caller's environment.
 ## Delivered
 
 - **Named versions.** `InstallOptions::version` is honoured by GitHub Releases
-  and Aqua (the tag is tried with and without a leading `v`). Brew, winget and
-  custom refuse a version other than their current one rather than installing
-  the wrong one. `sync` and groups pass the locked version through.
+  and Aqua (the tag is tried with and without a leading `v`). Brew resolves a
+  versioned formula (`name@x`) or its current version when that satisfies the
+  request; winget resolves an older manifest directory; custom serves its
+  registration history. A request no catalog can serve is refused with
+  `Error::Unsupported`, never rounded. Casks refuse a version the catalog does
+  not publish. `sync` and groups pass the locked version through.
 - **Casks.** `maca install cask:<token>` and `--cask` install zip and tar casks
   from the Homebrew cask API, checksummed. Disk images and installer packages
   are refused before download. Binaries are linked; the `.app` stays in the
@@ -38,8 +41,8 @@ prefixes, and isolate source builds from the caller's environment.
 
 ## Evidence
 
-- `./check.sh` after these changes (see the production plan for the latest
-  counts).
+- `./check.sh` at the release commit: 124 unit tests and 22 integration
+  tests, clippy `-D warnings`, release build, doctor.
 - Unit tests `an_unparseable_project_file_is_an_error_not_a_fallback` and
   `a_project_file_can_name_a_cellar_relative_to_itself`; integration test
   `a_broken_project_file_stops_the_command_instead_of_using_the_global_prefix`.

@@ -35,7 +35,7 @@ if [ "$TARGET" != "$HOST" ]; then
 fi
 
 echo "Building maca v${VERSION} for ${TARGET}..."
-cargo build --release
+cargo build --release --locked
 
 DIST_DIR="target/dist"
 mkdir -p "$DIST_DIR"

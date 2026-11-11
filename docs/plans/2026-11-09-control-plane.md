@@ -28,7 +28,7 @@ snapshots/rollback, and concurrent installs.
   verification, backup-and-replace.
 - **Catalog cache**: the 31 MiB brew index is cached for 1 hour.
 
-## Evidence (current as of 2026-11-10, after completion tranches)
+## Evidence (point-in-time record from the completion tranches; test counts and later tranches are superseded by docs/plans/2026-11-10-*.md and the current ./check.sh)
 
 - `./check.sh` → `check.sh: OK` (121 tests passed: 106 unit + 15 integration, clippy `-D warnings`, release build, doctor self-check).
 - `./scripts/cross-check.sh` → OK for `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` (clippy `-D warnings` via zig cross-compiler; proves Windows code paths compile and lint without a Windows machine).
