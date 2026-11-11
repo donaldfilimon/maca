@@ -1,6 +1,6 @@
 [package]
 name = "maca"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 description = "Cross-platform package manager for macOS and Linux. Installs from Homebrew (bottles or source), winget, GitHub Releases, Aqua registry, and custom sources — without shelling out to the native tools."
 license = "Apache-2.0"

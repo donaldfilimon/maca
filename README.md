@@ -119,7 +119,7 @@ Linux archives are built on Ubuntu 24.04 and need glibc 2.39 or newer:
 
 ```sh
 triple=aarch64-apple-darwin   # or x86_64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu
-base=https://github.com/donaldfilimon/maca/releases/download/v0.1.0-alpha.1
+base=https://github.com/donaldfilimon/maca/releases/download/v0.1.0-alpha.2
 curl -fsSLO "$base/maca-$triple.tar.gz" -O "$base/maca-$triple.tar.gz.sha256"
 shasum -a 256 -c "maca-$triple.tar.gz.sha256"   # sha256sum -c on Linux
 tar -xzf "maca-$triple.tar.gz" && ./maca --version
@@ -363,12 +363,12 @@ renaming the new file into place. The repository's release workflow and
   host was available to execute MSI/EXE installers. The winget catalog,
   manifest resolution, checksum verification, and `--dry-run` plans are
   verified on macOS; the installer launch path is compile-gated to Windows.
-- **Self-update has run on macOS arm64 only.** `self-update --force` replaced
-  a copy of the binary from the published `v0.1.0-alpha.1` prerelease, and an
-  end-to-end test drives the whole path against a loopback server on macOS
-  and Linux. It has not run against a real release on Linux or on an Intel
-  Mac. The `0.1.0-alpha.1` binary itself predates the prerelease channel and
-  only looks for a stable release, so it reports that none exists.
+- **Self-update has run against a real release on macOS arm64 and Linux
+  only.** `self-update --force` replaced a copy of the binary from a published
+  prerelease on both, and an end-to-end test drives the whole path against a
+  loopback server. It has not run on an Intel Mac. `0.1.0-alpha.1` predates
+  the prerelease channel and only looks for a stable release, so it cannot
+  update itself; install a later build over it.
 - **Windows self-update has never run on Windows.** The `.zip` extraction and
   the rename-based replacement helper are platform-independent code that is
   unit-tested on macOS only (zip archives built in the tests). The Windows

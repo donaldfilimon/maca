@@ -6,6 +6,8 @@ All notable changes to maca are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0-alpha.2] - 2026-11-10
+
 ### Added
 - `maca self-update --prerelease` considers prereleases and picks the highest
   published version. A build that is itself a prerelease does this without
