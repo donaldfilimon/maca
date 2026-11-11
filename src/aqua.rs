@@ -45,6 +45,13 @@ impl AquaBackend {
         Ok(describe(&pkg, &slash, &version))
     }
 
+    /// Latest release version; lookup failures propagate (unlike `info`).
+    pub async fn latest_release_version(&self, name: &str) -> Result<String> {
+        let slash = slash_spec(name)?;
+        let pkg = load_package(&slash).await?;
+        latest_tag(&pkg).await
+    }
+
     pub async fn plan(&self, name: &str) -> Result<InstallPlan> {
         Ok(self.prepare(name, None).await?.plan)
     }
@@ -778,7 +785,7 @@ fn prepare_http(cellar: &str, pkg: &AquaPkg) -> Result<Prepared> {
     let resolved = choose_variant(pkg, "latest", "linux", "amd64")?;
     let url = resolved.url.clone().unwrap_or_default();
     let version = github::sanitize_version("latest")?;
-    let kind = kind_from_format(&resolved.format, &url);
+    let kind = kind_from_format(&resolved.format, &url)?;
     Ok(Prepared {
         plan: InstallPlan {
             name: cellar.to_string(),
@@ -832,7 +839,7 @@ fn prepare_release(
             resolved.repo_owner, resolved.repo_name
         ))
     });
-    let kind = kind_from_format(&resolved.format, &resolved.asset);
+    let kind = kind_from_format(&resolved.format, &resolved.asset)?;
     let raw_exe = resolved
         .files
         .first()
@@ -856,13 +863,18 @@ fn prepare_release(
     })
 }
 
-fn kind_from_format(format: &str, name: &str) -> ArtifactKind {
-    match format {
+fn kind_from_format(format: &str, name: &str) -> Result<ArtifactKind> {
+    Ok(match format {
         "zip" => ArtifactKind::Zip,
         "raw" => ArtifactKind::Raw,
-        "tar.gz" => ArtifactKind::TarGz,
+        "tar.gz" | "tgz" => ArtifactKind::TarGz,
+        "tar.xz" | "tar.bz2" | "tar.zst" | "gz" | "bz2" | "xz" | "zst" | "7z" => {
+            return Err(Error::Unsupported(format!(
+                "aqua format `{format}` for `{name}` is not supported (maca unpacks tar.gz, zip and raw)"
+            )));
+        }
         _ => github::artifact_kind(name).unwrap_or(ArtifactKind::TarGz),
-    }
+    })
 }
 
 fn format_of(format: Option<&str>, url: &str) -> String {
@@ -1010,6 +1022,20 @@ async fn download_text(url: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kind_from_format_refuses_formats_it_cannot_unpack() {
+        for f in [
+            "tar.xz", "tar.bz2", "tar.zst", "gz", "bz2", "xz", "zst", "7z",
+        ] {
+            assert!(
+                matches!(kind_from_format(f, "x"), Err(Error::Unsupported(_))),
+                "{f}"
+            );
+        }
+        assert_eq!(kind_from_format("tgz", "x").unwrap(), ArtifactKind::TarGz);
+        assert_eq!(kind_from_format("zip", "x").unwrap(), ArtifactKind::Zip);
+    }
+
     use super::*;
 
     #[test]

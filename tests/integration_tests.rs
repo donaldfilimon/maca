@@ -271,6 +271,21 @@ fn script_tarball(top: &str, exe: &str, prints: &str) -> Vec<u8> {
     tar.into_inner().unwrap().finish().unwrap()
 }
 
+/// A tar.gz of `(path, mode, content)` entries.
+#[cfg(unix)]
+fn tarball(entries: &[(&str, u32, &str)]) -> Vec<u8> {
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut tar = tar::Builder::new(gz);
+    for (path, mode, body) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(*mode);
+        header.set_cksum();
+        tar.append_data(&mut header, path, body.as_bytes()).unwrap();
+    }
+    tar.into_inner().unwrap().finish().unwrap()
+}
+
 #[cfg(unix)]
 fn sha256(bytes: &[u8]) -> String {
     use sha2::Digest;
@@ -1459,4 +1474,86 @@ fn e2e_winget_resolves_an_older_manifest_and_refuses_unknown_ones() {
     );
     assert!(!ok, "{text}");
     assert!(text.contains("no version 1.5"), "{text}");
+}
+
+/// Serve a github release whose host asset is `archive`, and install it.
+#[cfg(unix)]
+fn github_install(sb: &Sandbox, archive: Vec<u8>) -> (bool, String) {
+    let asset = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "flat-1.0.0-aarch64-apple-darwin.tar.gz"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "flat-1.0.0-x86_64-apple-darwin.tar.gz"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "flat-1.0.0-aarch64-unknown-linux-gnu.tar.gz"
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "flat-1.0.0-x86_64-unknown-linux-gnu.tar.gz"
+    } else {
+        panic!("this target has no fixture asset");
+    };
+    let mut routes = HashMap::new();
+    routes.insert(format!("/dl/{asset}"), archive);
+    let base = serve(routes.clone());
+    let release = serde_json::to_vec(&serde_json::json!({
+        "tag_name": "v1.0.0",
+        "assets": [{
+            "name": asset,
+            "browser_download_url": format!("{base}/dl/{asset}"),
+        }],
+    }))
+    .unwrap();
+    routes.insert("/repos/acme/flat/releases/latest".into(), release);
+    let base = serve(routes);
+    sb.run_env(
+        &[
+            "install",
+            "acme/flat",
+            "--backend",
+            "github",
+            "--no-snapshot",
+        ],
+        &[("MACA_GITHUB_API", base.as_str())],
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_github_links_executables_at_the_archive_root() {
+    let sb = Sandbox::new("github-flat");
+    let archive = tarball(&[
+        ("flat-1.0.0/flatexe", 0o755, "#!/bin/sh\necho flat-ok\n"),
+        ("flat-1.0.0/README", 0o644, "docs\n"),
+    ]);
+    let (ok, text) = github_install(&sb, archive);
+    assert!(ok, "{text}");
+    assert_eq!(sb.exec("flatexe"), "flat-ok");
+    assert!(!sb.prefix().join("bin").join("README").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_github_bin_layout_still_links_from_bin() {
+    let sb = Sandbox::new("github-binlayout");
+    let archive = script_tarball("flat-1.0.0", "binexe", "bin-ok");
+    let (ok, text) = github_install(&sb, archive);
+    assert!(ok, "{text}");
+    assert_eq!(sb.exec("binexe"), "bin-ok");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_github_archive_without_executables_fails_and_leaves_nothing() {
+    let sb = Sandbox::new("github-noexe");
+    let archive = tarball(&[
+        ("flat-1.0.0/README", 0o644, "docs\n"),
+        ("flat-1.0.0/LICENSE", 0o644, "mit\n"),
+    ]);
+    let (ok, text) = github_install(&sb, archive);
+    assert!(!ok, "{text}");
+    assert!(text.contains("no executables"), "{text}");
+    assert_eq!(sb.installed_version("acme--flat"), None);
+    let keg_parent = sb.prefix().join("cellar").join("acme--flat");
+    assert!(
+        !keg_parent.join("1.0.0").exists(),
+        "keg left behind: {text}"
+    );
 }

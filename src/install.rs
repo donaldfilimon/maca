@@ -524,6 +524,53 @@ pub fn link_bins(cellar: &Path, executables: &[String], prefix: &Path) -> Result
     Ok(linked)
 }
 
+/// Fallback for release archives that keep their executables at the keg
+/// root (after the single top directory is stripped) instead of in `bin/`.
+/// Links every executable regular file found there; returns nothing when
+/// there is none. Link-safety rules are those of `place_link`.
+pub fn link_root_executables(cellar: &Path, prefix: &Path) -> Result<Vec<PathBuf>> {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(cellar) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            if name.starts_with('.') || name.contains('/') || name.contains('\\') {
+                continue;
+            }
+            // `metadata` follows symlinks, so a link to a directory is not a file.
+            let Ok(meta) = std::fs::metadata(entry.path()) else {
+                continue;
+            };
+            if meta.is_file() && is_executable_file(&name, &meta) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    config::ensure_dirs(prefix)?;
+    let bin_dir = config::bin_dir(prefix);
+    let mut linked = Vec::new();
+    for name in names {
+        let link = bin_dir.join(&name);
+        if place_link(&cellar.join(&name), &link, own_root(cellar))? {
+            linked.push(link);
+        }
+    }
+    Ok(linked)
+}
+
+#[cfg(unix)]
+fn is_executable_file(_name: &str, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(name: &str, _meta: &std::fs::Metadata) -> bool {
+    name.to_ascii_lowercase().ends_with(".exe")
+}
+
 fn discover_binaries(dir: &Path) -> Vec<String> {
     let mut exes = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {

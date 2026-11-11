@@ -285,8 +285,13 @@ pub async fn latest_version(backend: &str, name: &str) -> Result<String> {
             let urls = config::Config::load()?.custom_registry_urls;
             CustomBackend::new(custom::Registry::load_merged(&urls).await?).info(name)?
         }
-        "github" => github::GithubBackend::new().info(name).await?,
-        "aqua" => aqua::AquaBackend::new().info(name).await?,
+        // Strict lookups: a rate-limited or offline API must not look current.
+        "github" => {
+            return github::GithubBackend::new()
+                .latest_release_version(name)
+                .await;
+        }
+        "aqua" => return aqua::AquaBackend::new().latest_release_version(name).await,
         other => {
             return Err(crate::Error::Unsupported(format!(
                 "unknown backend '{other}' in ledger"

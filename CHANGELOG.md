@@ -7,6 +7,15 @@ All notable changes to maca are recorded here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- github installs of archives that keep their executables at the archive root
+  (not in `bin/`) now link them; an archive with no executables fails instead
+  of reporting a successful empty install.
+- github and aqua no longer install `.tar.xz`, `.tar.bz2`, `.tar.zst`, `.gz`,
+  `.7z` and similar archives as a "raw" executable; they are skipped (github)
+  or refused (aqua).
+- `maca upgrade` and `outdated` no longer report a github or aqua package as
+  up to date when the release lookup fails (rate limit, offline); the failure
+  is reported for that package.
 - aqua installs no longer link a dangling binary when `files[].src` names the
   archive's top directory; a file that is not in the archive is an error.
 - aqua checksum assets using `{{.Asset}}`, `{{.AssetWithoutExt}}` or

@@ -67,6 +67,15 @@ impl GithubBackend {
         ))
     }
 
+    /// The latest release version, with every lookup failure propagated
+    /// (unlike `info`, which tolerates it). Used by upgrade checks.
+    pub async fn latest_release_version(&self, name: &str) -> Result<String> {
+        let (owner, repo, _) = split_spec(name)?;
+        let url = format!("{}/repos/{owner}/{repo}/releases/latest", api_base());
+        let release = github_json(&url).await?;
+        version_from_release(&release, &format!("{owner}/{repo}"))
+    }
+
     pub async fn plan(&self, name: &str) -> Result<InstallPlan> {
         Ok(self.plan_release(name, None).await?.plan)
     }
@@ -145,7 +154,17 @@ impl GithubBackend {
                 )?]
             }
             ArtifactKind::TarGz | ArtifactKind::Zip => {
-                let bins = install::link_bins(&cellar, &[], &opts.prefix)?;
+                let mut bins = install::link_bins(&cellar, &[], &opts.prefix)?;
+                if bins.is_empty() {
+                    bins = install::link_root_executables(&cellar, &opts.prefix)?;
+                }
+                if bins.is_empty() {
+                    let _ = std::fs::remove_dir_all(&cellar);
+                    return Err(Error::Unsupported(format!(
+                        "github archive for {} contains no executables at the root or in bin/",
+                        planned.plan.name
+                    )));
+                }
                 install::link_share(&cellar, &opts.prefix)?;
                 bins
             }
@@ -227,6 +246,18 @@ pub fn split_spec(spec: &str) -> Result<(String, String, String)> {
         )));
     }
     Ok((owner.to_string(), repo.to_string(), name))
+}
+
+fn version_from_release(release: &serde_json::Value, what: &str) -> Result<String> {
+    let tag = release
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if tag.is_empty() {
+        return Err(Error::NotFound(format!("no release tag for {what}")));
+    }
+    sanitize_version(tag)
 }
 
 pub fn sanitize_version(tag: &str) -> Result<String> {
@@ -391,13 +422,23 @@ fn os_matches(name: &str, os: &str) -> bool {
     }
 }
 
+/// Archive or package formats maca cannot unpack. Installing one as a "raw"
+/// executable would link a compressed file, so they are never candidates.
+pub fn unsupported_archive(lower_name: &str) -> bool {
+    const EXTS: &[&str] = &[
+        ".tar.xz", ".txz", ".tar.bz2", ".tbz", ".tbz2", ".tar.zst", ".tzst", ".tar.lz", ".gz",
+        ".bz2", ".xz", ".zst", ".7z", ".rar", ".apk", ".snap",
+    ];
+    EXTS.iter().any(|e| lower_name.ends_with(e))
+}
+
 pub fn artifact_kind(name: &str) -> Option<ArtifactKind> {
     let n = name.to_ascii_lowercase();
     if n.ends_with(".tar.gz") || n.ends_with(".tgz") {
         Some(ArtifactKind::TarGz)
     } else if n.ends_with(".zip") {
         Some(ArtifactKind::Zip)
-    } else if rejected_asset(name) {
+    } else if unsupported_archive(&n) || rejected_asset(name) {
         None
     } else {
         Some(ArtifactKind::Raw)
@@ -721,6 +762,36 @@ fn form_encode(query: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_archives_are_not_raw_executables() {
+        assert_eq!(artifact_kind("tool-linux-amd64.tar.xz"), None);
+        assert_eq!(artifact_kind("tool-linux-amd64.tar.zst"), None);
+        assert_eq!(artifact_kind("tool-linux-amd64.7z"), None);
+        assert_eq!(artifact_kind("tool-linux-amd64.gz"), None);
+        assert_eq!(artifact_kind("x.AppImage"), Some(ArtifactKind::Raw));
+        assert_eq!(artifact_kind("tool.tar.gz"), Some(ArtifactKind::TarGz));
+    }
+
+    #[test]
+    fn plan_refuses_a_release_whose_only_asset_is_tar_xz() {
+        let assets = vec![ListedAsset {
+            name: "tool-1.0-x86_64-unknown-linux-gnu.tar.xz".into(),
+            url: "https://example.test/a.tar.xz".into(),
+        }];
+        assert!(
+            plan_from_assets("o--tool", "o", "tool", "v1.0", &assets, "linux", "x86_64").is_err()
+        );
+    }
+
+    #[test]
+    fn release_version_requires_a_tag() {
+        let ok = serde_json::json!({"tag_name": "v1.2.3"});
+        assert_eq!(version_from_release(&ok, "o/r").unwrap(), "1.2.3");
+        for bad in [serde_json::json!({}), serde_json::json!({"tag_name": ""})] {
+            assert!(version_from_release(&bad, "o/r").is_err());
+        }
+    }
+
     use super::*;
 
     fn names(list: &[&str]) -> Vec<String> {
