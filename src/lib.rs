@@ -1,7 +1,11 @@
-// Maca: cross-platform (macOS/Linux) package manager.
-// Native catalog APIs for Homebrew + winget, plus a custom registry backend.
-// No `brew`/`winget` subprocesses are required for search/catalog; installs
-// download and verify artifacts directly.
+//! Maca: a package manager for macOS and Linux.
+//!
+//! Installs from five backends: Homebrew bottles and sources, the winget catalog,
+//! GitHub Releases, the Aqua registry and a custom JSON registry. It calls their
+//! HTTP APIs directly and never shells out to `brew`, `winget`, `gh` or `aqua`.
+//! Installs download and verify artifacts themselves, and the crate also provides
+//! snapshots with rollback, groups and a reproducibility lockfile, version pins,
+//! self-update and a TUI.
 
 pub mod aqua;
 pub mod backend;

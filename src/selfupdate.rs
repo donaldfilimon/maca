@@ -91,6 +91,8 @@ pub fn repo_from_config(cfg: &crate::config::Config) -> String {
 }
 
 /// Fetch the latest release metadata. `Ok(None)` when the repo has no releases.
+/// Only the latest non-prerelease, non-draft release is tracked: GitHub's
+/// `/releases/latest` endpoint never returns prereleases.
 pub async fn fetch_latest(repo: &str) -> Result<Option<Release>> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let bytes = match install::download(&url).await {
@@ -111,12 +113,12 @@ pub fn is_newer(tag: &str, current: &str) -> bool {
 /// Download and install the latest binary. Returns the new version on success.
 pub async fn run(repo: &str, current_version: &str, force: bool) -> Result<String> {
     let Some(release) = fetch_latest(repo).await? else {
-        return Ok("no releases published for this repository".to_string());
+        return Ok("no stable release published for this repository (self-update tracks stable releases only; prereleases are not considered)".to_string());
     };
     let tag = release.tag_name.clone();
     if tag.is_empty() {
         return Err(Error::Other(anyhow::anyhow!(
-            "no releases published for {repo}"
+            "no stable release published for {repo} (self-update tracks stable releases only; prereleases are not considered)"
         )));
     }
     if !force && !is_newer(&tag, current_version) {

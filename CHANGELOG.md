@@ -7,6 +7,12 @@ All notable changes to maca are recorded here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- `list`, `info` and `outdated` report a corrupt `pins.json` as an error
+  instead of treating it as "no pins".
+- `outdated` reports packages whose latest-version lookup failed (stderr
+  warning, non-zero exit) instead of printing "all packages are up to date".
+- `self-update` says that only stable releases are tracked when it finds no
+  release; prereleases are not considered.
 - winget ids with more than two segments (`Google.Chrome.Beta`,
   `Python.Python.3.12`) resolve to their nested winget-pkgs directories. A
   two-segment package whose directory also holds numeric sub-package

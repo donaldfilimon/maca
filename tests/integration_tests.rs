@@ -488,6 +488,35 @@ fn e2e_install_verifies_runs_and_rolls_back_a_failed_batch() {
 
 #[cfg(unix)]
 #[test]
+fn e2e_corrupt_pins_and_failed_lookups_are_errors() {
+    let v1 = script_tarball("hello-1.0.0", "hello", "hello-1");
+    let mut routes = HashMap::new();
+    routes.insert("/hello-1.tar.gz".to_string(), v1.clone());
+    let base = serve(routes);
+    let sb = Sandbox::new("pinserr");
+    sb.add(
+        "hello",
+        "1.0.0",
+        &format!("{base}/hello-1.tar.gz"),
+        &sha256(&v1),
+    );
+    sb.ok(&["install", "hello", "--backend", "custom", "--kind", "cli"]);
+
+    // A package the registry no longer knows cannot be checked: outdated must
+    // not claim everything is up to date.
+    sb.ok(&["custom", "remove", "hello"]);
+    let out = sb.fails(&["outdated"]);
+    assert!(!out.contains("all packages are up to date"), "{out}");
+    assert!(out.contains("could not check 1 package(s): hello"), "{out}");
+
+    // A corrupt pins file is an error, never "no pins".
+    std::fs::write(sb.home.join("pins.json"), "not json").unwrap();
+    sb.fails(&["list"]);
+    sb.fails(&["outdated"]);
+}
+
+#[cfg(unix)]
+#[test]
 fn e2e_pins_upgrade_lock_sync_and_snapshot_restore() {
     let v1 = script_tarball("hello-1.0.0", "hello", "hello-1");
     let v2 = script_tarball("hello-2.0.0", "hello", "hello-2");

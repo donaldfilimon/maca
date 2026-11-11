@@ -310,14 +310,16 @@ pub fn resolve(kind: BackendKind) -> BackendKind {
 }
 
 pub fn auto_default() -> BackendKind {
-    // Auto order: custom (local, fast) -> brew (macOS/Linux) -> winget (Windows catalog).
-    // Callers try each in order for search; for install, first backend whose
-    // `plan()` succeeds wins.
+    // Nominal default only: returns Custom. The real orders differ by command:
+    // - install: custom, then brew (if `can_install`), then github or aqua when
+    //   `insight::suggest_backend` names one, then winget;
+    // - search: all five backends run concurrently, shown in `auto_search_order`;
+    // - info: custom, brew, winget, then github/aqua.
     BackendKind::Custom
 }
 
 /// Ordered fallback list for `--backend auto` search.
-/// GitHub and aqua come after the original three catalogs.
+/// This is the search and display order only; install order differs (see `auto_default`).
 pub fn auto_search_order() -> [BackendKind; 5] {
     [
         BackendKind::Custom,
@@ -366,7 +368,8 @@ pub async fn search_all(query: &str, limit: usize) -> Vec<Package> {
     insight::rank_packages(query, all)
 }
 
-/// Install `name` with an explicit backend name (`brew`, `winget`, `custom`).
+/// Install `name` with a backend name: one of `brew`, `winget`, `custom`, `github`
+/// or `aqua`. Any other value (including `auto`) selects auto.
 pub async fn install_with_backend(
     backend: &str,
     name: &str,

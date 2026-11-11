@@ -309,7 +309,9 @@ busy" instead of waiting.
 (`MACA_UPDATE_REPO` or `update_repo` in config, default `donaldfilimon/maca`),
 downloads the asset for the host target, verifies its `.sha256` companion,
 backs up the current binary, and replaces itself. A release without the
-`.sha256` file is refused unless `--force` is given.
+`.sha256` file is refused unless `--force` is given. Only the latest
+non-prerelease, non-draft release is tracked, so a prerelease such as an alpha
+is not seen by `self-update`.
 
 Release asset convention: `maca-<target>.tar.gz` plus
 `maca-<target>.tar.gz.sha256`, where `<target>` is a Rust target

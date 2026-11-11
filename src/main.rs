@@ -533,7 +533,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Doctor => cmd_doctor(&ctx).await,
         Commands::Shellenv { shell } => cmd_shellenv(&ctx, &shell),
         Commands::Completions { shell } => cmd_completions(shell),
-        Commands::Outdated { json } => cmd_outdated(&ctx, json).await,
+        Commands::Outdated { json } => cmd_outdated(json).await,
         Commands::Clean {
             all,
             keep_snapshots,
@@ -551,7 +551,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Cli { action } => cmd_kind(&ctx, action, Kind::Cli).await,
         Commands::Pin { package, version } => cmd_pin(&ctx, package, version),
         Commands::Unpin { package } => cmd_unpin(&ctx, package),
-        Commands::Why { package } => cmd_why(&ctx, &package).await,
+        Commands::Why { package } => cmd_why(&package).await,
         Commands::Leaves => cmd_leaves(&ctx),
         Commands::Drift => cmd_drift(&ctx),
         Commands::Gaps { group } => cmd_gaps(&ctx, &group),
@@ -614,7 +614,7 @@ async fn cmd_info(ctx: &Ctx, package: &str, json: bool) -> Result<()> {
         println!("tags:        {}", p.tags.join(", "));
     }
     let ledger = state::Ledger::load().ok();
-    let pins = pinned_versions().unwrap_or_default();
+    let pins = state::load_pins()?;
     if let Some(r) = ledger.as_ref().and_then(|l| l.get(&p.name)) {
         let is_pinned = pins.contains_key(&p.name);
         println!(
@@ -641,6 +641,8 @@ async fn info_one(ctx: &Ctx, package: &str) -> Result<maca::backend::Package> {
         BackendKind::Github => maca::github::GithubBackend::new().info(package).await,
         BackendKind::Aqua => maca::aqua::AquaBackend::new().info(package).await,
         BackendKind::Auto => {
+            // Fallback order intentionally differs from `backend::auto_install`:
+            // winget is tried before github/aqua here.
             let reg = Registry::load_merged(&ctx.custom_registry_urls).await?;
             let custom = CustomBackend::new(reg);
             if let Ok(p) = custom.info(package) {
@@ -679,17 +681,13 @@ async fn cmd_install(ctx: &Ctx, packages: &[String], opts: &InstallOptions) -> R
             Err(r) => eprintln!("maca: install failed ({e}); rollback also failed: {r}"),
         }
     }
-    match result {
-        Ok(upgraded) => {
-            if upgraded > 0 {
-                if opts.dry_run {
-                    println!("[dry-run] would install {upgraded} package(s)");
-                } else {
-                    println!("installed {upgraded} package(s)");
-                }
-            }
+    let installed = result?;
+    if installed > 0 {
+        if opts.dry_run {
+            println!("[dry-run] would install {installed} package(s)");
+        } else {
+            println!("installed {installed} package(s)");
         }
-        Err(e) => return Err(e),
     }
     Ok(())
 }
@@ -804,7 +802,7 @@ fn cmd_list(kind: Option<Kind>, json: bool) -> Result<()> {
         println!("no packages installed");
         return Ok(());
     }
-    let pins = pinned_versions().unwrap_or_default();
+    let pins = state::load_pins()?;
     println!(
         "{:<24} {:<12} {:<8} {:<8} {:<8} CELLAR",
         "NAME", "VERSION", "BACKEND", "KIND", "PINNED"
@@ -889,14 +887,6 @@ async fn cmd_upgrade(ctx: &Ctx, only: Vec<String>, no_snapshot: bool) -> Result<
     maca::upgrade::run(&env, &ctx.prefix, &only)
         .await
         .map(|_| ())
-}
-
-fn is_newer(candidate: &str, installed: &str) -> bool {
-    backend::is_newer_version(candidate, installed)
-}
-
-async fn latest_version(_ctx: &Ctx, backend: &str, name: &str) -> Result<Option<String>> {
-    backend::latest_version(backend, name).await.map(Some)
 }
 
 fn cmd_remove(ctx: &Ctx, packages: &[String], no_snapshot: bool) -> Result<()> {
@@ -1160,7 +1150,7 @@ struct OutdatedPackage {
     pinned: bool,
 }
 
-async fn cmd_outdated(ctx: &Ctx, json: bool) -> Result<()> {
+async fn cmd_outdated(json: bool) -> Result<()> {
     let ledger = state::Ledger::load()?;
     if ledger.packages.is_empty() {
         if json {
@@ -1170,15 +1160,19 @@ async fn cmd_outdated(ctx: &Ctx, json: bool) -> Result<()> {
         }
         return Ok(());
     }
-    let pins = pinned_versions().unwrap_or_default();
+    let pins = state::load_pins()?;
     let mut outdated = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
     for record in &ledger.packages {
         let is_pinned = pins.contains_key(&record.name);
-        let latest = match latest_version(ctx, &record.backend, &record.name).await {
-            Ok(Some(v)) => v,
-            _ => continue,
+        let latest = match backend::latest_version(&record.backend, &record.name).await {
+            Ok(v) => v,
+            Err(e) => {
+                failed.push((record.name.clone(), e.to_string()));
+                continue;
+            }
         };
-        if is_newer(&latest, &record.version) {
+        if backend::is_newer_version(&latest, &record.version) {
             outdated.push(OutdatedPackage {
                 name: record.name.clone(),
                 installed: record.version.clone(),
@@ -1190,22 +1184,37 @@ async fn cmd_outdated(ctx: &Ctx, json: bool) -> Result<()> {
     }
     if json {
         println!("{}", serde_json::to_string_pretty(&outdated)?);
-        return Ok(());
-    }
-    if outdated.is_empty() {
-        println!("all packages are up to date");
-        return Ok(());
-    }
-    println!(
-        "{:<24} {:<12} {:<12} {:<8} PINNED",
-        "NAME", "INSTALLED", "LATEST", "BACKEND"
-    );
-    for p in &outdated {
-        let pin_str = if p.pinned { "yes" } else { "no" };
+    } else if outdated.is_empty() {
+        if failed.is_empty() {
+            println!("all packages are up to date");
+        }
+    } else {
         println!(
-            "{:<24} {:<12} {:<12} {:<8} {}",
-            p.name, p.installed, p.latest, p.backend, pin_str
+            "{:<24} {:<12} {:<12} {:<8} PINNED",
+            "NAME", "INSTALLED", "LATEST", "BACKEND"
         );
+        for p in &outdated {
+            let pin_str = if p.pinned { "yes" } else { "no" };
+            println!(
+                "{:<24} {:<12} {:<12} {:<8} {}",
+                p.name, p.installed, p.latest, p.backend, pin_str
+            );
+        }
+    }
+    if !failed.is_empty() {
+        let names: Vec<&str> = failed.iter().map(|(n, _)| n.as_str()).collect();
+        eprintln!(
+            "warning: could not check {} package(s): {}",
+            failed.len(),
+            names.join(", ")
+        );
+        for (n, e) in &failed {
+            eprintln!("  {n}: {e}");
+        }
+        return Err(Error::Other(anyhow::anyhow!(
+            "could not check {} package(s) for updates",
+            failed.len()
+        )));
     }
     Ok(())
 }
@@ -1408,12 +1417,16 @@ async fn cmd_self_update(check: bool, force: bool) -> Result<()> {
     let cfg = config::Config::load()?;
     let repo = maca::selfupdate::repo_from_config(&cfg);
     let Some(release) = maca::selfupdate::fetch_latest(&repo).await? else {
-        println!("no releases published for {repo}");
+        println!(
+            "no stable release published for {repo} (self-update tracks stable releases only; prereleases are not considered)"
+        );
         return Ok(());
     };
     let tag = release.tag_name.trim_start_matches('v').to_string();
     if tag.is_empty() {
-        println!("no releases published for {repo}");
+        println!(
+            "no stable release published for {repo} (self-update tracks stable releases only; prereleases are not considered)"
+        );
         return Ok(());
     }
     if check {
@@ -2008,7 +2021,7 @@ fn cmd_unpin(ctx: &Ctx, package: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_why(ctx: &Ctx, package: &str) -> Result<()> {
+async fn cmd_why(package: &str) -> Result<()> {
     let ledger = state::Ledger::load()?;
     let mut dependents = Vec::new();
     let mut unknown = Vec::new();
@@ -2032,7 +2045,6 @@ async fn cmd_why(ctx: &Ctx, package: &str) -> Result<()> {
             }
         }
     }
-    let _ = ctx;
     if dependents.is_empty() {
         println!("no installed brew package depends on {package}");
     } else {
@@ -2048,9 +2060,4 @@ async fn cmd_why(ctx: &Ctx, package: &str) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Pinned package names and the version each was pinned at.
-pub fn pinned_versions() -> Result<BTreeMap<String, String>> {
-    state::load_pins()
 }
