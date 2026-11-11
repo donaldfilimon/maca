@@ -1404,6 +1404,7 @@ fn e2e_brew_resolves_a_versioned_formula_and_refuses_unknown_ones() {
     assert!(text.contains("no versioned formula for 3.11"), "{text}");
 }
 
+#[cfg(unix)]
 fn winget_manifest(id: &str, version: &str, url: &str) -> Vec<u8> {
     let arch = if cfg!(target_arch = "aarch64") {
         "arm64"
@@ -1587,6 +1588,7 @@ fn e2e_github_archive_without_executables_fails_and_leaves_nothing() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn group_names_that_escape_the_groups_dir_are_refused() {
     let sb = Sandbox::new("group-names");
