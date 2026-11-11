@@ -222,9 +222,6 @@ pub fn extract_bottle(
     if dest.exists() {
         return Ok(dest);
     }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     // Bottle layout is `<name>/<version>/...` inside the archive.
     let staging = Staging::new(cellar_root, name, version)?;
     unpack_tar_gz(name, bytes, &staging.0)?;
@@ -252,9 +249,6 @@ pub fn extract_tar_gz_to_cellar(
     let dest = cellar_root.join(name).join(version);
     if dest.exists() {
         return Ok(dest);
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
     }
     let staging = Staging::new(cellar_root, name, version)?;
     unpack_tar_gz(name, bytes, &staging.0)?;
@@ -287,9 +281,6 @@ pub fn extract_zip_to_cellar(
     let dest = cellar_root.join(name).join(version);
     if dest.exists() {
         return Ok(dest);
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
     }
     let staging = Staging::new(cellar_root, name, version)?;
     unpack_zip(name, bytes, &staging.0)?;
@@ -375,12 +366,24 @@ fn unpack_zip(name: &str, bytes: &[u8], dest: &Path) -> Result<()> {
 /// another task installing the same keg (two packages sharing a dependency)
 /// got there first, its complete keg is used and this copy is dropped.
 fn move_into_place(name: &str, staged: &Path, dest: &Path) -> Result<PathBuf> {
+    // `cellar/<name>/` is created only now, so a failed unpack leaves no
+    // empty package directory behind.
+    let parent = dest.parent();
+    if let Some(parent) = parent {
+        std::fs::create_dir_all(parent)?;
+    }
     match std::fs::rename(staged, dest) {
         Ok(()) => Ok(dest.to_path_buf()),
         Err(_) if dest.is_dir() => Ok(dest.to_path_buf()),
-        Err(e) => Err(Error::Other(anyhow::anyhow!(
-            "moving {name} into place: {e}"
-        ))),
+        Err(e) => {
+            if let Some(parent) = parent {
+                // Removes it only when empty.
+                let _ = std::fs::remove_dir(parent);
+            }
+            Err(Error::Other(anyhow::anyhow!(
+                "moving {name} into place: {e}"
+            )))
+        }
     }
 }
 

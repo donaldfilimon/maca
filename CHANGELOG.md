@@ -10,6 +10,9 @@ All notable changes to maca are recorded here. The format follows
 - `maca self-update --prerelease` considers prereleases and picks the highest
   published version. A build that is itself a prerelease does this without
   the flag, so an alpha can move to the next alpha.
+- `scripts/install.sh` installs a released binary for the host: it downloads
+  the archive, refuses a checksum mismatch or a missing `.sha256`, and writes
+  only the `maca` binary.
 - `scripts/package-release.sh <triple>` cross-builds the other macOS
   architecture (it still refuses another OS), and
   `scripts/linux-vm-check.sh` runs the gate on a clean export inside a Linux
@@ -20,6 +23,8 @@ All notable changes to maca are recorded here. The format follows
   paths inside their binaries still held Homebrew's placeholders. They are now
   rewritten with `patchelf`, and an install is refused (and rolled back) when
   `patchelf` is missing. `maca doctor` reports whether it is present.
+
+- A failed archive unpack no longer leaves an empty `cellar/<name>` directory.
 
 ### Changed
 - After a successful self-update only the newest `maca.bak.<timestamp>`

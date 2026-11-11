@@ -18,6 +18,7 @@ cargo test --test integration_tests test_binary_discovery # one integration test
 RUST_LOG=debug cargo run -- search jq                # tracing goes through RUST_LOG
 ./scripts/package-release.sh [target-triple]         # writes target/dist/maca-<triple>.tar.gz + .sha256 (host, or the other macOS arch via rustup; never another OS)
 ./scripts/linux-vm-check.sh [arm64|amd64]            # check.sh + packaging on a clean `git archive HEAD` in an Apple `container` Linux VM
+sh scripts/install.sh                                # end-user installer; test with MACA_INSTALL_DIR=<tmp>, it reads the real GitHub release
 ./scripts/cross-check.sh                             # clippy -D warnings for Linux + Windows from macOS (needs zig; compile-only)
 ```
 

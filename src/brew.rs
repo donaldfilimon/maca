@@ -1125,6 +1125,19 @@ mod tests {
     }
 
     #[test]
+    fn an_installer_package_cask_is_refused_before_download() {
+        for url in [
+            "https://example.com/Tool.pkg",
+            "https://example.com/Tool.PKG",
+            "https://example.com/Tool.mpkg",
+            "https://example.com/Tool.exe",
+        ] {
+            let body = serde_json::json!({"token": "tool", "version": "1.0", "url": url});
+            assert!(plan_cask(&body).is_err(), "{url} should be refused");
+        }
+    }
+
+    #[test]
     fn an_unchecked_cask_hash_is_not_treated_as_a_checksum() {
         let body = serde_json::json!({
             "token": "font-example",

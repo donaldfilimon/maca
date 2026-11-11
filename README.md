@@ -104,9 +104,18 @@ something else.
 
 ## Install
 
-From a release archive (macOS arm64 and x86_64, Linux arm64 and x86_64; see
+With the install script, which picks the archive for this machine, verifies
+its checksum and puts `maca` in `~/.local/bin` (`MACA_INSTALL_DIR` to change,
+`MACA_VERSION` to pin a tag):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/donaldfilimon/maca/main/scripts/install.sh | sh
+```
+
+Or by hand, from a release archive (macOS arm64 and x86_64, Linux arm64 and x86_64; see
 the [releases page](https://github.com/donaldfilimon/maca/releases)). Each
-archive holds the single `maca` binary and has a `.sha256` next to it:
+archive holds the single `maca` binary and has a `.sha256` next to it. The
+Linux archives are built on Ubuntu 24.04 and need glibc 2.39 or newer:
 
 ```sh
 triple=aarch64-apple-darwin   # or x86_64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu

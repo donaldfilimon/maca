@@ -1699,3 +1699,38 @@ fn e2e_self_update_replaces_a_copy_of_the_binary_from_a_prerelease() {
         "the backup is not the previous binary"
     );
 }
+
+/// A cask archive whose entry climbs out of the keg is refused, and nothing
+/// lands outside the cellar or in the ledger.
+#[cfg(unix)]
+#[test]
+fn e2e_cask_zip_with_a_path_escape_is_refused() {
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let opts = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+        zip.start_file("tool.sh", opts).unwrap();
+        zip.write_all(b"#!/bin/sh\necho cask-bin\n").unwrap();
+        zip.start_file("../../../escaped.sh", opts).unwrap();
+        zip.write_all(b"#!/bin/sh\necho escaped\n").unwrap();
+        zip.finish().unwrap();
+    }
+    let zip = cursor.into_inner();
+    let sb = Sandbox::new("caskslip");
+    let api = cask_api("slippy", "1.0.0", zip.clone(), &sha256(&zip));
+    let (ok, text) = sb.run_env(
+        &["install", "cask:slippy", "--backend", "brew"],
+        &[("MACA_CASK_API", &api)],
+    );
+    assert!(!ok, "a path escape must fail the install:\n{text}");
+    assert_eq!(sb.installed_version("slippy"), None);
+    assert!(!sb.prefix().join("cellar/slippy").exists(), "{text}");
+    for outside in [
+        sb.prefix().join("escaped.sh"),
+        sb.prefix().join("cellar/escaped.sh"),
+        sb.home.join("escaped.sh"),
+    ] {
+        assert!(!outside.exists(), "{} was written", outside.display());
+    }
+}
