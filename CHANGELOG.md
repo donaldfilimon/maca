@@ -6,6 +6,14 @@ All notable changes to maca are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- aqua installs no longer link a dangling binary when `files[].src` names the
+  archive's top directory; a file that is not in the archive is an error.
+- aqua checksum assets using `{{.Asset}}`, `{{.AssetWithoutExt}}` or
+  `{{.SemVer}}` now resolve, so those installs are verified.
+- aqua http packages refuse a requested version instead of installing "latest".
+- aqua `supported_envs: [all]` now matches every platform.
+
 ### Changed
 - A `maca.toml` that cannot be read or parsed is now an error instead of being
   skipped, so a typo cannot send an install into the global prefix.

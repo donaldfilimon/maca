@@ -54,6 +54,7 @@ impl AquaBackend {
         let cellar = slash.replace('/', "--");
         let pkg = load_package(&slash).await?;
         if pkg.kind == "http" {
+            check_http_version(version, &slash)?;
             return prepare_http(&cellar, &pkg);
         }
         let owner = pkg.repo_owner.clone().unwrap_or_default();
@@ -408,9 +409,10 @@ fn choose_variant(pkg: &AquaPkg, version: &str, goos: &str, goarch: &str) -> Res
         if c.algorithm.as_deref().is_some_and(|a| a != "sha256") {
             return None;
         }
-        c.asset
-            .as_ref()
-            .map(|tpl| render_template(tpl, version, goos, goarch, &format, &replacements))
+        c.asset.as_ref().map(|tpl| {
+            let name = render_template(tpl, version, goos, goarch, &format, &replacements);
+            expand_checksum_placeholders(&name, &rendered, version)
+        })
     });
     let files = files
         .iter()
@@ -530,7 +532,7 @@ fn cmp_version(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     }
 }
 
-/// Empty list means every platform.
+/// Empty list means every platform, and so does an `all` entry.
 ///
 /// A token matches the host OS (`darwin`/`linux`/`windows`), the host arch
 /// (`amd64`/`arm64`), or exactly `{os}/{arch}`. An exact `{os}/{other-arch}`
@@ -548,7 +550,24 @@ pub fn env_supported(envs: &[String], goos: &str, goarch: &str) -> bool {
     if other_pair && !our_pair && !bare_os {
         return false;
     }
-    envs.iter().any(|e| e == goos || e == goarch || e == &pair)
+    envs.iter()
+        .any(|e| e == "all" || e == goos || e == goarch || e == &pair)
+}
+
+/// Resolve the placeholders that only make sense in a checksum asset name:
+/// `{{.Asset}}`, `{{.AssetWithoutExt}}` and `{{.SemVer}}`. Anything else
+/// unresolved keeps its `{{` so the caller treats the checksum as unknown.
+fn expand_checksum_placeholders(name: &str, asset: &str, version: &str) -> String {
+    const EXTS: [&str; 8] = [
+        ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".zip", ".gz", ".tar",
+    ];
+    let without_ext = EXTS
+        .iter()
+        .find_map(|e| asset.strip_suffix(e))
+        .unwrap_or(asset);
+    name.replace("{{.AssetWithoutExt}}", without_ext)
+        .replace("{{.Asset}}", asset)
+        .replace("{{.SemVer}}", version.strip_prefix('v').unwrap_or(version))
 }
 
 pub fn render_template(
@@ -914,16 +933,47 @@ fn link_files(
                 "aqua file src {rel:?} escapes the keg"
             )));
         }
-        let full = cellar.join(&rel);
-        if !full.starts_with(cellar) {
-            return Err(Error::Unsupported(format!(
-                "aqua file src {rel:?} escapes the keg"
-            )));
-        }
+        let full = resolve_file_target(cellar, name, &rel)?;
         linked.push(install::link_single_binary(&full, name, &opts.prefix)?);
     }
     install::link_share(cellar, &opts.prefix)?;
     Ok(linked)
+}
+
+/// Find the extracted file a registry `files` entry names. Extraction strips a
+/// single leading directory, while registry `src` values usually include it, so
+/// try the path as given, then without its first component, then the bare name
+/// at the keg root and under `bin/`.
+fn resolve_file_target(cellar: &Path, name: &str, rel: &str) -> Result<std::path::PathBuf> {
+    let stripped: std::path::PathBuf = Path::new(rel).components().skip(1).collect();
+    let mut candidates = vec![std::path::PathBuf::from(rel)];
+    if !stripped.as_os_str().is_empty() {
+        candidates.push(stripped);
+    }
+    candidates.push(std::path::PathBuf::from(name));
+    candidates.push(Path::new("bin").join(name));
+    for cand in candidates {
+        let Some(cand) = cand.to_str().filter(|c| safe_rel(c)).map(str::to_owned) else {
+            continue;
+        };
+        let full = cellar.join(&cand);
+        if full.starts_with(cellar) && full.is_file() {
+            return Ok(full);
+        }
+    }
+    Err(Error::Unsupported(format!(
+        "aqua file `{name}` (src `{rel}`) not found in the extracted archive"
+    )))
+}
+
+/// An http package has one fixed url, so only "latest" can be served.
+fn check_http_version(version: Option<&str>, slash: &str) -> Result<()> {
+    match version {
+        Some(v) if !v.eq_ignore_ascii_case("latest") => Err(Error::Unsupported(format!(
+            "aqua http package {slash} has a single fixed url and cannot serve version {v}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 fn safe_rel(rel: &str) -> bool {
@@ -1021,6 +1071,8 @@ mod tests {
             "arm64"
         ));
         assert!(!env_supported(&["linux/amd64".into()], "linux", "arm64"));
+        assert!(env_supported(&["all".into()], "linux", "amd64"));
+        assert!(env_supported(&["all".into()], "darwin", "arm64"));
         assert!(env_supported(
             &["linux/amd64".into(), "linux/arm64".into()],
             "linux",
@@ -1112,5 +1164,48 @@ packages:
         };
         let err = choose_variant(&pkg, "v2.0.0", "linux", "amd64").unwrap_err();
         assert!(err.to_string().contains("constraint"), "{err}");
+    }
+
+    #[test]
+    fn checksum_placeholders_resolve_from_the_rendered_asset() {
+        let a = "tool_1.2.3_linux_amd64.tar.gz";
+        assert_eq!(
+            expand_checksum_placeholders("{{.Asset}}.sha256", a, "v1.2.3"),
+            "tool_1.2.3_linux_amd64.tar.gz.sha256"
+        );
+        assert_eq!(
+            expand_checksum_placeholders("{{.AssetWithoutExt}}.txt", a, "v1.2.3"),
+            "tool_1.2.3_linux_amd64.txt"
+        );
+        assert_eq!(
+            expand_checksum_placeholders("sums_{{.SemVer}}.txt", a, "v1.2.3"),
+            "sums_1.2.3.txt"
+        );
+        assert!(expand_checksum_placeholders("{{.Nope}}.txt", a, "v1").contains("{{"));
+    }
+
+    #[test]
+    fn http_version_other_than_latest_is_refused() {
+        assert!(check_http_version(Some("1.2"), "o/r").is_err());
+        assert!(check_http_version(Some("latest"), "o/r").is_ok());
+        assert!(check_http_version(None, "o/r").is_ok());
+    }
+
+    #[test]
+    fn file_target_follows_the_stripped_archive_layout() {
+        let dir = std::env::temp_dir().join(format!("maca-aqua-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/gh"), b"x").unwrap();
+        std::fs::write(dir.join("flat"), b"x").unwrap();
+        let got = resolve_file_target(&dir, "gh", "gh_2.40.0_macOS/bin/gh").unwrap();
+        assert_eq!(got, dir.join("bin/gh"));
+        assert_eq!(
+            resolve_file_target(&dir, "flat", "top/flat").unwrap(),
+            dir.join("flat")
+        );
+        assert!(resolve_file_target(&dir, "gh", "top/nothing").is_ok());
+        assert!(resolve_file_target(&dir, "zzz", "top/zzz").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
