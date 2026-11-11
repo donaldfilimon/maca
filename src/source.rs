@@ -201,6 +201,7 @@ pub fn run_steps(
     steps: &[String],
     jobs: usize,
 ) -> Result<BuildResult> {
+    // `jobs` is currently unused by custom steps.
     let _ = jobs;
     let name = dest
         .file_name()
@@ -211,15 +212,15 @@ pub fn run_steps(
     let mut log_file = std::fs::File::create(&log)?;
     std::fs::create_dir_all(dest)?;
     for step in steps {
-        let parts = split_words(step);
-        let Some(program) = parts.first().cloned() else {
+        let prefix = dest.display().to_string();
+        let words: Vec<String> = split_words(step)
+            .into_iter()
+            .map(|w| w.replace("{{prefix}}", &prefix))
+            .collect();
+        let Some((program, args)) = words.split_first() else {
             continue;
         };
-        let args: Vec<String> = parts[1..]
-            .iter()
-            .map(|s| s.replace("{{prefix}}", &dest.display().to_string()))
-            .collect();
-        if !run_logged(&mut log_file, &program, &args, source_dir)? {
+        if !run_logged(&mut log_file, program, args, source_dir)? {
             return Err(Error::Other(anyhow::anyhow!(
                 "build step failed: {step}; see {}",
                 log.display()
@@ -393,6 +394,26 @@ mod tests {
             build(BuildSystem::Make, &src, &dest, jobs).expect("make build should succeed");
         assert_eq!(result.build_system, "make");
         assert!(dest.join("bin/hello").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_steps_substitute_prefix_in_program() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("maca-src-prog-{}", std::process::id()));
+        let src = base.join("src");
+        let dest = base.join("dest");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("hello"), b"#!/bin/sh\ntouch ran-helper\n").unwrap();
+        std::fs::set_permissions(src.join("hello"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let steps = vec![
+            "cp hello {{prefix}}/helper.sh".to_string(),
+            "{{prefix}}/helper.sh".to_string(),
+        ];
+        run_steps(&src, &dest, &steps, 1).expect("program word should expand {{prefix}}");
+        assert!(src.join("ran-helper").exists());
         let _ = std::fs::remove_dir_all(&base);
     }
 

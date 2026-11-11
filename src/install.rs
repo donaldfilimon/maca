@@ -116,6 +116,13 @@ pub async fn download_with_bearer(url: &str, bearer: Option<&str>) -> Result<Vec
     Ok(bytes.to_vec())
 }
 
+/// True when a [`download`] error message is an HTTP 404. Matches the exact
+/// `GET {url} -> HTTP {status}` suffix, so a URL that merely contains "404"
+/// does not count.
+pub fn is_http_404(message: &str) -> bool {
+    message.ends_with("-> HTTP 404")
+}
+
 /// True when `s` is safe to use as a single path component (a package name,
 /// version or executable name): exactly one normal component, no separators,
 /// no control characters. Rejects ``, `.`, `..`, `a/b`, `/abs` and `C:\x`.
@@ -732,6 +739,15 @@ pub fn http_client() -> Result<reqwest::Client> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_404_matches_only_the_status_suffix() {
+        assert!(is_http_404("GET https://x/y -> HTTP 404"));
+        assert!(!is_http_404(
+            "GET https://api.github.com/repos/x/r404/releases/latest -> HTTP 500"
+        ));
+        assert!(!is_http_404("GET https://x/r404: connection refused"));
+    }
+
     use super::*;
 
     #[test]

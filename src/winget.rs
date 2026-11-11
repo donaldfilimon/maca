@@ -282,10 +282,10 @@ impl WingetBackend {
     /// must be one winget-pkgs actually publishes for the id.
     pub async fn resolve_version(id: &str, requested: Option<&str>) -> Result<(String, String)> {
         let url = Self::versions_url(id).ok_or_else(|| {
-            Error::Unsupported(format!("winget id '{id}' is not in Publisher.Name form"))
+            Error::Unsupported(format!("winget id '{id}' is not in Publisher.Package form"))
         })?;
         let bytes = install::download(&url).await.map_err(|e| match e {
-            Error::Network(m) if m.contains("404") => {
+            Error::Network(m) if install::is_http_404(&m) => {
                 Error::NotFound(format!("winget package '{id}' not found in winget-pkgs"))
             }
             other => other,
@@ -307,35 +307,34 @@ impl WingetBackend {
         Ok((id.to_string(), version))
     }
 
-    /// winget-pkgs versions listing URL.
-    pub fn versions_url(id: &str) -> Option<String> {
+    /// Directory of an id in winget-pkgs: `(first-char-lowercase, "Publisher/Name/...")`.
+    /// `None` for fewer than two segments or any empty segment (which also
+    /// blocks `..`-style traversal).
+    fn id_dir(id: &str) -> Option<(char, String)> {
         let parts: Vec<&str> = id.split('.').collect();
-        if parts.len() != 2 {
+        if parts.len() < 2 || parts.iter().any(|p| p.is_empty()) {
             return None;
         }
         let first = parts[0].chars().next()?.to_ascii_lowercase();
-        Some(format!(
-            "{}/{first}/{}/{}",
-            winget_contents_api(),
-            parts[0],
-            parts[1]
-        ))
+        Some((first, parts.join("/")))
+    }
+
+    /// winget-pkgs versions listing URL.
+    ///
+    /// Known limitation: a package whose directory also holds numeric
+    /// sub-package directories (such as `Python/Python/3`) may list those as
+    /// versions.
+    pub fn versions_url(id: &str) -> Option<String> {
+        let (first, path) = Self::id_dir(id)?;
+        Some(format!("{}/{first}/{path}", winget_contents_api()))
     }
 
     /// winget-pkgs locale manifest URL (description/homepage/publisher).
     pub fn locale_url(id: &str, version: &str) -> Option<String> {
-        let parts: Vec<&str> = id.split('.').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        let first = parts[0].chars().next()?.to_ascii_lowercase();
+        let (first, path) = Self::id_dir(id)?;
         Some(format!(
-            "{}/{first}/{}/{}/{}/{}.locale.en-US.yaml",
-            winget_pkgs_raw(),
-            parts[0],
-            parts[1],
-            version,
-            id
+            "{}/{first}/{path}/{version}/{id}.locale.en-US.yaml",
+            winget_pkgs_raw()
         ))
     }
 
@@ -399,18 +398,10 @@ impl WingetBackend {
     /// Build the winget-pkgs raw manifest URL for an id+version.
     /// winget-pkgs layout: `manifests/<first-char-lower>/<Publisher>/<Name>/<version>/<Id>.installer.yaml`
     pub fn manifest_url(id: &str, version: &str) -> Option<String> {
-        let parts: Vec<&str> = id.split('.').collect();
-        if parts.len() != 2 {
-            return None;
-        }
-        let first = parts[0].chars().next()?.to_ascii_lowercase();
+        let (first, path) = Self::id_dir(id)?;
         Some(format!(
-            "{}/{first}/{}/{}/{}/{}.installer.yaml",
-            winget_pkgs_raw(),
-            parts[0],
-            parts[1],
-            version,
-            id
+            "{}/{first}/{path}/{version}/{id}.installer.yaml",
+            winget_pkgs_raw()
         ))
     }
 
@@ -422,10 +413,10 @@ impl WingetBackend {
         // Resolve the exact id + version from winget-pkgs (source of truth).
         let (id, version) = Self::resolve_version(name, requested).await?;
         let url = Self::manifest_url(&id, &version).ok_or_else(|| {
-            Error::Unsupported(format!("winget id '{id}' is not in Publisher.Name form"))
+            Error::Unsupported(format!("winget id '{id}' is not in Publisher.Package form"))
         })?;
         let yaml_bytes = install::download(&url).await.map_err(|e| match e {
-            Error::Network(m) if m.contains("404") => Error::NotFound(format!(
+            Error::Network(m) if install::is_http_404(&m) => Error::NotFound(format!(
                 "winget manifest for {id} {version} not found at {url}"
             )),
             other => other,
@@ -623,6 +614,23 @@ mod tests {
     #[test]
     fn manifest_url_rejects_bad_id() {
         assert!(WingetBackend::manifest_url("NoDots", "1.0").is_none());
+        assert!(WingetBackend::manifest_url("A..B", "1.0").is_none());
+        assert!(WingetBackend::manifest_url("A.", "1.0").is_none());
+        assert!(WingetBackend::versions_url("A..B").is_none());
+        assert!(WingetBackend::locale_url("A.", "1.0").is_none());
+    }
+
+    #[test]
+    fn nested_ids_use_nested_directories() {
+        let u = WingetBackend::manifest_url("Google.Chrome.Beta", "1.0").unwrap();
+        assert!(
+            u.ends_with("/manifests/g/Google/Chrome/Beta/1.0/Google.Chrome.Beta.installer.yaml"),
+            "{u}"
+        );
+        let v = WingetBackend::versions_url("Python.Python.3.12").unwrap();
+        assert!(v.ends_with("/p/Python/Python/3/12"), "{v}");
+        let l = WingetBackend::locale_url("Mozilla.Firefox.ESR", "9").unwrap();
+        assert!(l.ends_with("/m/Mozilla/Firefox/ESR/9/Mozilla.Firefox.ESR.locale.en-US.yaml"));
     }
 
     #[test]

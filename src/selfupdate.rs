@@ -95,7 +95,7 @@ pub async fn fetch_latest(repo: &str) -> Result<Option<Release>> {
     let url = format!("https://api.github.com/repos/{repo}/releases/latest");
     let bytes = match install::download(&url).await {
         Ok(b) => b,
-        Err(crate::Error::Network(m)) if m.contains("404") => return Ok(None),
+        Err(crate::Error::Network(m)) if install::is_http_404(&m) => return Ok(None),
         Err(e) => return Err(e),
     };
     let release = serde_json::from_slice(&bytes)

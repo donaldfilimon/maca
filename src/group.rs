@@ -76,6 +76,16 @@ pub struct Group {
     pub packages: Vec<GroupEntry>,
 }
 
+fn validate_name(name: &str) -> Result<()> {
+    if crate::install::valid_component(name) {
+        Ok(())
+    } else {
+        Err(Error::Unsupported(format!(
+            "group name {name:?} is not a valid path component"
+        )))
+    }
+}
+
 impl Group {
     pub fn path(name: &str) -> PathBuf {
         crate::config::data_dir()
@@ -84,6 +94,7 @@ impl Group {
     }
 
     pub fn load(name: &str) -> Result<Self> {
+        validate_name(name)?;
         let path = Self::path(name);
         if !path.exists() {
             return Err(Error::NotFound(format!("group '{name}' not found")));
@@ -93,6 +104,7 @@ impl Group {
     }
 
     pub fn save(&self) -> Result<()> {
+        validate_name(&self.name)?;
         let path = Self::path(&self.name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -138,6 +150,7 @@ impl Group {
     }
 
     pub fn delete(name: &str) -> Result<()> {
+        validate_name(name)?;
         let path = Self::path(name);
         if !path.exists() {
             return Err(Error::NotFound(format!("group '{name}' not found")));
@@ -219,6 +232,21 @@ mod tests {
         assert_eq!(Kind::from_str_lossy("APP"), Kind::App);
         assert_eq!(Kind::from_str_lossy("nope"), Kind::Other);
         assert_eq!(Kind::Cli.as_str(), "cli");
+    }
+
+    #[test]
+    fn unsafe_group_names_are_rejected_before_touching_disk() {
+        for bad in ["../evil", "a/b", "", "..", "a\\b"] {
+            assert!(Group::load(bad).is_err(), "load {bad:?}");
+            assert!(Group::delete(bad).is_err(), "delete {bad:?}");
+            let g = Group {
+                name: bad.into(),
+                description: String::new(),
+                packages: vec![],
+            };
+            assert!(g.save().is_err(), "save {bad:?}");
+        }
+        assert!(validate_name("dev-tools").is_ok());
     }
 
     #[test]

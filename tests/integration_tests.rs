@@ -1557,3 +1557,14 @@ fn e2e_github_archive_without_executables_fails_and_leaves_nothing() {
         "keg left behind: {text}"
     );
 }
+
+#[test]
+fn group_names_that_escape_the_groups_dir_are_refused() {
+    let sb = Sandbox::new("group-names");
+    let text = sb.fails(&["group", "create", "../evil"]);
+    assert!(text.contains("not a valid path component"), "{text}");
+    assert!(!sb.home.join("evil.json").exists());
+    sb.fails(&["group", "delete", "../evil"]);
+    sb.ok(&["group", "create", "dev-tools"]);
+    assert!(sb.home.join("groups/dev-tools.json").exists());
+}

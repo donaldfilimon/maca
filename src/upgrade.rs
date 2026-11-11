@@ -212,12 +212,16 @@ pub async fn run<E: UpgradeEnv>(env: &E, prefix: &Path, only: &[String]) -> Resu
                 && let Some(id) = &snapshot
             {
                 match env.restore(id) {
-                    Ok(()) => eprintln!(
-                        "maca: {} package(s) failed to upgrade; rolled back to snapshot {id}",
-                        summary.failed
-                    ),
+                    Ok(()) => {
+                        // The restore reverts the packages that had succeeded too.
+                        summary.upgraded = 0;
+                        eprintln!(
+                            "maca: {} package(s) failed to upgrade; rolled back to snapshot {id} (all upgrades in this run were reverted)",
+                            summary.failed
+                        );
+                    }
                     Err(r) => eprintln!(
-                        "maca: {} package(s) failed to upgrade; rollback also failed: {r}",
+                        "maca: {} package(s) failed to upgrade; rollback also failed: {r}; installed state is unknown, run `maca doctor`",
                         summary.failed
                     ),
                 }
@@ -225,10 +229,17 @@ pub async fn run<E: UpgradeEnv>(env: &E, prefix: &Path, only: &[String]) -> Resu
         }
     }
 
-    println!(
-        "upgrade complete: {} upgraded, {} current, {} failed, {} could not be checked, {} no longer applicable",
-        summary.upgraded, summary.current, summary.failed, summary.unchecked, summary.stale
-    );
+    if summary.failed > 0 {
+        println!(
+            "upgrade failed: {} failed, {} current, {} could not be checked, {} no longer applicable",
+            summary.failed, summary.current, summary.unchecked, summary.stale
+        );
+    } else {
+        println!(
+            "upgrade complete: {} upgraded, {} current, {} could not be checked, {} no longer applicable",
+            summary.upgraded, summary.current, summary.unchecked, summary.stale
+        );
+    }
     // A version check that could not be made does not fail the command (it
     // changed nothing); a failed install does, after the rollback.
     if summary.failed > 0 {
@@ -278,6 +289,7 @@ mod tests {
         lock_held_in_apply: RefCell<Vec<bool>>,
         applied: RefCell<Vec<String>>,
         fail_apply: bool,
+        fail_apply_for: Option<String>,
         restored: RefCell<Vec<String>>,
     }
 
@@ -293,6 +305,7 @@ mod tests {
                 lock_held_in_apply: RefCell::new(vec![]),
                 applied: RefCell::new(vec![]),
                 fail_apply: false,
+                fail_apply_for: None,
                 restored: RefCell::new(vec![]),
             }
         }
@@ -341,7 +354,7 @@ mod tests {
                 .borrow_mut()
                 .push(self.lock_is_held());
             self.applied.borrow_mut().push(from.name.clone());
-            if self.fail_apply {
+            if self.fail_apply || self.fail_apply_for.as_deref() == Some(from.name.as_str()) {
                 return Err(Error::Other(anyhow::anyhow!("boom")));
             }
             let mut l = self.ledger.borrow_mut();
@@ -470,6 +483,21 @@ mod tests {
         assert!(run(&env, &prefix, &[]).await.is_err());
         assert_eq!(*env.restored.borrow(), vec!["snap1".to_string()]);
         assert!(env.lock_is_free());
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    #[tokio::test]
+    async fn one_failure_among_several_restores_once_and_fails_the_run() {
+        let prefix = temp_prefix("failsecond");
+        let mut env = Fake::new(
+            &prefix,
+            vec![rec(&prefix, "a", "1.0.0"), rec(&prefix, "b", "1.0.0")],
+            "2.0.0",
+        );
+        env.fail_apply_for = Some("b".into());
+        assert!(run(&env, &prefix, &[]).await.is_err());
+        assert_eq!(env.applied.borrow().len(), 2);
+        assert_eq!(*env.restored.borrow(), vec!["snap1".to_string()]);
         let _ = std::fs::remove_dir_all(&prefix);
     }
 

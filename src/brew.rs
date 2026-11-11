@@ -242,7 +242,7 @@ async fn fetch_cask_json(token: &str) -> Result<serde_json::Value> {
     let base = cask_api();
     let url = format!("{base}/{token}.json");
     let data = install::download(&url).await.map_err(|e| match e {
-        Error::Network(m) if m.contains("404") => {
+        Error::Network(m) if install::is_http_404(&m) => {
             Error::NotFound(format!("cask '{token}' not found"))
         }
         other => other,
@@ -370,7 +370,7 @@ impl BrewBackend {
         }
         let url = format!("{}/{normalized}.json", formula_api());
         let data = install::download(&url).await.map_err(|e| match e {
-            Error::Network(m) if m.contains("404") => {
+            Error::Network(m) if install::is_http_404(&m) => {
                 Error::NotFound(format!("formula '{normalized}' not found"))
             }
             other => other,

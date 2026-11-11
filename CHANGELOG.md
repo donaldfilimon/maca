@@ -7,6 +7,18 @@ All notable changes to maca are recorded here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- winget ids with more than two segments (`Google.Chrome.Beta`,
+  `Python.Python.3.12`) resolve to their nested winget-pkgs directories. A
+  two-segment package whose directory also holds numeric sub-package
+  directories may still list those as versions.
+- A "no releases" or "not found" answer is recognised only from an HTTP 404
+  status, not from a repo or package name that contains "404".
+- Custom build steps expand `{{prefix}}` in the program word as well as in the
+  arguments.
+- Group names must be a single path component; `maca group create ../x` and
+  similar are refused instead of writing or deleting files outside `groups/`.
+- `maca upgrade` no longer reports packages as upgraded after the batch
+  rollback reverted them, and says so when the rollback itself fails.
 - github installs of archives that keep their executables at the archive root
   (not in `bin/`) now link them; an archive with no executables fails instead
   of reporting a successful empty install.
