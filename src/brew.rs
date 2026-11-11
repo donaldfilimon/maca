@@ -146,11 +146,7 @@ fn plan_cask(body: &serde_json::Value) -> Result<CaskPlan> {
         .filter(|s| install::valid_component(s))
         .ok_or_else(|| Error::Unsupported(format!("cask {token} has no usable version")))?;
     let url = json_str(body, "url")
-        .filter(|s| {
-            s.starts_with("https://")
-                || s.starts_with("http://127.0.0.1")
-                || s.starts_with("http://localhost")
-        })
+        .filter(|s| crate::custom::mirror_url_allowed(s))
         .ok_or_else(|| Error::Unsupported(format!("cask {token} has no allowed url")))?;
     let archive = cask_archive(&url).ok_or_else(|| {
         Error::Unsupported(format!(
@@ -340,11 +336,30 @@ impl BrewBackend {
             return Ok(bytes);
         }
         let bytes = install::download(FORMULA_INDEX).await?;
-        if let Some(parent) = cache.parent() {
-            std::fs::create_dir_all(parent)?;
+        if let Err(e) = install::atomic_write(&cache, &bytes) {
+            tracing::warn!("could not cache brew index: {e}");
         }
-        std::fs::write(&cache, &bytes)?;
         Ok(bytes)
+    }
+
+    /// Decode the formula index. A corrupt cached copy is dropped and the
+    /// index fetched once more; a corrupt fresh download is an error.
+    async fn load_index(&self) -> Result<Vec<FormulaSummary>> {
+        let cache = crate::config::data_dir().join("cache/brew-index.json");
+        let data = self.cached_index().await?;
+        match serde_json::from_slice(&data) {
+            Ok(all) => Ok(all),
+            Err(e) => {
+                tracing::warn!("brew index cache is corrupt ({e}); refetching");
+                let _ = std::fs::remove_file(&cache);
+                let bytes = install::download(FORMULA_INDEX).await?;
+                if let Err(e) = install::atomic_write(&cache, &bytes) {
+                    tracing::warn!("could not cache brew index: {e}");
+                }
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| Error::Network(format!("decoding formula index: {e}")))
+            }
+        }
     }
 
     /// Fetch per-formula metadata. Name is lowercased; `homebrew/core` only.
@@ -369,9 +384,7 @@ impl BrewBackend {
     /// searches fast.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Package>> {
         let q = query.trim().to_ascii_lowercase();
-        let data = self.cached_index().await?;
-        let all: Vec<FormulaSummary> = serde_json::from_slice(&data)
-            .map_err(|e| Error::Network(format!("decoding formula index: {e}")))?;
+        let all = self.load_index().await?;
         let mut hits: Vec<Package> = all
             .into_iter()
             .filter(|f| !f.disabled.unwrap_or(false))
@@ -443,17 +456,21 @@ impl BrewBackend {
         if let Some(key) = prefs.iter().find(|k| files.contains(k.as_str())) {
             return Some(key.clone());
         }
-        // Fallback: any key matching arch+os suffix.
-        files
+        // Fallback: any key matching arch+os suffix. `all` (arch-independent)
+        // is tried last, so an arch-specific bottle always wins over it.
+        let specific = files
             .iter()
             .find(|k| match (os, arch) {
                 ("macos", "arm64") => k.starts_with("arm64_") && !k.ends_with("_linux"),
-                ("macos", "x86_64") => !k.contains('_') && !k.ends_with("_linux"),
+                ("macos", "x86_64") => {
+                    k.as_str() != "all" && !k.contains('_') && !k.ends_with("_linux")
+                }
                 ("linux", "x86_64") => k.ends_with("x86_64_linux") || k.as_str() == "x86_64_linux",
                 ("linux", "arm64") => k.ends_with("arm64_linux"),
                 _ => false,
             })
-            .cloned()
+            .cloned();
+        specific.or_else(|| files.get("all").cloned())
     }
 
     /// True when `install` can handle `name`: the formula exists and has
@@ -679,6 +696,12 @@ impl BrewBackend {
             });
         }
         let bytes = install::download(&source.url).await?;
+        if source.checksum.is_none() {
+            eprintln!(
+                "maca: warning: formula {} declares no source checksum; building {} UNVERIFIED",
+                formula.name, source.url
+            );
+        }
         install::verify_sha256(&formula.name, &bytes, source.checksum.as_deref())?;
         // Extract the source into a scratch tree.
         let scratch = std::env::temp_dir().join(format!(
@@ -957,8 +980,14 @@ fn macos_codename() -> Option<String> {
 }
 
 /// Fetch an anonymous GHCR JWT for `homebrew/core/<name>`.
+/// GHCR repository scope for a formula. Versioned formulae (`python@3.12`)
+/// are published as `homebrew/core/python/3.12`.
+fn ghcr_repo_scope(name: &str) -> String {
+    format!("repository:homebrew/core/{}:pull", name.replace('@', "/"))
+}
+
 async fn ghcr_anonymous_token(formula_name: &str) -> Result<String> {
-    let scope = format!("repository:homebrew/core/{formula_name}:pull");
+    let scope = ghcr_repo_scope(formula_name);
     let url = format!("{GHCR_TOKEN}?service=ghcr.io&scope={scope}");
     let bytes = install::download(&url).await?;
     #[derive(Deserialize)]
@@ -992,6 +1021,54 @@ mod tests {
         let files = keys(&["arm64_linux", "x86_64_linux", "arm64_sequoia"]);
         let got = BrewBackend::pick_bottle_key(&files, "linux", "x86_64", None);
         assert_eq!(got.as_deref(), Some("x86_64_linux"));
+    }
+
+    #[test]
+    fn pick_all_bottle_on_every_host() {
+        let files = keys(&["all"]);
+        for (os, arch) in [("macos", "arm64"), ("macos", "x86_64"), ("linux", "x86_64")] {
+            let got = BrewBackend::pick_bottle_key(&files, os, arch, None);
+            assert_eq!(got.as_deref(), Some("all"), "{os}/{arch}");
+        }
+    }
+
+    #[test]
+    fn arch_specific_bottle_beats_all() {
+        let files = keys(&["all", "arm64_sequoia", "sonoma", "x86_64_linux"]);
+        let a = BrewBackend::pick_bottle_key(&files, "macos", "arm64", Some("sequoia"));
+        assert_eq!(a.as_deref(), Some("arm64_sequoia"));
+        let b = BrewBackend::pick_bottle_key(&files, "macos", "x86_64", None);
+        assert_eq!(b.as_deref(), Some("sonoma"));
+        let c = BrewBackend::pick_bottle_key(&files, "linux", "x86_64", None);
+        assert_eq!(c.as_deref(), Some("x86_64_linux"));
+        // An unknown future codename still beats `all` on macOS x86_64.
+        let d = BrewBackend::pick_bottle_key(&keys(&["all", "zephyr"]), "macos", "x86_64", None);
+        assert_eq!(d.as_deref(), Some("zephyr"));
+    }
+
+    #[test]
+    fn ghcr_scope_maps_versioned_formulae() {
+        assert_eq!(
+            ghcr_repo_scope("python@3.12"),
+            "repository:homebrew/core/python/3.12:pull"
+        );
+        assert_eq!(ghcr_repo_scope("jq"), "repository:homebrew/core/jq:pull");
+    }
+
+    #[test]
+    fn plan_cask_url_allow_list_checks_the_host_boundary() {
+        let body = |url: &str| serde_json::json!({"token": "t", "version": "1", "url": url});
+        for bad in [
+            "http://localhost.evil.com/x.zip",
+            "http://127.0.0.1.evil.com/x.zip",
+            "http://localhost:80@evil.com/x.zip",
+            "http://example.com/x.zip",
+        ] {
+            assert!(plan_cask(&body(bad)).is_err(), "{bad} should be refused");
+        }
+        for ok in ["http://127.0.0.1:8080/x.zip", "https://example.com/x.zip"] {
+            assert!(plan_cask(&body(ok)).is_ok(), "{ok} should be accepted");
+        }
     }
 
     #[test]

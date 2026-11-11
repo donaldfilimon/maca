@@ -515,9 +515,13 @@ pub fn mirror_url_allowed(url: &str) -> bool {
         || ["http://127.0.0.1", "http://localhost", "http://[::1]"]
             .iter()
             .any(|p| {
-                lower
-                    .strip_prefix(p)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
+                lower.strip_prefix(p).is_some_and(|rest| {
+                    // The prefix must end the host, and no userinfo may
+                    // follow (`localhost:80@evil.com` has host evil.com).
+                    let authority_tail = rest.split(['/', '?', '#']).next().unwrap_or("");
+                    (rest.is_empty() || rest.starts_with([':', '/', '?', '#']))
+                        && !authority_tail.contains('@')
+                })
             })
 }
 
@@ -681,6 +685,9 @@ mod mirror_tests {
             "http://example.com/reg.json",
             "http://127.0.0.1.evil.com/reg.json",
             "http://localhost.evil.com/",
+            "http://127.0.0.1.evil.com/x.zip",
+            "http://localhost:80@evil.com/x.zip",
+            "http://127.0.0.1@evil.com/x.zip",
             "ftp://example.com/reg.json",
             "file:///etc/passwd",
         ] {

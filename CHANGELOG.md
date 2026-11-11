@@ -22,6 +22,17 @@ All notable changes to maca are recorded here. The format follows
   or sticky bits from an archive.
 
 ### Fixed
+- Homebrew bottles tagged `all` (arch-independent) are now selected on arm64
+  macOS and Linux instead of falling back to a source build.
+- The cask URL allow-list checked a bare prefix, so `http://localhost.evil.com`
+  and `http://localhost:80@evil.com` passed; it now shares the stricter
+  loopback check used for custom registry mirrors.
+- Versioned Homebrew formulae (`name@x`) request the GHCR token for
+  `homebrew/core/name/x`, matching where the bottles are published.
+- A source build whose formula declares no checksum now warns that it is
+  UNVERIFIED.
+- The Homebrew index cache is written atomically, a failed cache write no
+  longer aborts `search`, and a corrupt cached index is dropped and refetched.
 - Casks ignored `--version` and installed the current one; they now refuse a
   version the catalog does not publish.
 - `rust-toolchain.toml` pinned `nightly`; it is now `stable`, and CI builds on
