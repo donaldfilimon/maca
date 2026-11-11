@@ -7,7 +7,7 @@
 //!
 //! Maca performs the same substitution with `install_name_tool` so bottle
 //! binaries and dylibs resolve inside the maca prefix. On non-macOS hosts
-//! this module is a no-op (Linux bottles are relocatable tarballs).
+//! this module is a no-op; `elf.rs` does the equivalent for Linux bottles.
 
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]

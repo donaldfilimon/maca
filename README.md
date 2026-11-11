@@ -104,6 +104,20 @@ something else.
 
 ## Install
 
+From a release archive (macOS arm64 and x86_64, Linux arm64 and x86_64; see
+the [releases page](https://github.com/donaldfilimon/maca/releases)). Each
+archive holds the single `maca` binary and has a `.sha256` next to it:
+
+```sh
+triple=aarch64-apple-darwin   # or x86_64-apple-darwin, aarch64-unknown-linux-gnu, x86_64-unknown-linux-gnu
+base=https://github.com/donaldfilimon/maca/releases/download/v0.1.0-alpha.1
+curl -fsSLO "$base/maca-$triple.tar.gz" -O "$base/maca-$triple.tar.gz.sha256"
+shasum -a 256 -c "maca-$triple.tar.gz.sha256"   # sha256sum -c on Linux
+tar -xzf "maca-$triple.tar.gz" && ./maca --version
+```
+
+Or from source:
+
 ```sh
 cargo build --release
 eval "$(./target/release/maca shellenv)"
@@ -309,9 +323,14 @@ busy" instead of waiting.
 (`MACA_UPDATE_REPO` or `update_repo` in config, default `donaldfilimon/maca`),
 downloads the asset for the host target, verifies its `.sha256` companion,
 backs up the current binary, and replaces itself. A release without the
-`.sha256` file is refused unless `--force` is given. Only the latest
-non-prerelease, non-draft release is tracked, so a prerelease such as an alpha
-is not seen by `self-update`.
+`.sha256` file is refused unless `--force` is given.
+
+A stable build tracks the latest stable release. `--prerelease` also
+considers prereleases and picks the highest version among the published,
+non-draft releases; a build that is itself a prerelease (an alpha) does this
+without the flag, since it has no stable release to move to. One backup of
+the previous binary, `maca.bak.<timestamp>`, is kept next to the binary;
+earlier backups are removed after a successful update.
 
 Release asset convention: `maca-<target>.tar.gz` plus
 `maca-<target>.tar.gz.sha256`, where `<target>` is a Rust target
@@ -335,14 +354,25 @@ renaming the new file into place. The repository's release workflow and
   host was available to execute MSI/EXE installers. The winget catalog,
   manifest resolution, checksum verification, and `--dry-run` plans are
   verified on macOS; the installer launch path is compile-gated to Windows.
-- **Self-update is implemented but unverified.** No release is published for
-  the default repository yet, so the download-and-replace path has not run
-  against a real release.
+- **Self-update has run on macOS arm64 only.** `self-update --force` replaced
+  a copy of the binary from the published `v0.1.0-alpha.1` prerelease, and an
+  end-to-end test drives the whole path against a loopback server on macOS
+  and Linux. It has not run against a real release on Linux or on an Intel
+  Mac. The `0.1.0-alpha.1` binary itself predates the prerelease channel and
+  only looks for a stable release, so it reports that none exists.
 - **Windows self-update has never run on Windows.** The `.zip` extraction and
   the rename-based replacement helper are platform-independent code that is
   unit-tested on macOS only (zip archives built in the tests). The Windows
   call path that feeds them, and replacing a running `maca.exe`, are
   compile-checked at most (`scripts/cross-check.sh`), not executed.
+- **Homebrew bottles on Linux need `patchelf`.** A bottle's binaries name a
+  placeholder loader and library path that must be rewritten for the maca
+  prefix, as `brew` does. maca uses `patchelf` for that (`apt install
+  patchelf`); without it an install of such a bottle is refused and rolled
+  back, and `maca doctor` warns. Checked on arm64 Linux (Ubuntu 24.04) with
+  `jq`, `tree`, `fd` and `sqlite`. Text files inside a bottle that mention
+  the placeholders (some `.pc` files and scripts) are not rewritten on either
+  OS.
 - **Source builds are best-effort.** Autotools, CMake, Meson, Make, Cargo, and
   Python projects are detected; projects with bespoke build systems fail with a
   clear message and a log path.
@@ -362,10 +392,13 @@ renaming the new file into place. The repository's release workflow and
   Homebrew (versioned formulae), winget (older manifests) and the custom
   registry (registration history). A request no catalog can serve is refused,
   never rounded to a nearby version.
-- **`scripts/package-release.sh` packages the host build only.** Pushing a
-  `v<version>` tag runs `.github/workflows/release.yml`, which attaches the
-  Linux x86_64 and macOS arm64 archives to the GitHub release. That workflow
-  has not run yet, so no release exists for `self-update` to download.
+- **Release archives are built by hand so far.** Pushing a `v<version>` tag
+  runs `.github/workflows/release.yml`, but GitHub Actions has not run a job
+  for this repository yet, so the published archives were built locally:
+  `scripts/package-release.sh` for the macOS ones (it cross-builds the other
+  macOS architecture, never another OS) and `scripts/linux-vm-check.sh` for
+  the Linux ones, which runs `./check.sh` on a clean export inside a Linux VM
+  first. Nothing has been verified on GitHub's runners.
 
 ## Development
 

@@ -16,7 +16,8 @@ cargo test --lib                                     # unit tests only
 cargo test --lib backend::tests::backend_kind_roundtrip   # one unit test: <module>::tests::<name>
 cargo test --test integration_tests test_binary_discovery # one integration test
 RUST_LOG=debug cargo run -- search jq                # tracing goes through RUST_LOG
-./scripts/package-release.sh [target-triple]         # writes target/dist/maca-<triple>.tar.gz + .sha256 (host triple only)
+./scripts/package-release.sh [target-triple]         # writes target/dist/maca-<triple>.tar.gz + .sha256 (host, or the other macOS arch via rustup; never another OS)
+./scripts/linux-vm-check.sh [arm64|amd64]            # check.sh + packaging on a clean `git archive HEAD` in an Apple `container` Linux VM
 ./scripts/cross-check.sh                             # clippy -D warnings for Linux + Windows from macOS (needs zig; compile-only)
 ```
 
@@ -61,8 +62,9 @@ Custom registry HTTP mirrors (`custom_registry_urls`) are additive and local ent
 
 ### Install pipeline (`install.rs` shared helpers)
 
-Brew bottle install, in order: fetch formula JSON → recurse into `dependencies` (skipping `uses_from_macos`) → anonymous GHCR bearer token → download → SHA-256 verify → extract to cellar → `link_opt` → `mach_o::rewrite_placeholders` → `link_bins` → `link_share` → ledger upsert.
+Brew bottle install, in order: fetch formula JSON → recurse into `dependencies` (skipping `uses_from_macos`) → anonymous GHCR bearer token → download → SHA-256 verify → extract to cellar → `link_opt` → `mach_o::rewrite_placeholders` → `elf::rewrite_placeholders` → `link_bins` → `link_share` → ledger upsert.
 
+- `elf.rs` is the Linux counterpart of `mach_o.rs`, called right after it in `brew::finish_keg`: bottle ELF files hold the same tokens in `PT_INTERP` and `RPATH`, and it rewrites them with `patchelf` (interpreter becomes the loader `maca` itself runs under; `@@HOMEBREW_PREFIX@@/Cellar` and `@@HOMEBREW_CELLAR@@` map to `config::cellar_dir`). A keg that needs it on a host without `patchelf` is `Error::Unsupported`, which unwinds the install. No-op off Linux; its Linux code is only compiled by `scripts/cross-check.sh` and run by `scripts/linux-vm-check.sh` on a Mac.
 - `mach_o.rs` substitutes `@@HOMEBREW_CELLAR@@` / `@@HOMEBREW_PREFIX@@` with `install_name_tool`, then every modified Mach-O must be ad-hoc re-signed (`codesign --force --sign -`) or Apple Silicon kills it at launch. It is a no-op off macOS.
 - Extraction is staged: `extract_bottle` / `extract_tar_gz_to_cellar` unpack into a unique `cellar/.tmp-*` dir and `rename` into place, so a keg that exists is complete (both return early when the keg exists). Package names and versions are checked with `install::valid_component` before they become path components.
 - Links go through `install::place_link`, which replaces an existing entry only if it is a dangling symlink or points into the same package's `cellar/<name>`; anything else is left alone and reported. `link_bins` falls back to scanning `<cellar>/bin` and `sbin` when the metadata lists no executables.
@@ -87,6 +89,8 @@ Library functions do not take locks or snapshots; the `cmd_*` handlers do:
 Naming trap: `lock.rs` is the cross-process prefix mutex; the reproducibility **lockfile** (`maca lock` / `maca sync`) and groups live in `group.rs`. Pins are a third thing (`state::load_pins` / `save_pins`, `pins.json`): a pinned package is held at its installed version, and a corrupt pins file is an error, never "no pins".
 
 ### Self-update
+
+Channel: a stable build asks `/releases/latest` (stable only); `--prerelease`, or a build whose own version is a prerelease (`selfupdate::tracks_prereleases`), reads the release list and takes the highest non-draft version (`newest_release`). The lookup honours `MACA_GITHUB_API`, which is how `e2e_self_update_replaces_a_copy_of_the_binary_from_a_prerelease` drives the whole path on a *copy* of the binary; never run `self-update` on the binary under test. After a successful replace, `prune_backups` keeps only the newest `maca.bak.<seconds>`.
 
 `selfupdate::pick_asset` matches release assets named exactly `maca-<target-triple>.tar.gz` plus `…tar.gz.sha256`, which is what `scripts/package-release.sh` produces (on Windows `maca-<triple>.zip`; nothing produces that asset yet). The asset name carries no version; the release tag does. The checksum is verified on the archive before extraction. Both archive paths share the same rules: `selfupdate::extract_zip_binary` and `extract_tar_gz_binary` reject absolute/`..` entries, accept exactly one regular-file match at the root or one directory down (more than one is `Ambiguous`), bound the bytes read, create the staging file with `create_new` under an unpredictable name, and return a typed `ArchiveError`. Windows uses the zip one and replacement is `swap_in_by_rename`; both are platform-independent and unit-tested on macOS only.
 

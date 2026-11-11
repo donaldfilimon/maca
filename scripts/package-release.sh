@@ -2,6 +2,8 @@
 # Package maca release artifacts matching self-update convention:
 # maca-<target>.tar.gz
 # maca-<target>.tar.gz.sha256
+#
+#   scripts/package-release.sh [target-triple]   default: this host
 set -eu
 
 cd "$(dirname "$0")/.."
@@ -26,16 +28,37 @@ if [ -z "$TARGET" ]; then
     esac
 fi
 
-# This script packages the host build. Labelling a host binary with another
-# triple would make self-update install the wrong architecture, so refuse.
+# A target other than the host is cross-compiled with `--target`, which needs
+# rustup's toolchain (Homebrew's cargo ships the host standard library only)
+# and `rustup target add <triple>`. Only same-OS cross builds are supported:
+# the host linker cannot link another OS. The binary always comes from the
+# directory cargo built for that triple, so an archive can never carry a
+# binary of a different architecture than its name says.
 HOST=$(rustc -vV | sed -n 's/^host: //p')
-if [ "$TARGET" != "$HOST" ]; then
-    echo "Error: target ${TARGET} is not this host (${HOST}); cross-packaging is not supported" >&2
-    exit 1
+BIN_SRC="target/release/maca"
+if [ "$TARGET" = "$HOST" ]; then
+    echo "Building maca v${VERSION} for ${TARGET}..."
+    cargo build --release --locked
+else
+    case "$TARGET" in
+        *-apple-darwin) TARGET_OS=darwin ;;
+        *-linux-*) TARGET_OS=linux ;;
+        *) TARGET_OS=other ;;
+    esac
+    if [ "$TARGET_OS" != "$(uname -s | tr '[:upper:]' '[:lower:]')" ]; then
+        echo "Error: target ${TARGET} is another OS than this host (${HOST}); build it on that OS" >&2
+        exit 1
+    fi
+    command -v rustup >/dev/null 2>&1 || { echo "Error: cross-building ${TARGET} needs rustup" >&2; exit 1; }
+    TC="$(rustup run stable rustc --print sysroot)/bin"
+    if ! PATH="$TC:$PATH" rustc --print target-libdir --target "$TARGET" 2>/dev/null | xargs test -d; then
+        echo "Error: run \`rustup target add ${TARGET} --toolchain stable\` first" >&2
+        exit 1
+    fi
+    echo "Cross-building maca v${VERSION} for ${TARGET} on ${HOST}..."
+    PATH="$TC:$PATH" cargo build --release --locked --target "$TARGET"
+    BIN_SRC="target/${TARGET}/release/maca"
 fi
-
-echo "Building maca v${VERSION} for ${TARGET}..."
-cargo build --release --locked
 
 DIST_DIR="target/dist"
 mkdir -p "$DIST_DIR"
@@ -44,7 +67,6 @@ STAGE_DIR="target/release-stage"
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR"
 
-BIN_SRC="target/release/maca"
 if [ ! -f "$BIN_SRC" ]; then
     echo "Error: ${BIN_SRC} not found"
     exit 1

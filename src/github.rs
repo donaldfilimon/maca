@@ -714,7 +714,7 @@ async fn fetch_release(
     Err(last)
 }
 
-fn api_base() -> String {
+pub(crate) fn api_base() -> String {
     std::env::var("MACA_GITHUB_API")
         .ok()
         .filter(|s| !s.trim().is_empty())

@@ -29,6 +29,10 @@ pub struct Release {
     pub assets: Vec<Asset>,
     #[serde(default)]
     pub body: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub prerelease: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -90,11 +94,11 @@ pub fn repo_from_config(cfg: &crate::config::Config) -> String {
     repo_from_env(cfg, env.as_deref())
 }
 
-/// Fetch the latest release metadata. `Ok(None)` when the repo has no releases.
-/// Only the latest non-prerelease, non-draft release is tracked: GitHub's
-/// `/releases/latest` endpoint never returns prereleases.
+/// Fetch the latest stable release. `Ok(None)` when the repo has none.
+/// GitHub's `/releases/latest` endpoint never returns a prerelease or draft.
+/// The API origin honours `MACA_GITHUB_API`, like the github backend.
 pub async fn fetch_latest(repo: &str) -> Result<Option<Release>> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let url = format!("{}/repos/{repo}/releases/latest", crate::github::api_base());
     let bytes = match install::download(&url).await {
         Ok(b) => b,
         Err(crate::Error::Network(m)) if install::is_http_404(&m) => return Ok(None),
@@ -105,20 +109,82 @@ pub async fn fetch_latest(repo: &str) -> Result<Option<Release>> {
     Ok(Some(release))
 }
 
+/// Fetch the release `self-update` should consider: the latest stable one,
+/// or with `include_prereleases` the highest-versioned published release of
+/// any kind (the first page of the release list, newest 100).
+pub async fn fetch_release(repo: &str, include_prereleases: bool) -> Result<Option<Release>> {
+    if !include_prereleases {
+        return fetch_latest(repo).await;
+    }
+    let url = format!(
+        "{}/repos/{repo}/releases?per_page=100",
+        crate::github::api_base()
+    );
+    let bytes = match install::download(&url).await {
+        Ok(b) => b,
+        Err(crate::Error::Network(m)) if install::is_http_404(&m) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let releases: Vec<Release> = serde_json::from_slice(&bytes)
+        .map_err(|e| Error::Network(format!("decoding releases for {repo}: {e}")))?;
+    Ok(newest_release(releases))
+}
+
+/// The highest-versioned release that is not a draft and has a tag.
+/// Prereleases are candidates; `0.2.0-alpha.1` sorts below `0.2.0`.
+pub fn newest_release(releases: Vec<Release>) -> Option<Release> {
+    releases
+        .into_iter()
+        .filter(|r| !r.draft && !r.tag_name.trim().is_empty())
+        .reduce(|best, r| {
+            if is_newer(&r.tag_name, &best.tag_name) {
+                r
+            } else {
+                best
+            }
+        })
+}
+
+/// Whether to look at prereleases: when asked to, or when the running build
+/// is itself a prerelease (an alpha has no stable release to move to, and
+/// would otherwise never see the next alpha).
+pub fn tracks_prereleases(current_version: &str, requested: bool) -> bool {
+    requested
+        || semver::Version::parse(current_version.trim().trim_start_matches('v'))
+            .is_ok_and(|v| !v.pre.is_empty())
+}
+
+/// What to say when there is nothing to update to.
+pub fn no_release_message(repo: &str, include_prereleases: bool) -> String {
+    if include_prereleases {
+        format!("no release published for {repo}")
+    } else {
+        format!(
+            "no stable release published for {repo} (pass --prerelease to consider prereleases)"
+        )
+    }
+}
+
 /// Compare a release tag against the current version. `true` if newer.
 pub fn is_newer(tag: &str, current: &str) -> bool {
     crate::backend::is_newer_version(tag, current)
 }
 
-/// Download and install the latest binary. Returns the new version on success.
-pub async fn run(repo: &str, current_version: &str, force: bool) -> Result<String> {
-    let Some(release) = fetch_latest(repo).await? else {
-        return Ok("no stable release published for this repository (self-update tracks stable releases only; prereleases are not considered)".to_string());
+/// Download and install the newest binary. Returns the new version on success.
+pub async fn run(
+    repo: &str,
+    current_version: &str,
+    force: bool,
+    include_prereleases: bool,
+) -> Result<String> {
+    let Some(release) = fetch_release(repo, include_prereleases).await? else {
+        return Ok(no_release_message(repo, include_prereleases));
     };
     let tag = release.tag_name.clone();
     if tag.is_empty() {
         return Err(Error::Other(anyhow::anyhow!(
-            "no stable release published for {repo} (self-update tracks stable releases only; prereleases are not considered)"
+            "{}",
+            no_release_message(repo, include_prereleases)
         )));
     }
     if !force && !is_newer(&tag, current_version) {
@@ -424,7 +490,38 @@ fn replace_with_backup(exe: &Path, new_binary: &Path) -> Result<()> {
     {
         swap_in_by_rename(exe, new_binary, &backup)?;
     }
+    prune_backups(exe, &backup);
     Ok(())
+}
+
+/// Remove earlier `<name>.bak.<seconds>` files next to `exe`, keeping `keep`
+/// (the backup just written), so repeated updates leave one backup behind
+/// instead of one per update. Only regular files with exactly that name shape
+/// are touched; failures are ignored (on Windows the previous backup can
+/// still be the running image).
+fn prune_backups(exe: &Path, keep: &Path) {
+    let (Some(dir), Some(stem)) = (exe.parent(), exe.file_stem().and_then(|s| s.to_str())) else {
+        return;
+    };
+    let prefix = format!("{stem}.bak.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let is_backup = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.strip_prefix(&prefix))
+            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
+        let is_file = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_file());
+        if is_backup && is_file {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Replace `exe` with `new_binary` by renaming, which Windows allows even for
@@ -450,6 +547,86 @@ fn current_exe_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn release(tag: &str, draft: bool, prerelease: bool) -> Release {
+        Release {
+            tag_name: tag.into(),
+            assets: vec![],
+            body: None,
+            draft,
+            prerelease,
+        }
+    }
+
+    #[test]
+    fn newest_release_orders_by_version_and_skips_drafts() {
+        // GitHub lists by creation date, so the list order is not the answer.
+        let picked = newest_release(vec![
+            release("v0.1.0-alpha.2", false, true),
+            release("v0.2.0", true, false),
+            release("v0.1.0", false, false),
+            release("", false, false),
+            release("v0.1.0-alpha.1", false, true),
+        ]);
+        assert_eq!(picked.map(|r| r.tag_name).as_deref(), Some("v0.1.0"));
+        let only_alphas = newest_release(vec![
+            release("v0.1.0-alpha.1", false, true),
+            release("v0.1.0-alpha.2", false, true),
+        ]);
+        assert_eq!(
+            only_alphas.map(|r| r.tag_name).as_deref(),
+            Some("v0.1.0-alpha.2")
+        );
+        assert!(newest_release(vec![release("v9.0.0", true, false)]).is_none());
+    }
+
+    #[test]
+    fn a_prerelease_build_tracks_prereleases_without_the_flag() {
+        assert!(tracks_prereleases("0.1.0-alpha.1", false));
+        assert!(tracks_prereleases("v0.1.0-rc.1", false));
+        assert!(!tracks_prereleases("0.1.0", false));
+        assert!(tracks_prereleases("0.1.0", true));
+        assert!(!tracks_prereleases("not-a-version", false));
+    }
+
+    #[test]
+    fn prune_backups_keeps_the_new_backup_and_unrelated_files() {
+        let dir = std::env::temp_dir().join(format!("maca-bak-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("maca");
+        let keep = dir.join("maca.bak.200");
+        for name in [
+            "maca",
+            "maca.bak.100",
+            "maca.bak.200",
+            "maca.bak.notes",
+            "maca.bak.",
+            "other.bak.100",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        std::fs::create_dir(dir.join("maca.bak.300")).unwrap();
+        prune_backups(&exe, &keep);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                "maca",
+                "maca.bak.",
+                "maca.bak.200",
+                "maca.bak.300",
+                "maca.bak.notes",
+                "other.bak.100"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn asset(name: &str) -> Asset {
         Asset {

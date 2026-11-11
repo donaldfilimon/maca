@@ -228,7 +228,13 @@ use std::sync::Arc;
 /// Serve `routes` (path -> body) on 127.0.0.1 for the life of the test process.
 #[cfg(unix)]
 fn serve(routes: HashMap<String, Vec<u8>>) -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    serve_on(std::net::TcpListener::bind("127.0.0.1:0").unwrap(), routes)
+}
+
+/// Like `serve`, on a listener the caller already bound, for a test whose
+/// bodies must contain the server's own URL.
+#[cfg(unix)]
+fn serve_on(listener: std::net::TcpListener, routes: HashMap<String, Vec<u8>>) -> String {
     let addr = listener.local_addr().unwrap();
     let routes = Arc::new(routes);
     std::thread::spawn(move || {
@@ -1598,4 +1604,98 @@ fn group_names_that_escape_the_groups_dir_are_refused() {
     sb.fails(&["group", "delete", "../evil"]);
     sb.ok(&["group", "create", "dev-tools"]);
     assert!(sb.home.join("groups/dev-tools.json").exists());
+}
+
+/// `self-update` end to end against a loopback "GitHub": the release list,
+/// the archive and its checksum. It runs on a copy of the binary, so the
+/// build under test is never replaced.
+#[cfg(unix)]
+#[test]
+fn e2e_self_update_replaces_a_copy_of_the_binary_from_a_prerelease() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = Sandbox::new("selfupdate");
+    let bin_dir = sb.home.join("copy");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let copy = bin_dir.join("maca");
+    std::fs::copy(maca_bin(), &copy).unwrap();
+    std::fs::write(bin_dir.join("maca.bak.1"), b"stale backup").unwrap();
+
+    let triple = maca::selfupdate::target_triple();
+    let asset = format!("maca-{triple}.tar.gz");
+    let archive = tarball(&[("maca", 0o755, "#!/bin/sh\necho replaced-by-update\n")]);
+    let digest = sha256(&archive);
+
+    // The asset URLs must point back at the server, whose address is only
+    // known once it is listening: bind first, then build the routes.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let releases = serde_json::json!([
+        {"tag_name": "v0.0.1", "prerelease": false, "draft": false, "assets": []},
+        {"tag_name": "v999.0.0-alpha.1", "prerelease": true, "draft": false, "assets": [
+            {"name": asset, "browser_download_url": format!("{base}/dl/{asset}")},
+            {"name": format!("{asset}.sha256"), "browser_download_url": format!("{base}/dl/{asset}.sha256")}
+        ]},
+        {"tag_name": "v9999.0.0", "prerelease": false, "draft": true, "assets": []}
+    ]);
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/repos/acme/maca/releases?per_page=100".to_string(),
+        serde_json::to_vec(&releases).unwrap(),
+    );
+    routes.insert(format!("/dl/{asset}"), archive);
+    routes.insert(
+        format!("/dl/{asset}.sha256"),
+        format!("{digest}  {asset}\n").into_bytes(),
+    );
+    assert_eq!(serve_on(listener, routes), base);
+
+    let run = |args: &[&str]| {
+        let out = Command::new(&copy)
+            .args(args)
+            .env("MACA_HOME", &sb.home)
+            .env_remove("MACA_PREFIX")
+            .env("MACA_GITHUB_API", &base)
+            .env("MACA_UPDATE_REPO", "acme/maca")
+            .output()
+            .unwrap();
+        (
+            out.status.success(),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            ),
+        )
+    };
+
+    let (ok, text) = run(&["self-update", "--check", "--prerelease"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("-> 999.0.0-alpha.1"), "{text}");
+
+    let (ok, text) = run(&["self-update", "--prerelease"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("updated to v999.0.0-alpha.1"), "{text}");
+
+    // The copy is now the script from the archive, and still executable.
+    let mode = std::fs::metadata(&copy).unwrap().permissions().mode();
+    assert_ne!(mode & 0o111, 0, "replacement is not executable");
+    let out = Command::new(&copy).output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "replaced-by-update"
+    );
+    // One backup of the previous binary is left; the stale one is pruned.
+    let backups: Vec<_> = std::fs::read_dir(&bin_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("maca.bak."))
+        .collect();
+    assert_eq!(backups.len(), 1, "{backups:?}");
+    assert_ne!(backups[0], "maca.bak.1");
+    assert_eq!(
+        std::fs::read(bin_dir.join(&backups[0])).unwrap(),
+        std::fs::read(maca_bin()).unwrap(),
+        "the backup is not the previous binary"
+    );
 }

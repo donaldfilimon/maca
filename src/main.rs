@@ -180,6 +180,9 @@ enum Commands {
         /// Install even when the tag is not newer.
         #[arg(long)]
         force: bool,
+        /// Consider prereleases too. A prerelease build does this by default.
+        #[arg(long)]
+        prerelease: bool,
     },
     /// Prefix snapshots and rollback.
     Snapshot {
@@ -540,7 +543,11 @@ async fn run(cli: Cli) -> Result<()> {
         } => cmd_clean(&ctx, all, keep_snapshots),
         // The TUI locks the prefix per action, not for the whole session.
         Commands::Tui => maca::tui::run(ctx.prefix.clone()).await,
-        Commands::SelfUpdate { check, force } => cmd_self_update(check, force).await,
+        Commands::SelfUpdate {
+            check,
+            force,
+            prerelease,
+        } => cmd_self_update(check, force, prerelease).await,
         Commands::Snapshot { action } => cmd_snapshot(&ctx, action),
         Commands::Custom { action } => cmd_custom(&ctx, action),
         Commands::Group { action } => cmd_group(&ctx, action).await,
@@ -989,6 +996,18 @@ async fn cmd_doctor(ctx: &Ctx) -> Result<()> {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        if has_tool("patchelf") {
+            passes += 1;
+        } else {
+            println!(
+                "  [WARN] 'patchelf' not found on PATH (needed to install Homebrew bottles that contain binaries)"
+            );
+            warnings += 1;
+        }
+    }
+
     // 4. Build tools check (source builds)
     for tool in ["make", "cc"] {
         if has_tool(tool) {
@@ -1413,32 +1432,29 @@ fn host_platform_key() -> String {
     format!("{os}-{arch}")
 }
 
-async fn cmd_self_update(check: bool, force: bool) -> Result<()> {
+async fn cmd_self_update(check: bool, force: bool, prerelease: bool) -> Result<()> {
     let cfg = config::Config::load()?;
     let repo = maca::selfupdate::repo_from_config(&cfg);
-    let Some(release) = maca::selfupdate::fetch_latest(&repo).await? else {
-        println!(
-            "no stable release published for {repo} (self-update tracks stable releases only; prereleases are not considered)"
-        );
-        return Ok(());
-    };
-    let tag = release.tag_name.trim_start_matches('v').to_string();
-    if tag.is_empty() {
-        println!(
-            "no stable release published for {repo} (self-update tracks stable releases only; prereleases are not considered)"
-        );
-        return Ok(());
-    }
+    let prerelease = maca::selfupdate::tracks_prereleases(maca::VERSION, prerelease);
     if check {
-        if maca::selfupdate::is_newer(&tag, maca::VERSION) {
-            println!("update available: {} -> {tag}", maca::VERSION);
-        } else {
-            println!("up to date ({})", maca::VERSION);
+        let tag = maca::selfupdate::fetch_release(&repo, prerelease)
+            .await?
+            .map(|r| r.tag_name.trim_start_matches('v').to_string())
+            .filter(|t| !t.is_empty());
+        match tag {
+            None => println!(
+                "{}",
+                maca::selfupdate::no_release_message(&repo, prerelease)
+            ),
+            Some(tag) if maca::selfupdate::is_newer(&tag, maca::VERSION) => {
+                println!("update available: {} -> {tag}", maca::VERSION)
+            }
+            Some(_) => println!("up to date ({})", maca::VERSION),
         }
         return Ok(());
     }
-    match maca::selfupdate::run(&repo, maca::VERSION, force).await? {
-        s if s.starts_with("already up to date") => println!("{s}"),
+    match maca::selfupdate::run(&repo, maca::VERSION, force, prerelease).await? {
+        s if s.starts_with("already up to date") || s.starts_with("no ") => println!("{s}"),
         tag => println!("updated to {tag}"),
     }
     Ok(())

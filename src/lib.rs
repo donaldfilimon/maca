@@ -12,6 +12,7 @@ pub mod backend;
 pub mod brew;
 pub mod config;
 pub mod custom;
+pub mod elf;
 pub mod github;
 pub mod group;
 pub mod insight;

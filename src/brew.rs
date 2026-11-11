@@ -267,7 +267,7 @@ fn runtime_deps(formula: &Formula) -> Vec<String> {
         .collect()
 }
 
-/// Everything after a keg exists on disk: the `opt/` link, Mach-O
+/// Everything after a keg exists on disk: the `opt/` link, Mach-O and ELF
 /// relocation, `bin/` and `share/` links, and the ledger record.
 fn finish_keg(
     name: &str,
@@ -284,6 +284,15 @@ fn finish_keg(
     let rewritten = mach_o::rewrite_placeholders(keg, &opts.prefix)?;
     if rewritten > 0 {
         tracing::info!("rewrote Homebrew placeholders in {rewritten} Mach-O files");
+    }
+    // The same tokens in ELF files (Linux): interpreter and search path.
+    let relocated = crate::elf::rewrite_placeholders(
+        keg,
+        &opts.prefix,
+        &crate::config::cellar_dir(&opts.prefix),
+    )?;
+    if relocated > 0 {
+        tracing::info!("relocated {relocated} ELF files");
     }
     let linked = install::link_bins(keg, executables, &opts.prefix)?;
     let _ = install::link_share(keg, &opts.prefix);

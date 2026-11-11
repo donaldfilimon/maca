@@ -6,8 +6,26 @@ All notable changes to maca are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- `maca self-update --prerelease` considers prereleases and picks the highest
+  published version. A build that is itself a prerelease does this without
+  the flag, so an alpha can move to the next alpha.
+- `scripts/package-release.sh <triple>` cross-builds the other macOS
+  architecture (it still refuses another OS), and
+  `scripts/linux-vm-check.sh` runs the gate on a clean export inside a Linux
+  VM on a Mac and brings back the Linux archive.
+
 ### Fixed
-- A GitHub archive with no linkable executables no longer deletes a keg that existed before the install, and the empty package directory is cleaned up when the keg was created by that install.
+- Homebrew bottles installed on Linux could not start: the loader and library
+  paths inside their binaries still held Homebrew's placeholders. They are now
+  rewritten with `patchelf`, and an install is refused (and rolled back) when
+  `patchelf` is missing. `maca doctor` reports whether it is present.
+
+### Changed
+- After a successful self-update only the newest `maca.bak.<timestamp>`
+  backup is kept; earlier ones are removed.
+- Self-update honours `MACA_GITHUB_API` for the release lookup, like the
+  GitHub and Aqua backends.
 
 ## [0.1.0-alpha.1] - 2026-11-10
 
@@ -32,6 +50,7 @@ First tagged release, published as an alpha pre-release.
 - Per-directory prefix and cellar through `maca.toml`.
 
 ### Fixed
+- A GitHub archive with no linkable executables no longer deletes a keg that existed before the install, and the empty package directory is cleaned up when the keg was created by that install.
 - `list`, `info` and `outdated` report a corrupt `pins.json` as an error
   instead of treating it as "no pins".
 - `outdated` reports packages whose latest-version lookup failed (stderr
